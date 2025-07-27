@@ -1,13 +1,16 @@
-# nandseqgen
+# nandseqgen Project PRD
 
+---
 ## 개발 도구
 ### Python 3.10
 #### numpy
 
+---
 ## 목표
 ### Flash Memory NAND 에 입력할 randomized command sequence 생성한다.
 ### clock time 기반으로 NAND 의 state 에 따라 randomized command sequence 가 생성되는 dynamic system 을 구현한다.
 
+---
 ## 구성 요소
 ### -. class: **Clock**
 #### 전체 System 에 적용되는 Clock.
@@ -26,7 +29,7 @@
 ###### -3: ready to use
 ###### -2: closed
 ###### -1: erased
-###### 0 to n_wls-1 : PGM 된 page 수
+###### 0 to n_pages-1 : PGM 된 page 수
 ##### 배열의 형태
 ##### 원소의 값에 따라 다음과 같은 상태를 나타낸다.
 #### List of int: **addrErasable**
@@ -120,6 +123,7 @@
 #### state 마다 execution time 을 정의. 별도의 TimeSpec.yaml 파일에서 읽어온다.
 #### TimeSpec.yaml 파일에 정의
 
+---
 ## Test Flow 정의
 ### 1. 초기화
 #### -. StateOperWeightDict 생성 : TimeSpec.yaml 파일
