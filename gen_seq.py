@@ -31,4 +31,15 @@ class DeduplicateBase
     """
     key = cls._make_key(*args, **kwargs)
     if not force_new:
-      with cls._global_lock
+      with cls._global_lock:
+        instance = cls._global_instances.get((cls, key))
+        if instance:
+          return instance
+
+    obj = cls(*args, **kwargs)
+    obj.id = next(cls._get_class_counter())
+
+    with cls._global_lock:
+      cls._class_instances_by_id[cls][obj.id] = obj
+      if not force_new:
+        cls._global_instances[(cls, key)] = obj
