@@ -1,4 +1,4 @@
-from gen_py import *
+from gen_seq import *
 import yaml
 
 if __name__ == "__main__":
@@ -13,23 +13,23 @@ if __name__ == "__main__":
   
   # TimeSpec 정의 (수정중)
   tWB                        = StateSeq.create(times=TimeSpec['tWB']             ,states='tWB'                        )
-  tERS_TLC                   = StateSeq.create(times=TImeSpec['tERS_TLC']        ,states='erase TLC busy'             )
-  tPROGO                     = StateSeq.create(times=TImeSpec['tPROGO']          ,states='pgm TLC busy'               )
-  tTRAN_L                    = StateSeq.create(times=TImeSpec['tTRAN']           ,states='pgm LSB transfer busy'      )
-  tTRAN_C                    = StateSeq.create(times=TImeSpec['tTRAN']           ,states='pgm CSB transfer busy'      )
-  tTRAN_M                    = StateSeq.create(times=TImeSpec['tTRAN']           ,states='pgm MSB transfer busy'      )
-  tR_SLC                     = StateSeq.create(times=TImeSpec['tR_SLC']          ,states='read SLC busy'              )
-  tR_LSB                     = StateSeq.create(times=TImeSpec['tR_LSB']          ,states='read TLC busy'              )
-  tR_CSB                     = StateSeq.create(times=TImeSpec['tR_CSB']          ,states='read TLC busy'              )
-  tR_MSB                     = StateSeq.create(times=TImeSpec['tR_MSB']          ,states='read TLC busy'              )
-  tRRC_SLC                   = StateSeq.create(times=TImeSpec['tRRC']            ,states='read SLC extready'          )
-  tRRC_FWSLC                 = StateSeq.create(times=TImeSpec['tRRC']            ,states='read FWSLC extready'        )
-  tRRC_TLC                   = StateSeq.create(times=TImeSpec['tRRC']            ,states='read TLC extready'          )
-  tRST_ready                 = StateSeq.create(times=TImeSpec['tRST_ready']      ,states='reset busy ready'           )
-  tRST_read                  = StateSeq.create(times=TImeSpec['tRST_read']       ,states='reset busy read'            )
+  tERS_TLC                   = StateSeq.create(times=TimeSpec['tERS_TLC']        ,states='erase TLC busy'             )
+  tPROGO                     = StateSeq.create(times=TimeSpec['tPROGO']          ,states='pgm TLC busy'               )
+  tTRAN_L                    = StateSeq.create(times=TimeSpec['tTRAN']           ,states='pgm LSB transfer busy'      )
+  tTRAN_C                    = StateSeq.create(times=TimeSpec['tTRAN']           ,states='pgm CSB transfer busy'      )
+  tTRAN_M                    = StateSeq.create(times=TimeSpec['tTRAN']           ,states='pgm MSB transfer busy'      )
+  tR_SLC                     = StateSeq.create(times=TimeSpec['tR_SLC']          ,states='read SLC busy'              )
+  tR_LSB                     = StateSeq.create(times=TimeSpec['tR_LSB']          ,states='read TLC busy'              )
+  tR_CSB                     = StateSeq.create(times=TimeSpec['tR_CSB']          ,states='read TLC busy'              )
+  tR_MSB                     = StateSeq.create(times=TimeSpec['tR_MSB']          ,states='read TLC busy'              )
+  tRRC_SLC                   = StateSeq.create(times=TimeSpec['tRRC']            ,states='read SLC extready'          )
+  tRRC_FWSLC                 = StateSeq.create(times=TimeSpec['tRRC']            ,states='read FWSLC extready'        )
+  tRRC_TLC                   = StateSeq.create(times=TimeSpec['tRRC']            ,states='read TLC extready'          )
+  tRST_ready                 = StateSeq.create(times=TimeSpec['tRST_ready']      ,states='reset busy ready'           )
+  tRST_read                  = StateSeq.create(times=TimeSpec['tRST_read']       ,states='reset busy read'            )
   tRST_pgm                   = StateSeq.create(times=TimeSpec['tRST_pgm']        ,states='reset busy pgm'             )
-  tERSL_TLC                  = StateSeq.create(times=TImeSpec['tRST_pgm']        ,states='erase TLC suspend busy'     )
-  tPGMSL_TLC                 = StateSeq.create(times=TImeSpec['tRST_ready']      ,states='program TLC suspend busy'   )
+  tERSL_TLC                  = StateSeq.create(times=TimeSpec['tRST_pgm']        ,states='erase TLC suspend busy'     )
+  tPGMSL_TLC                 = StateSeq.create(times=TimeSpec['tRST_ready']      ,states='program TLC suspend busy'   )
   
   # operations 정의 (수정중)
   # seq[0] : operation 의 execution time -> 추후 dictionary data 로 입력을 받을 예정

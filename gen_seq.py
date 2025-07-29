@@ -12,10 +12,11 @@ import threading
 import weakref
 from dataclasses import dataclass, field
 import numpy as np
+import yaml
 import os
 
 # 중복 instance 생성 방지를 위한 parent class 정의
-class DeduplicateBase
+class DeduplicateBase:
   """
   multi-thread 환경(필요하다면)에서 instance 중복 생성 방지를 위한 id, lock, counter
   """
@@ -51,7 +52,7 @@ class DeduplicateBase
     """
     id 로 instance 반환
     """
-    return cls._cls_class_instances_by_id[cls].get(id, None)
+    return cls._class_instances_by_id[cls].get(id, None)
 
   @classmethod
   def len_class(cls):
@@ -66,6 +67,18 @@ class DeduplicateBase
     child class 선언 시 id 생성 규칙 정의 강제하기 위한 구문
     """
     raise NotImplementedError()
+
+  @classmethod
+  def _get_class_counter(cls):
+    """
+    클래스별로 독립적인 카운터를 반환합니다.
+    카운터가 없으면 새로 생성합니다.
+    """
+    with cls._global_lock:
+      if cls not in cls._class_counters:
+        cls._class_counters[cls] = itertools.count()
+        cls._class_instances_by_id[cls] = {}
+      return cls._class_counters[cls]
 
 @dataclass
 class StateSeq(DeduplicateBase):
@@ -101,7 +114,7 @@ class StateSeq(DeduplicateBase):
       self.times = np.array(self.times, dtype=float)
     elif isinstance(self.times, np.ndarray) and self.times.dtype.kind == 'f':
       self.times = np.array(self.times, dtype=float)
-    elif isinstance(slef.times, (list, tuple)):
+    elif isinstance(self.times, (list, tuple)):
       if all(isinstance(v, (float, int)) for v in self.times):
         self.times = np.array(self.times, dtype=float)
       else:
@@ -158,7 +171,7 @@ class StateSeq(DeduplicateBase):
     """
     return self.id
 
-  def __eq__(self):
+  def __eq__(self, other):
     """
     연산자 오버로딩 : == 연산자
     """
@@ -189,7 +202,7 @@ class StateSeq(DeduplicateBase):
     """
     states 의 원소값에서 prefix 를 제거
     """
-    states [s.removeprefix(string) for s in self.states]
+    states = [s.removeprefix(string) for s in self.states]
     return self.create(self.times, states)
 
   def remove_suffix(self, string: str) -> 'StateSeq':
@@ -221,6 +234,7 @@ class StateSeq(DeduplicateBase):
     """
     times = self.times[idx]
     states = self.states[idx]
+    return self.create(times, states)
 
   def get_idx_by_time(self, time:float) -> int:
     """
@@ -251,7 +265,7 @@ class StateSeq(DeduplicateBase):
     states = tmp_seq.states.copy()
     return self.create(times, states)
 
-  def get_times(self) -> np.ndarray[floaat]:
+  def get_times(self) -> np.ndarray[float]:
     """
     times 반환
     """
@@ -275,13 +289,13 @@ class StateSeq(DeduplicateBase):
     """
     return self.times[0]
 
-  def get_first(self) -> float:
+  def get_first(self) -> 'StateSeq':
     """
     times 와 states 의 첫 번째 원소를 slice
     """
     return self.slice_one(0)
 
-  def get_last(self) -> float:
+  def get_last(self) -> 'StateSeq':
     """
     times 와 states 의 마지막 원소를 slice
     """
@@ -339,7 +353,7 @@ class StateSeq(DeduplicateBase):
     """
     return f"StateSeq id={self.id}, times_len={len(self.times)}, states_len={len(self.states)}"
 
-def Idle(time, float) -> StateSeq:
+def Idle(time: float) -> StateSeq:
   """
   idle 을 state 로 하는 stateseq 생성 함수
   """
@@ -445,7 +459,7 @@ class Matrix2D(Generic[T]):
     self.rows = len(data)
     self.cols = len(data[0])
 
-  def __gettime__(self, idx: Tuple[int, int]) -> T:
+  def __getitem__(self, idx: Tuple[int, int]) -> T:
     """
     연산자 정의 : ex) Matrix2D[i, j]
     """
@@ -454,10 +468,10 @@ class Matrix2D(Generic[T]):
 
   def __setitem__(self, idx: Tuple[int, int], value: T):
     """
-    연산자 정의 : ex) Matrix2D[i, j] value
+    연산자 정의 : ex) Matrix2D[i, j] = value
     """
     i, j = idx
-    return self._data[i][j]
+    self._data[i][j] = value
 
   def as_list(self) -> List[List[T]]:
     """
@@ -469,8 +483,8 @@ class Matrix2D(Generic[T]):
     """
     class instance 의 원소값 중 최소 값을 찾기 위한 함수 정의
     """
-    min_val - None
-    min_index == (-1, -1)
+    min_val = None
+    min_index = (-1, -1)
     for i in range(self.rows):
       for j in range(self.cols):
         val = key(self[i, j])
@@ -479,7 +493,7 @@ class Matrix2D(Generic[T]):
           min_index = (i, j)
     return min_index
 
-  def argmax(self, key: Callable[[T], Any]) -> Tuple(int, int]:
+  def argmax(self, key: Callable[[T], Any]) -> Tuple[int, int]:
     """
     class instance 의 우ㅓㄴ소값 중 최대 값을 찾기 위한 함수 정의
     """
@@ -548,7 +562,7 @@ class BusyTable:
     tmp_seq = self.seq.shift_time(self.get_time()*-1)
     return tuple(zip(tmp_seq.get_times(), tmp_seq.get_states()))
 
-  def get_lasttime(self) -> float:
+  def get_lasttime(self, time: float) -> float:
     """
     time 시간에서의 state 의 값 반환
     """
@@ -645,7 +659,7 @@ class Scheduler:
     self.clock: Clock = Clock(0)
     self.num_die: int = num_die
     self.num_plane: int = num_plane
-    self.busytable = Matrix2D[BusyTable]([BusyTable(self.clock) for _ in range(num_palne)] for _ in range(num_die)])
+    self.busytable = Matrix2D([[BusyTable(self.clock) for _ in range(self.num_plane)] for _ in range(self.num_die)])
     self.targets = np.zeros((num_die, num_plane))
     self.indice = tuple(np.ndindex(self.targets.shape))
     self.mapper = StateMapper()
@@ -705,7 +719,7 @@ class Scheduler:
     """
     busytable 의 등록된 stateseq 를 모두 출력
     """
-    self._get_targets(sel_die, sel_plane)
+    self._set_targets(sel_die, sel_plane)
     for idx in self.indice:
       if self.targets[idx] == 1:
         print(f"die: {idx[0]}, plane: {idx[1]}")
@@ -781,7 +795,7 @@ class Scheduler:
 class AddressManager:
   def __init__(self, num_address: int, val: int, offset: int = 30):
     self.adds: np.ndarray = np.full(num_address, val, dtype=int)
-    self.size = int = num_address
+    self.size: int = num_address
     self.readoffset: int = offset
 
   def get_eq(self, val):
@@ -791,9 +805,9 @@ class AddressManager:
     return np.where(self.adds > val)[0]
 
   def set_range_val(self, add_from: int, add_to: int, val: int):
-    self.adds[add_from:add_to+1] val
+    self.adds[add_from:add_to+1] = val
 
-  def set_n_val(self, add_from: n: int, val: int):
+  def set_n_val(self, add_from: int, n: int, val: int):
     self.adds[add_from:add_from + n] = val
 
   def set_adds_val(self, adds: np.ndarray, val: int):
@@ -837,12 +851,12 @@ class AddressManager:
 
   def sample_erasable(self, num: int):
     arr = self.get_adds_erasable()
-    idx = np.random.choice(len(arr), size=num, replace=Fase)
+    idx = np.random.choice(len(arr), size=num, replace=False)
     return arr[idx]
 
   def sample_pgmable(self, num: int):
     arr = self.get_adds_pgmable()
-    idx = np.random.choice(len(arr), size=num, replace=Fase)
+    idx = np.random.choice(len(arr), size=num, replace=False)
     return arr[idx]
 
   def sample_readable(self, num: int, offset: int = None):
