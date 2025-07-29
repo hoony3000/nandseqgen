@@ -480,4 +480,334 @@ class Matrix2D(Generic[T]):
           min_index = (i, j)
     return min_index
 
-  def argmax
+  def argmax(self, key: Callable[[T], Any]) -> Tuple(int, int]:
+    """
+    class instance 의 우ㅓㄴ소값 중 최대 값을 찾기 위한 함수 정의
+    """
+    max_val = None
+    max_index = (-1,-1)
+    for i in range(self.rows):
+      for j in range(self.cols):
+        val = key(self[i, j])
+        if max_val is None or val > max_val:
+          max_val = val
+          max_index = (i, j)
+    return max_index
+
+class BusyTable:
+  """
+  BusyTable class 정의
+  clock : Clock instance
+  seq : StateSeq instance
+  """
+  clock: Clock
+  seq: StateSeq
+
+  def __init__(self, clock: Clock):
+    """
+    instsance 생성자 정의
+    """
+    self.clock = clock
+    self.seq = Idle(self.clock.get_time())
+
+  def set(self, stateseq: StateSeq):
+    """
+    seq 값 할당
+    """
+    self.seq = stateseq
+
+  def add(self, stateseq: StateSeq):
+    """
+    기존 seq 값 뒤에 new seq 추가
+    """
+    self.seq += stateseq
+
+  def setnow(self, stateseq: StateSeq):
+    """
+    현재 시각 기준으로 그 뒤에 seq 는 삭제하고 new seq 로 대체
+    """
+    tmp_seq = self.seq.cut_time(self.get_time())
+    self.seq = tmp_seq + stateseq
+
+  def stat(self):
+    """
+    현재 seq 값 출력
+    """
+    print(self.seq.get_pairs())
+
+  def update(self):
+    """
+    현재 시각 기준으로 진행되고 있는 seq. 제외한 과거의 seq 삭제
+    """
+    idx = bisect.bisect_right(self.seq.get_times(), self.get_time())
+    self.seq = self.seq.slice_tail(idx)
+
+  def gettimeleft(self) -> Tuple[Tuple[float, str]]:
+    """
+    현재 시각 기준으로 미래의 state 의 time 이 얼마나 남았는지 반환
+    """
+    tmp_seq = self.seq.shift_time(self.get_time()*-1)
+    return tuple(zip(tmp_seq.get_times(), tmp_seq.get_states()))
+
+  def get_lasttime(self) -> float:
+    """
+    time 시간에서의 state 의 값 반환
+    """
+    if time < self.get_time():
+      raise ValueError("time < current time")
+    return self.seq.get_state_by_time(time)
+
+  def get_time(self) -> float:
+    """
+    현재 시각 반환
+    """
+    return self.clock.get_time()
+
+  def get_state(self) -> str:
+    """
+    현재 시각에서의 state 의 값 반환
+    """
+    return self.seq.get_state_by_time(self.get_time())
+
+  def get_stat(self) -> Tuple[str, float]:
+    """
+    현재 시각과 state 를 반환
+    """
+    time = self.get_time()
+    return time, self.expect(time)
+
+  def squeeze(self) -> StateSeq:
+    """
+    2번 이상 연속적으로 반복되는 state 원소들을 합침
+    """
+    self.seq = self.seq.squeeze_targets({'idle', 'nop'})
+
+class StateMapper:
+  def __init__(self, path: str = "state_mapping.yaml"):
+    self.rules = {}
+    self.path = path
+    self.load(path)
+
+  def load(self, path: str):
+    """
+    yaml 파일에서 prefix rule 불러오기
+    """
+    if os.path.exists(path):
+      with open(path, "r", encoding="utf-8") as f:
+        self.rules = yaml.safe_load(f) or {}
+      print(f"[INFO] Loaded state mapping from {path}")
+    else:
+      print(f"[INFO] No state mapping file at {path}, starting fresh")
+
+  def save(self, path: str = None):
+    """
+    prefix rule 을 yaml 파일로 저장
+    """
+    if path is None:
+      path = self.path
+    with open(path, "w", encoding="utf-8") as f:
+      yaml.safe_dump(self.rules, f, default_flow_style=False, allow_unicode=True)
+    print(f"[INFO] State mapping save to {path}")
+
+  def register_prefix(self, base_state: str, prefix: str):
+    self.rules[base_state] = prefix
+
+  def apply_prefix(self, op: Operation):
+    """
+    prefix rule 적용
+    """
+    seq = op.get_seq()
+    # 구현 필요
+
+  def ensure_prefix(self, op: Operation):
+    """
+    등록되지 않은 상태에 대해 사용자 입력을 통해 prefix rule 동적 등록
+    """
+    states = op.get_seq()
+    for state in states:
+      if state in self.rules:
+        prefix = input(f"[INPUT] Enter prefix for state '{state}' (leave empty to skip) ")
+        self.rules[state] = prefix
+    self.save()
+
+class Scheduler:
+  """
+  busytable 을 관리하기 위한 주체 class 정의
+  Scheduler 를 통해서만 busytable 에 Operation 추가 및 삭제 가능
+  clock : Clock instance
+  num_die : die 갯수
+  num_plane : plane 갯수
+  targets : die-level 또는 plane-level 에서 seq 추가를 위해 만든 index 배열
+  """
+  def __init__(self, num_die: int, num_plane: int):
+    """
+    생성자 정의
+    """
+    self.clock: Clock = Clock(0)
+    self.num_die: int = num_die
+    self.num_plane: int = num_plane
+    self.busytable = Matrix2D[BusyTable]([BusyTable(self.clock) for _ in range(num_palne)] for _ in range(num_die)])
+    self.targets = np.zeros((num_die, num_plane))
+    self.indice = tuple(np.ndindex(self.targets.shape))
+    self.mapper = StateMapper()
+    self.cur_states = np.full((num_die, num_plane), 'idle', dtype=str)
+
+  def get_time(self):
+    """
+    현재 시각 반환
+    """
+    return self.clock.get_time()
+
+  def set(self, sel_die: int, sel_plane: int, op: Operation):
+    """
+    operation 할당
+    """
+    applyto = op.get_applyto()
+    seq = op.get_seq()
+    self._set_targets(sel_die, sel_plane, applyt=applyto)
+    for idx in self.indice:
+      if self.targets[idx] == 1:
+        self.busytable[idx].set(seq)
+      else:
+        self.busytable[idx].set(Nop(seq.get_firsttime()))
+
+  def add(self, sel_die: int, sel_plane: int, op: Operation):
+    """
+    Operation 추가
+    """
+    applyto = op.get_applyto()
+    seq = op.get_seq()
+    self._set_targets(sel_die, sel_plane, applyto=applyto)
+    for idx in self.indice:
+      if self.targets[idx] == 1:
+        self.busytable[idx].add(seq)
+
+    idx_max = self.busytable.argmax(lambda x: x.get_lasttime())
+    max_val = self.busytable[idx_max].get_lasttime()
+
+    for idx in self.indice:
+      if idx != idx_max:
+        self.busytable[idx].add(Nop(max_val-self.busytable[idx].getlasttime()))
+
+  def setnow(self, sel_die: int, sel_plane: int, op: Operation):
+    """
+    현재 시각 이후의 예약된 stateseq 를 삭제하고 new stateseq 추가
+    """
+    applyto = op.get_applyto()
+    seq = op.get_seq()
+    self._set_targets(sel_die, sel_plane, applyto=applyto)
+    for idx in self.indice:
+      if self.targets[idx] == 1:
+        self.busytable[idx].setnow(seq)
+      else:
+        self.busytable[idx].setnow(seq.get_first())
+
+  def stat(self, sel_die: int, sel_plane: int):
+    """
+    busytable 의 등록된 stateseq 를 모두 출력
+    """
+    self._get_targets(sel_die, sel_plane)
+    for idx in self.indice:
+      if self.targets[idx] == 1:
+        print(f"die: {idx[0]}, plane: {idx[1]}")
+        self.busytable[idx].stat()
+
+  def get_aheadtime(self, time: float) -> float:
+    """
+    (현재 시각 + time) 반환
+    """
+    return self.get_time()+time
+    
+  def expect(self, sel_die: int, sel_plane: int, time: float) -> str:
+    """
+    (현재 시각 + time) 에서의 state 반환
+    """
+    _time = self.get_aheadtime(time)
+    return self.busytable[sel_die, sel_plane].expect(_time)
+
+  def expect_all(self, time: float) -> List[List[str]]:
+    """
+    expect 를 모든 busytable 에 대해서 수행한 값을 반환
+    """
+    _time = self.get_aheadtime(time)
+    self._set_targets(-1,-1)
+    return [[self.busytable[die, plane].expect(_time) for plane in range(self.num_plane)] for die in range(self.num_die)]
+
+  def _set_targets(self, sel_die: int, sel_plane: int, applyto='plane'):
+    """
+    어느 level 에서 operation 을 수행할 지 self.targets 에 기록
+    """
+    self.targets.fill(0)
+    if applyto == 'die':
+      sel_plane = -1
+
+    if sel_die == -1 and sel_plane == -1:
+      self.targets[:] = 1
+    elif sel_die == -1 and sel_plane != -1:
+      self.targets[:, sel_plane] = 1
+    elif sel_die != -1 and sel_plane == -1:
+      self.targets[sel_die, :] = 1
+    elif sel_die != -1 and sel_plane != -1:
+      self.targets[sel_die, sel_plane] = 1
+
+  def update(self):
+    """
+    모든 busytable 을 현재 시각 기준으로 update 하여 과거 state 제거
+    """
+    for idx in self.indice:
+      self.busytable[idx].update()
+
+  def step(self, time: float):
+    """
+    현재 시각에서 time 만큼 이동
+    """
+    self.clock.forward(time)
+
+  def step_last(self):
+    """
+    busytable 에 등록된 seq.times 중 시간적으로 가장 짧은 시간만큼 clock 을 이동
+    목적은 현재 등록된 모든 StateSeq 의 validity check 를 위함
+    아직 확실하게 어떻게 써야할 지 정해지지 않음
+    """
+    idx_min = self.busytable.argmin(lambda x: x.get_lasttime())
+    self.clock.init(self.busytable[idx_min].get_lasttime())
+
+  def squeeze(self):
+    """
+    모든 busytable 에서 2번 이상 연속적으로 반복되는 state 원소들을 합침
+    """
+    for idx in self.indice:
+      self.busytable[idx].squeeze()
+
+class AddressManager:
+  def __init__(self, num_address: int, val: int, offset: int = 30):
+    self.adds: np.ndarray = np.full(num_address, val, dtype=int)
+    self.size = int = num_address
+    self.readoffset: int = offset
+
+  def get_eq(self, val):
+    return np.where(self.adds == val)[0]
+
+  def get_gt(self, val):
+    return np.where(self.adds > val)[0]
+
+  def set_range_val(self, add_from: int, add_to: int, val: int):
+    self.adds[add_from:add_to+1] val
+
+  def set_n_val(self, add_from: n: int, val: int):
+    self.adds[add_from:add_from + n] = val
+
+  def set_adds_val(self, adds: np.ndarray, val: int):
+    self.adds[adds] = val
+
+  def get_vals_adds(self, adds: np.ndarray):
+    return self.adds[adds]
+
+  def tolist(self):
+    return self.adds.tolist()
+
+  def get_size(self):
+    return self.size
+
+  def get_adds_erasable(self):
+    return np.where(self.adds != -4)
