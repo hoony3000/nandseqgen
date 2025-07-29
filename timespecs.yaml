@@ -1,0 +1,35 @@
+TimeSpec:
+  tERSL                  : 150000
+  tPGMSL                 : 150000
+  tRST_ready             : 1000
+  tRST_read              : 10000
+  tRST_pgm               : 30000
+  tRST_erase             : 30000
+  tWB                    : 100
+  tERS_TLC               : 5000000
+  tPROGO                 : 300000
+  tTRAN                  : 20000
+  tR_SLC                 : 30000
+  tR_LSB                 : 50000
+  tR_CSB                 : 60000
+  tR_MSB                 : 55000
+  tRRC                   : 2000
+
+ExecTime:
+  erase TLC              : 300
+  pgm LSB                : 300
+  pgm CSB                : 300
+  pgm MSB                : 300
+  pgm MSB exec           : 300
+  read SLC               : 300
+  read LSB               : 300
+  read CSB               : 300
+  read MSB               : 300
+  dout 06h               : 300
+  SR 70h                 : 300
+  SR 78h                 : 300
+  reset FAh              : 300
+  erase TLC suspend      : 300
+  erase TLC resume       : 300
+  program TLC suspend    : 300
+  program TLC resume     : 300
