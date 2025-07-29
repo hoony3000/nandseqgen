@@ -905,3 +905,12 @@ name='erase TLC suspend'    ; erase_TLC_suspend        = Operation.create(name=n
 name='erase TLC resume'     ; erase_TLC_resume         = Operation.create(name=name  ,seq=Nop(ExecTime[name]) + tERS_TLC.shift_time(-2*MS)  + End(name)          ,applyto='die'    )
 name='program TLC suspend'  ; program_TLC_suspend      = Operation.create(name=name  ,seq=Nop(ExecTime[name]) + tERSL_TLC                   + End(name)          ,applyto='die'    )
 name='program TLC resume'   ; program_TLC_resume       = Operation.create(name=name  ,seq=Nop(ExecTime[name]) + tPROGO.shift_time(-300*US)  + End(name)          ,applyto='die'    )
+
+# scheduler 동작 순서 예시
+if 1 == 1:
+  sched = Scheduler(num_die=2, num_plane=4)
+  len_op = Operation.len_class()
+  id = np.random.choice(len_op, size=1, replace=True).tolist()[0]
+  op = Operation.get_by_id(id)
+  sched.setnow(0, 0, op)
+  sched.stat(-1, -1)
