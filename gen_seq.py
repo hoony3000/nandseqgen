@@ -414,6 +414,70 @@ class Operation(DeduplicateBase):
     """
     return f"Operation name={self.name}, id={self.id}, StateSeq id={self.seq.id}"
 
+class OperSeq:
+  """
+  Operation Sequence class 정의
+  """
+  def __init__(self, operations: List[Operation]):
+    """
+    생성자 정의
+    """
+    self.operations = operations
+
+class OperManager:
+  """
+  OperManager class 정의
+  """
+  def __init__(self):
+    """
+    생성자 정의
+    구현 필요
+    """
+    pass
+
+class HostReq:
+  """
+  HostReq class 정의
+  """
+  def __init__(self, id: int, name: str):
+    """
+    생성자 정의
+    """
+    self.id = id
+    self.name = name
+
+class HostReqGen:
+  """
+  HostReqGen class 정의
+  """
+  def __init__(self):
+    """
+    생성자 정의
+    구현 필요
+    """
+    pass
+
+  def create(self) -> HostReq:
+    """
+    HostReq 생성 함수
+    구현 필요
+    """
+    pass
+
+class HostReqInterpreter:
+  """
+  HostReqInterpreter class 정의
+  """
+  def __init__(self):
+    """
+    생성자 정의
+    구현 필요
+    """
+    pass
+
+
+
+  
 class Clock:
   def __init__(self, time):
     """
@@ -445,7 +509,7 @@ T = TypeVar('T')
 class Matrix2D(Generic[T]):
   """
   class instance 의 2차원 배열 indexing 을 tuple 형태로 간단하게 표현하기 위해서, 가독성을 위해서 정의한 helper class
-  ex) busytable[0][1] -> busytable[0, 1]
+  ex) statetable[0][1] -> statetable[0, 1]
   목적은 numpy 2차원 배열을 순회할 때 nested for 문을 사용하지 않고 간단하게 1차원 for 문을 사용할 수가 있는데,
   이걸 numpy 배열 뿐만 아니라 instance 의 2차원 배열로 확장하기 위해서 trick 을 썼음.
   코드 가독성과 type hint 를 사용한 자동 완성 기능을 위해서 특별히 고안됨.
@@ -507,9 +571,9 @@ class Matrix2D(Generic[T]):
           max_index = (i, j)
     return max_index
 
-class BusyTable:
+class StateTable:
   """
-  BusyTable class 정의
+  StateTable class 정의
   clock : Clock instance
   seq : StateSeq instance
   """
@@ -643,10 +707,10 @@ class StateMapper:
         self.rules[state] = prefix
     self.save()
 
-class Scheduler:
+class NANDScheduler:
   """
-  busytable 을 관리하기 위한 주체 class 정의
-  Scheduler 를 통해서만 busytable 에 Operation 추가 및 삭제 가능
+  statetable 을 관리하기 위한 주체 class 정의
+  Scheduler 를 통해서만 statetable 에 Operation 추가 및 삭제 가능
   clock : Clock instance
   num_die : die 갯수
   num_plane : plane 갯수
@@ -659,7 +723,7 @@ class Scheduler:
     self.clock: Clock = Clock(0)
     self.num_die: int = num_die
     self.num_plane: int = num_plane
-    self.busytable = Matrix2D([[BusyTable(self.clock) for _ in range(self.num_plane)] for _ in range(self.num_die)])
+    self.statetable = Matrix2D([[StateTable(self.clock) for _ in range(self.num_plane)] for _ in range(self.num_die)])
     self.targets = np.zeros((num_die, num_plane))
     self.indice = tuple(np.ndindex(self.targets.shape))
     self.mapper = StateMapper()
@@ -680,9 +744,9 @@ class Scheduler:
     self._set_targets(sel_die, sel_plane, applyt=applyto)
     for idx in self.indice:
       if self.targets[idx] == 1:
-        self.busytable[idx].set(seq)
+        self.statetable[idx].set(seq)
       else:
-        self.busytable[idx].set(Nop(seq.get_firsttime()))
+        self.statetable[idx].set(Nop(seq.get_firsttime()))
 
   def add(self, sel_die: int, sel_plane: int, op: Operation):
     """
@@ -693,14 +757,14 @@ class Scheduler:
     self._set_targets(sel_die, sel_plane, applyto=applyto)
     for idx in self.indice:
       if self.targets[idx] == 1:
-        self.busytable[idx].add(seq)
+        self.statetable[idx].add(seq)
 
-    idx_max = self.busytable.argmax(lambda x: x.get_lasttime())
-    max_val = self.busytable[idx_max].get_lasttime()
+    idx_max = self.statetable.argmax(lambda x: x.get_lasttime())
+    max_val = self.statetable[idx_max].get_lasttime()
 
     for idx in self.indice:
       if idx != idx_max:
-        self.busytable[idx].add(Nop(max_val-self.busytable[idx].getlasttime()))
+        self.statetable[idx].add(Nop(max_val-self.statetable[idx].getlasttime()))
 
   def setnow(self, sel_die: int, sel_plane: int, op: Operation):
     """
@@ -711,19 +775,19 @@ class Scheduler:
     self._set_targets(sel_die, sel_plane, applyto=applyto)
     for idx in self.indice:
       if self.targets[idx] == 1:
-        self.busytable[idx].setnow(seq)
+        self.statetable[idx].setnow(seq)
       else:
-        self.busytable[idx].setnow(seq.get_first())
+        self.statetable[idx].setnow(seq.get_first())
 
   def stat(self, sel_die: int, sel_plane: int):
     """
-    busytable 의 등록된 stateseq 를 모두 출력
+    statetable 의 등록된 stateseq 를 모두 출력
     """
     self._set_targets(sel_die, sel_plane)
     for idx in self.indice:
       if self.targets[idx] == 1:
         print(f"die: {idx[0]}, plane: {idx[1]}")
-        self.busytable[idx].stat()
+        self.statetable[idx].stat()
 
   def get_aheadtime(self, time: float) -> float:
     """
@@ -736,15 +800,15 @@ class Scheduler:
     (현재 시각 + time) 에서의 state 반환
     """
     _time = self.get_aheadtime(time)
-    return self.busytable[sel_die, sel_plane].expect(_time)
+    return self.statetable[sel_die, sel_plane].expect(_time)
 
   def expect_all(self, time: float) -> List[List[str]]:
     """
-    expect 를 모든 busytable 에 대해서 수행한 값을 반환
+    expect 를 모든 statetable 에 대해서 수행한 값을 반환
     """
     _time = self.get_aheadtime(time)
     self._set_targets(-1,-1)
-    return [[self.busytable[die, plane].expect(_time) for plane in range(self.num_plane)] for die in range(self.num_die)]
+    return [[self.statetable[die, plane].expect(_time) for plane in range(self.num_plane)] for die in range(self.num_die)]
 
   def _set_targets(self, sel_die: int, sel_plane: int, applyto='plane'):
     """
@@ -765,10 +829,10 @@ class Scheduler:
 
   def update(self):
     """
-    모든 busytable 을 현재 시각 기준으로 update 하여 과거 state 제거
+    모든 statetable 을 현재 시각 기준으로 update 하여 과거 state 제거
     """
     for idx in self.indice:
-      self.busytable[idx].update()
+      self.statetable[idx].update()
 
   def step(self, time: float):
     """
@@ -778,58 +842,121 @@ class Scheduler:
 
   def step_last(self):
     """
-    busytable 에 등록된 seq.times 중 시간적으로 가장 짧은 시간만큼 clock 을 이동
+    statetable 에 등록된 seq.times 중 시간적으로 가장 짧은 시간만큼 clock 을 이동
     목적은 현재 등록된 모든 StateSeq 의 validity check 를 위함
     아직 확실하게 어떻게 써야할 지 정해지지 않음
     """
-    idx_min = self.busytable.argmin(lambda x: x.get_lasttime())
-    self.clock.init(self.busytable[idx_min].get_lasttime())
+    idx_min = self.statetable.argmin(lambda x: x.get_lasttime())
+    self.clock.init(self.statetable[idx_min].get_lasttime())
 
   def squeeze(self):
     """
-    모든 busytable 에서 2번 이상 연속적으로 반복되는 state 원소들을 합침
+    모든 statetable 에서 2번 이상 연속적으로 반복되는 state 원소들을 합침
     """
     for idx in self.indice:
-      self.busytable[idx].squeeze()
+      self.statetable[idx].squeeze()
 
 class AddressManager:
-  def __init__(self, num_address: int, val: int, offset: int = 30):
-    self.adds: np.ndarray = np.full(num_address, val, dtype=int)
-    self.size: int = num_address
+  """
+  AddressManager class 정의
+  adds : address 상태를 저장하는 numpy 배열
+  size : adds 배열의 길이
+  readoffset : 읽기 오프셋 값
+  pagesize : 페이지 크기
+  addrstates : address 상태를 저장하는 numpy 배열
+  addrErasable : address erase 가능 여부를 저장하는 numpy 배열
+  addrPGMable : address PGM 가능 여부를 저장하는 numpy 배열
+  addrReadable : address 읽기 가능 여부를 저장하는 numpy 배열
+  isErasable : address erase 가능 여부를 저장하는 numpy 배열
+  isPGMable : address PGM 가능 여부를 저장하는 numpy 배열
+  isReadable : address 읽기 가능 여부를 저장하는 numpy 배열
+  """
+  # adds 배열의 상태 값 정의
+  # -4: not usable
+  # -3: ready to use
+  # -2: PGM closed
+  # -1: erased
+  # 0 to pagesize-1 : PGM 된 page 수
+  def __init__(self, num_address: int, pagesize: int, val: int, offset: int = 30):
+    """
+    생성자 정의
+    """
+    self.addrstates: np.ndarray = np.full(num_address, val, dtype=int)
+    self.num_address: int = num_address
     self.readoffset: int = offset
+    self.pagesize: int = pagesize
+    self.addrErasable: np.ndarray = np.array([], dtype=int)
+    self.addrPGMable: np.ndarray = np.array([], dtype=int)
+    self.addrReadable: np.ndarray = np.array([], dtype=int)
+    self.isErasable: np.ndarray = np.array([], dtype=bool)
+    self.isPGMable: np.ndarray = np.array([], dtype=bool)
+    self.isReadable: np.ndarray = np.array([], dtype=bool)
 
-  def get_eq(self, val):
-    return np.where(self.adds == val)[0]
+  def get_eq(self, val: int):
+    """
+    adds 배열에서 val 과 동일한 값을 갖는 index 반환
+    """
+    return np.where(self.addrstates == val)[0]
 
-  def get_gt(self, val):
-    return np.where(self.adds > val)[0]
+  def get_gt(self, val: int):
+    """
+    adds 배열에서 val 보다 큰 값을 갖는 index 반환
+    """
+    return np.where(self.addrstates > val)[0]
 
   def set_range_val(self, add_from: int, add_to: int, val: int):
-    self.adds[add_from:add_to+1] = val
+    """
+    adds 배열에서 add_from 부터 add_to 까지의 index 에 val 값을 할당
+    """
+    self.addrstates[add_from:add_to+1] = val
 
   def set_n_val(self, add_from: int, n: int, val: int):
-    self.adds[add_from:add_from + n] = val
+    """
+    adds 배열에서 add_from 부터 n 개의 index 에 val 값을 할당
+    """
+    self.addrstates[add_from:add_from + n] = val
 
   def set_adds_val(self, adds: np.ndarray, val: int):
-    self.adds[adds] = val
+    """
+    adds 배열에 val 값을 할당
+    """
+    self.addrstates[adds] = val
 
   def get_vals_adds(self, adds: np.ndarray):
-    return self.adds[adds]
+    """
+    adds 배열의 값을 반환
+    """
+    return self.addrstates[adds]
 
   def tolist(self):
-    return self.adds.tolist()
+    """
+    adds 배열을 list 형태로 반환
+    """
+    return self.addrstates.tolist()
 
   def get_size(self):
-    return self.size
+    """
+    adds 배열의 길이를 반환
+    """
+    return self.num_address
 
   def get_adds_erasable(self):
-    return np.where(self.adds != -4)[0]
+    """
+    adds 배열에서 -4 보다 큰 값을 갖는 index 반환
+    """
+    return np.where(self.addrstates != -4)[0]
 
   def get_adds_pgmable(self):
-    blkadds = np.where(self.adds >= -1)[0]
-    return np.array(tuple(zip(blkadds, self.adds[blkadds]+1)))
+    """
+    adds 배열에서 -2 이상인 값을 갖는 index 반환
+    """
+    blkadds = np.where(self.addrstates >= -1)[0]
+    return np.array(tuple(zip(blkadds, self.addrstates[blkadds]+1)))
 
   def get_adds_readable(self, offset: int = None):
+    """
+    adds 배열에서 -2 보다 큰 값을 갖는 index 반환
+    """
     try:
       if(offset):
         _offset = offset
@@ -838,8 +965,8 @@ class AddressManager:
     except ValueError:
       print(f"offset 값 오류")
 
-    blkadds = np.where( (self.adds >= -2) & (self.adds >= _offset) )[0]
-    readadds = self.adds[blkadds]
+    blkadds = np.where( (self.addrstates >= -2) & (self.addrstates >= _offset) )[0]
+    readadds = self.addrstates[blkadds]
     readadds -= _offset
 
     arr_tot = []
@@ -848,6 +975,14 @@ class AddressManager:
       arr_tot.extend(arr)
 
     return np.array(arr_tot)
+  
+  def update(self):
+    """
+    adds 배열의 값을 업데이트
+    구현 필요
+    """
+    pass
+    
 
   def sample_erasable(self, num: int):
     arr = self.get_adds_erasable()

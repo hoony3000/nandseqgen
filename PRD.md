@@ -21,15 +21,15 @@
 
 ### -. class: **AddressManager**
 #### NAND Address 별로 Erase, PGM, Read 가능한 상태를 업데이트 한다.
-#### n_pages, addrstates, addrErasable, addrPGMable, addrReadable, isErasable, isPGMable, isReadable 속성을 지님.
-#### int: **n_pages**
+#### num_address, pagesize, readoffset, addrstates, addrErasable, addrPGMable, addrReadable, isErasable, isPGMable, isReadable 속성을 지님.
+#### int: **pagesize**
 ##### 한 block 안에서 page 의 갯수
 #### **addrstates**
 ###### -4: not usable
 ###### -3: ready to use
-###### -2: closed
+###### -2: PGM closed
 ###### -1: erased
-###### 0 to n_pages-1 : PGM 된 page 수
+###### 0 to pagesize-1 : PGM 된 page 수
 ##### 배열의 형태
 ##### 원소의 값에 따라 다음과 같은 상태를 나타낸다.
 #### List of int: **addrErasable**
@@ -62,12 +62,12 @@
 ##### C.times = concat(A.times, B.times)
 ##### C.id = hash of (C.states, C.times)
 
-### -. class: **StateManager**
+### -. class: **StateTable**
 #### StateSeq 를 입력 받아 statetable 에 추가 및 변경한다.
 #### clock, statetable 속성을 지님.
 #### Clock: **clock**
 ##### Clock 의 instance.
-#### StateSeq:**statetable**
+#### StateSeq: **statetable**
 ##### clock 의 현재 시각 이후의 StateSeq 를 등록한다.
 ##### 특정 시각 t 에서의 state 값을 반환한다.
 
@@ -115,13 +115,17 @@
 #### **clock**
 ##### Clock 의 instance
 
-### -. dict: **StateOperWeightDict**
-#### State 와 Operation 의 조합에 해당하는 0-1 사이의 확률 값을 가지는 dictionary data.
-#### StateOperWeight.yaml 파일에 정의
+### -. dict: **StateOperWeight**
+#### State 와 Operation 의 조합에 해당하는 0-1 사이의 확률 값을 정의.
+#### config.yaml 파일에 정의
 
-### -. dict: **TimeSpecDict**
-#### state 마다 execution time 을 정의. 별도의 TimeSpec.yaml 파일에서 읽어온다.
-#### TimeSpec.yaml 파일에 정의
+### -. dict: **TimeSpec**
+#### state 마다 지속되는 시간을 정의.
+#### config.yaml 파일에 정의
+
+### -. dict: **ExecTime**
+#### Operation 에서 command execution time 을 정의.
+#### config.yaml 파일에 정의
 
 ---
 ## Test Flow 정의

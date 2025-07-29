@@ -4,9 +4,10 @@ import yaml
 if __name__ == "__main__":
   TimeSpec = {}
   ExecTime = {}
+  StateOperWeight = {}
   
   # yaml 파일 load 하여 AC timing load
-  with open('timespecs.yaml', 'r', encoding='utf-8') as file:
+  with open('config.yaml', 'r', encoding='utf-8') as file:
     Dict = yaml.safe_load(file)
     TimeSpec = Dict['TimeSpec']
     ExecTime = Dict['ExecTime']
@@ -52,7 +53,7 @@ if __name__ == "__main__":
   
   # scheduler 동작 순서 예시
   if 1 == 1:
-    sched = Scheduler(num_die=2, num_plane=4)
+    sched = NANDScheduler(num_die=2, num_plane=4)
     len_op = Operation.len_class()
     id = np.random.choice(len_op, size=1, replace=True).tolist()[0]
     op = Operation.get_by_id(id)
