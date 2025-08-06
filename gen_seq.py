@@ -125,7 +125,7 @@ class NamedInstanceBase(DeduplicateBase):
                 )
         ids = np.random.choice(cls.len_class(), size=_size, replace=replace, p=_weights)
         return [cls.get_by_id(id) for id in ids]
-    
+
     def __post_init__(self):
         """
         _instance_by_name update
@@ -134,7 +134,6 @@ class NamedInstanceBase(DeduplicateBase):
 
     def __repr__(self):
         return f"class:{self.__class__.__name__}, name:{self.name}, id:{self.id}"
-
 
 
 @dataclass
