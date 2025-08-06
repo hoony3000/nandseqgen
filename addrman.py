@@ -572,7 +572,7 @@ class AddressManager:
         """
         if force_new:
             self.addrReadable = self._get_multi_readable(
-                offset=offset, sel_plane=sel_plane, offset=offset, mode=mode
+                offset=offset, mode=mode, sel_plane=sel_plane
             )
         return self.addrReadable
 
@@ -868,7 +868,7 @@ class AddressManager:
 
         # Create subplots
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        fig.subtilte(title, fontsize=16)
+        fig.suptitle(title, fontsize=16)
 
         # Command frequency histogram
         cmd_counts = {}
