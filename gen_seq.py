@@ -1,22 +1,25 @@
+from addrman import *
+import os
+import yaml
+import numpy as np
+from dataclasses import dataclass, field
+import weakref
+import threading
+import hashlib
+import itertools
+from typing import Union, List, Tuple, TypeVar, Generic, Callable, Any, Set
+import bisect
+
 NS = 1
 US = 10**3
 MS = 10**6
 S = 10**9
 INF = 20 * 10**9
 
-import bisect
-from typing import Union, List, Tuple, TypeVar, Generic, Callable, Any, Set
-import itertools
-import hashlib
-import threading
-import weakref
-from dataclasses import dataclass, field
-import numpy as np
-import yaml
-import os
-
 
 # 중복 instance 생성 방지를 위한 parent class 정의
+
+
 class DeduplicateBase:
     """
     multi-thread 환경(필요하다면)에서 instance 중복 생성 방지를 위한 id, lock, counter
@@ -26,6 +29,17 @@ class DeduplicateBase:
     _global_instances = weakref.WeakValueDictionary()
     _class_counters = {}
     _class_instances_by_id = {}
+
+    @classmethod
+    def _get_class_counter(cls):
+        """
+        instance 생성 시 id, counter 값 부여
+        """
+        if cls not in cls._class_counters:
+            cls._class_counters[cls] = itertools.count()
+            # python 내부 메모리 관리를 위한 garbage collection 을 위한 구문. chatGPT 제안해서 씀
+            cls._class_instances_by_id[cls] = {}
+        return cls._class_counters[cls]
 
     @classmethod
     def create(cls, *args, force_new=False, **kwargs):
@@ -70,17 +84,57 @@ class DeduplicateBase:
         """
         raise NotImplementedError()
 
+
+@dataclass
+class NamedInstanceBase(DeduplicateBase):
+    """
+    name 으로 instance 를 반환 가능한 base class
+    name: instance 이름
+    id : instance id
+    _instance_by_name : name 으로 instance 반환하기 위한 dict
+    """
+
+    name: str
+    id: int = field(init=False, default=None)
+    _instance_by_name = {}
+
     @classmethod
-    def _get_class_counter(cls):
+    def get_instance_by_name(cls, name: str):
+        return cls._instance_by_name.get(name, None)
+
+    @classmethod
+    def get_id_by_name(cls, name: str):
+        return cls.get_instance_by_name(name).id
+
+    @classmethod
+    def samples(
+        cls, size: int = 1, replace: bool = True, weights: List | np.ndarray = None
+    ):
+        size_all = cls.len_class()
+        _weights = weights
+        _size = size
+        if weights is None:
+            if size > size_all:
+                _size = size_all
+        else:
+            if len(weights) == size_all:
+                _weights = arr_to_nparr(weights)
+            else:
+                raise ValueError(
+                    f"len(weights) does not match the size of all instances: {len(weights)} != {size_all}"
+                )
+        ids = np.random.choice(cls.len_class(), size=_size, replace=replace, p=_weights)
+        return [cls.get_by_id(id) for id in ids]
+    
+    def __post_init__(self):
         """
-        클래스별로 독립적인 카운터를 반환합니다.
-        카운터가 없으면 새로 생성합니다.
+        _instance_by_name update
         """
-        with cls._global_lock:
-            if cls not in cls._class_counters:
-                cls._class_counters[cls] = itertools.count()
-                cls._class_instances_by_id[cls] = {}
-            return cls._class_counters[cls]
+        self.__class__.instance_by_name[self.name] = self
+
+    def __repr__(self):
+        return f"class:{self.__class__.__name__}, name:{self.name}, id:{self.id}"
+
 
 
 @dataclass
@@ -96,10 +150,13 @@ class StateSeq(DeduplicateBase):
     times: Union[int, float, List[int], List[float], np.ndarray]
     states: Union[str, List[str], np.ndarray]
     id: int = field(init=False, default=None)
-    length: int = field(init=False, default=None)
 
     @classmethod
-    def _make_key(cls, times, states):
+    def _make_key(
+        cls,
+        times: Union[int, float, List[int], List[float], np.ndarray],
+        states: Union[str, List[str], np.ndarray],
+    ):
         """
         instance 의 unique 한 id 생성을 위한 hash key 생성 함수
         """
@@ -185,6 +242,12 @@ class StateSeq(DeduplicateBase):
         연산자 오버로딩 : == 연산자
         """
         return isinstance(other, StateSeq) and self.id == other.id
+
+    def __repr__(self):
+        """
+        연산자 오버로딩 : print(stateseq) 시 출력 값 정의
+        """
+        return f"StateSeq id={self.id}, times_len={len(self.times)}, states_len={len(self.states)}"
 
     def shift_time(self, time: float) -> "StateSeq":
         """
@@ -356,12 +419,6 @@ class StateSeq(DeduplicateBase):
         """
         return self.times[:], self.states[:]
 
-    def __repr__(self):
-        """
-        연산자 오버로딩 : print(stateseq) 시 출력 값 정의
-        """
-        return f"StateSeq id={self.id}, times_len={len(self.times)}, states_len={len(self.states)}"
-
 
 def Idle(time: float) -> StateSeq:
     """
@@ -385,20 +442,30 @@ def End(state: str) -> StateSeq:
 
 
 @dataclass
-class Operation(DeduplicateBase):
+class Operation(NamedInstanceBase):
     """
     Operation class 정의
     name : operation 이름
     seq : StateSeq instance
     applyto : die-level 또는 plane-level
-    id : instance 생성 시 고유 값 부여, 0부터 시작
     """
 
     name: str
     seq: StateSeq
     applyto: str
     id: int = field(init=False, default=None)
-    _instance_by_name = {}
+
+    @classmethod
+    def _make_key(cls, name: str, seq: StateSeq, applyto: str):
+        """
+        instance 의 unique 한 id 생성을 위한 hash key 생성 함수
+        """
+        return hashlib.sha256(
+            np.array(name + str(seq.id) + applyto).tobytes()
+        ).hexdigest()
+
+    def __repr__(self):
+        return super().__repr__()
 
     def get_seq(self) -> StateSeq:
         """
@@ -411,24 +478,6 @@ class Operation(DeduplicateBase):
         applyto 반환
         """
         return self.applyto
-
-    @classmethod
-    def _make_key(cls, name: str, seq: StateSeq, applyto: str):
-        """
-        instance 의 unique 한 id 생성을 위한 hash key 생성 함수
-        """
-        name_array = np.array([name, applyto])
-        time_array = np.array(seq.get_times())
-        state_array = np.array(seq.get_states())
-        return hashlib.sha256(
-            name_array.tobytes() + time_array.tobytes() + state_array.tobytes()
-        ).hexdigest()
-
-    def __repr__(self):
-        """
-        연산자 오버로딩 : print(operation) 의 값 반환
-        """
-        return f"Operation name={self.name}, id={self.id}, StateSeq id={self.seq.id}"
 
 
 class OperSeq:
@@ -456,17 +505,26 @@ class OperManager:
         pass
 
 
-class HostReq:
+@dataclass
+class HostReq(NamedInstanceBase):
     """
     HostReq class 정의
+    name : Request name
+    id : Request 고유값
     """
 
-    def __init__(self, id: int, name: str):
+    name: str
+    id: int = field(init=False, default=None)
+
+    @classmethod
+    def _make_key(cls, name: str):
         """
-        생성자 정의
+        instance 의 unique 한 id 생성을 위한 hash key 생성 함수
         """
-        self.id = id
-        self.name = name
+        return hashlib.sha256(np.array([name], dtype=str).tobytes()).hexdigest()
+
+    def __repr__(self):
+        return super().__repr__()
 
 
 class HostReqGen:
@@ -477,13 +535,6 @@ class HostReqGen:
     def __init__(self):
         """
         생성자 정의
-        구현 필요
-        """
-        pass
-
-    def create(self) -> HostReq:
-        """
-        HostReq 생성 함수
         구현 필요
         """
         pass
@@ -749,23 +800,28 @@ class NANDScheduler:
     targets : die-level 또는 plane-level 에서 seq 추가를 위해 만든 index 배열
     """
 
-    def __init__(self, num_die: int, num_plane: int):
+    def __init__(self, num_dies: int, num_planes: int, num_blocks: int, pagesize: int):
         """
         생성자 정의
         """
         self.clock: Clock = Clock(0)
-        self.num_die: int = num_die
-        self.num_plane: int = num_plane
+        self.num_dies: int = num_dies
+        self.num_planes: int = num_planes
+        self.num_blocks: int = num_blocks
         self.statetable = Matrix2D(
             [
-                [StateTable(self.clock) for _ in range(self.num_plane)]
+                [StateTable(self.clock) for _ in range(self.num_planes)]
                 for _ in range(self.num_die)
             ]
         )
-        self.targets = np.zeros((num_die, num_plane))
+        self.targets = np.zeros((num_dies, num_planes))
         self.indice = tuple(np.ndindex(self.targets.shape))
         self.mapper = StateMapper()
-        self.cur_states = np.full((num_die, num_plane), "idle", dtype=str)
+        self.addman = [
+            AddressMananer(num_planes, num_blocks, pagesize, GOOD)
+            for _ in range(self.num_dies)
+        ]
+        self.cur_states = np.full((num_dies, num_planes), "idle", dtype=str)
 
     def get_time(self):
         """
@@ -901,154 +957,3 @@ class NANDScheduler:
         """
         for idx in self.indice:
             self.statetable[idx].squeeze()
-
-
-class AddressManager:
-    """
-    AddressManager class 정의
-    adds : address 상태를 저장하는 numpy 배열
-    size : adds 배열의 길이
-    readoffset : 읽기 오프셋 값
-    pagesize : 페이지 크기
-    addrstates : address 상태를 저장하는 numpy 배열
-    addrErasable : address erase 가능 여부를 저장하는 numpy 배열
-    addrPGMable : address PGM 가능 여부를 저장하는 numpy 배열
-    addrReadable : address 읽기 가능 여부를 저장하는 numpy 배열
-    isErasable : address erase 가능 여부를 저장하는 numpy 배열
-    isPGMable : address PGM 가능 여부를 저장하는 numpy 배열
-    isReadable : address 읽기 가능 여부를 저장하는 numpy 배열
-    """
-
-    # adds 배열의 상태 값 정의
-    # -4: not usable
-    # -3: ready to use
-    # -2: PGM closed
-    # -1: erased
-    # 0 to pagesize-1 : PGM 된 page 수
-    def __init__(self, num_address: int, pagesize: int, val: int, offset: int = 30):
-        """
-        생성자 정의
-        """
-        self.addrstates: np.ndarray = np.full(num_address, val, dtype=int)
-        self.num_address: int = num_address
-        self.readoffset: int = offset
-        self.pagesize: int = pagesize
-        self.addrErasable: np.ndarray = np.array([], dtype=int)
-        self.addrPGMable: np.ndarray = np.array([], dtype=int)
-        self.addrReadable: np.ndarray = np.array([], dtype=int)
-        self.isErasable: np.ndarray = np.array([], dtype=bool)
-        self.isPGMable: np.ndarray = np.array([], dtype=bool)
-        self.isReadable: np.ndarray = np.array([], dtype=bool)
-
-    def get_eq(self, val: int):
-        """
-        adds 배열에서 val 과 동일한 값을 갖는 index 반환
-        """
-        return np.where(self.addrstates == val)[0]
-
-    def get_gt(self, val: int):
-        """
-        adds 배열에서 val 보다 큰 값을 갖는 index 반환
-        """
-        return np.where(self.addrstates > val)[0]
-
-    def set_range_val(self, add_from: int, add_to: int, val: int):
-        """
-        adds 배열에서 add_from 부터 add_to 까지의 index 에 val 값을 할당
-        """
-        self.addrstates[add_from : add_to + 1] = val
-
-    def set_n_val(self, add_from: int, n: int, val: int):
-        """
-        adds 배열에서 add_from 부터 n 개의 index 에 val 값을 할당
-        """
-        self.addrstates[add_from : add_from + n] = val
-
-    def set_adds_val(self, adds: np.ndarray, val: int):
-        """
-        adds 배열에 val 값을 할당
-        """
-        self.addrstates[adds] = val
-
-    def get_vals_adds(self, adds: np.ndarray):
-        """
-        adds 배열의 값을 반환
-        """
-        return self.addrstates[adds]
-
-    def tolist(self):
-        """
-        adds 배열을 list 형태로 반환
-        """
-        return self.addrstates.tolist()
-
-    def get_size(self):
-        """
-        adds 배열의 길이를 반환
-        """
-        return self.num_address
-
-    def get_adds_erasable(self):
-        """
-        adds 배열에서 -4 보다 큰 값을 갖는 index 반환
-        """
-        return np.where(self.addrstates != -4)[0]
-
-    def get_adds_pgmable(self):
-        """
-        adds 배열에서 -2 이상인 값을 갖는 index 반환
-        """
-        blkadds = np.where(self.addrstates >= -1)[0]
-        return np.array(tuple(zip(blkadds, self.addrstates[blkadds] + 1)))
-
-    def get_adds_readable(self, offset: int = None):
-        """
-        adds 배열에서 -2 보다 큰 값을 갖는 index 반환
-        """
-        try:
-            if offset:
-                _offset = offset
-            else:
-                _offset = self.readoffset
-        except ValueError:
-            print(f"offset 값 오류")
-
-        blkadds = np.where((self.addrstates >= -2) & (self.addrstates >= _offset))[0]
-        readadds = self.addrstates[blkadds]
-        readadds -= _offset
-
-        arr_tot = []
-        for idx, blkadd in enumerate(blkadds):
-            arr = [(blkadd, readadd) for readadd in range(readadds[idx] + 1)]
-            arr_tot.extend(arr)
-
-        return np.array(arr_tot)
-
-    def update(self):
-        """
-        adds 배열의 값을 업데이트
-        구현 필요
-        """
-        pass
-
-    def sample_erasable(self, num: int):
-        arr = self.get_adds_erasable()
-        idx = np.random.choice(len(arr), size=num, replace=False)
-        return arr[idx]
-
-    def sample_pgmable(self, num: int):
-        arr = self.get_adds_pgmable()
-        idx = np.random.choice(len(arr), size=num, replace=False)
-        return arr[idx]
-
-    def sample_readable(self, num: int, offset: int = None):
-        try:
-            if offset:
-                arr = self.get_adds_readable(offset)
-            else:
-                arr = self.get_adds_readable()
-        except ValueError:
-            print(f"offset 값 오류")
-
-        idx = np.random.choice(len(arr), size=num, replace=False)
-        return arr[idx]
