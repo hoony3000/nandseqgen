@@ -3,10 +3,10 @@ import itertools
 import seaborn as sns
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from matplotlib import Line2D
+from matplotlib.lines import Line2D
 from matplotlib import cm
 from matplotlib.colors import Normalize
-from mpl_toolkits.mplot3d import Line3DCollection
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
 # from loguru import logger
 TLC = "TLC"
@@ -18,7 +18,7 @@ GOOD = -2
 ERASE = -1
 
 CMD_VOCAB = {"ERASE": 0, "PGM": 1, "READ": 2}
-ADDR_KEYS = {"plane", "block", "page"}
+ADDR_KEYS = ["plane", "block", "page"]
 
 
 def arr_to_nparr(adds: list | np.ndarray):
@@ -33,7 +33,7 @@ def arr_to_nparr(adds: list | np.ndarray):
         return adds
     else:
         raise TypeError(
-            "adds must be a list, tuple, set, int, or numpy array of integers: {type(adds)}"
+            f"adds must be a list, tuple, set, int, or numpy array of integers: {type(adds)}"
         )
 
 
@@ -41,7 +41,7 @@ def reduce_to_blkarr(adds: np.ndarray):
     if isinstance(adds, np.ndarray) and adds.dtype.kind in {"i", "u"}:
         return adds.reshape(-1, adds.shape[-1])[:, 0]
     else:
-        raise TypeError("adds must be a numpy array of integers: {type(adds)}")
+        raise TypeError(f"adds must be a numpy array of integers: {type(adds)}")
 
 
 def to_1D_blkaddr(adds: list | np.ndarray):
@@ -59,12 +59,12 @@ def empty_arr():
 def all_subsets(s):
     return list(
         itertools.chain.from_iterable(
-            itertools.combinations(s, r) for r in range(len(s) + 1)
+            itertools.combinations(s, r) for r in range(1, len(s) + 1)
         )
     )
 
 
-class AddressMananer:
+class AddressManager:
     """
     AddressManager class 정의
     num_address : block address 갯수
@@ -85,7 +85,7 @@ class AddressMananer:
     # -3: badblock
     # -2: goodblock not erased
     # -1: erased
-    # 0 to pagesize-1: PGM 된 page 수
+    # 0 to pagesize-1 : PGM 된 page 수
     set_plane: set = {0, 1, 2, 4, 6}
 
     def __init__(
@@ -114,16 +114,16 @@ class AddressMananer:
         self.undo_modes: np.ndarray = np.array([], dtype=int)
         self.oversample: bool = False
 
-        if num_planes in AddressMananer.set_plane:
+        if num_planes in AddressManager.set_plane:
             self.num_planes = num_planes
         else:
             raise ValueError(
-                f"num_planes must be one of {AddressMananer.set_plane}, got {num_planes}"
+                f"num_planes must be one of {AddressManager.set_plane}, got {num_planes}"
             )
 
         if isinstance(num_blocks, int) and num_blocks > 0:
             self.num_blocks = num_blocks
-            if isinstance(init, int) and list > BAD or init < pagesize:
+            if isinstance(init, int) and init > BAD or init < pagesize:
                 self.addrstates = np.full(num_blocks, init, dtype=int)
                 self.addrmodes = np.full(
                     num_blocks, TBD, dtype=object
@@ -171,7 +171,7 @@ class AddressMananer:
         """
         adds 배열에 val 값을 할당
         """
-        tmp_adds = to_1D_blkaddr(adds)
+        tmp_adds = to_1D_blkaddr(adds)  # 1차원 배열
 
         if np.any(tmp_adds >= self.num_blocks):
             raise IndexError(
@@ -193,7 +193,7 @@ class AddressMananer:
         adds 배열에 erase 동작을 수행
         len(adds.shape) = 1
         """
-        tmp_adds = to_1D_blkaddr(adds)
+        tmp_adds = to_1D_blkaddr(adds)  # 1차원 배열
         adds_all = self.get_erasable()
 
         if len(tmp_adds) == 0 or len(adds_all) == 0:
@@ -221,7 +221,7 @@ class AddressMananer:
         adds 배열에 pgm 동작을 수행
         len(adds.shape) = 1
         """
-        tmp_adds = to_1D_blkaddr(adds)
+        tmp_adds = to_1D_blkaddr(adds)  # 1차원 배열
         adds_all = self.get_pgmable(mode=mode)
 
         if len(tmp_adds) == 0 or len(adds_all) == 0:
@@ -229,7 +229,7 @@ class AddressMananer:
 
         adds_all = reduce_to_blkarr(adds_all)  # 1차원 배열
         if all(add in adds_all for add in tmp_adds):
-            if all(val == mode for val in self.addrsmodes[tmp_adds]):
+            if all(val == mode for val in self.addrmodes[tmp_adds]):
                 # in case of abortion to restore addrstates, addrmodes
                 self.undo_addrs = tmp_adds
                 self.undo_states = self.addrstates[tmp_adds].copy()
@@ -239,19 +239,19 @@ class AddressMananer:
 
                 return adds
             else:
-                raise ValueError(f"every value in adds must be equal to mode arg")
+                raise ValueError(f"every value in addrmodes must be equal to mode arg")
         else:
             raise ValueError(f"every value in adds must be in addrPGMable")
 
     def get_addrstates(self) -> np.ndarray:
         """
-        addrstates 배열을 반환
+        addrstates 반환
         """
         return self.addrstates
 
     def get_addrmodes(self) -> np.ndarray:
         """
-        addrmodes 배열을 반환
+        addrmodes 반환
         """
         return self.addrmodes
 
@@ -280,19 +280,19 @@ class AddressMananer:
         """
         if adds is None:
             if file is None:
-                for i, add in enuerate(self.tolist()):
-                    print(f"{i}: {add}")
+                for i, add in enumerate(self.tolist()):
+                    print(f"{i} : {add}")
             else:
                 for i, add in enumerate(self.tolist()):
-                    file.write(f"{i}: {add}\n")
+                    file.write(f"{i} : {add}\n")
         else:
             tmp_adds = to_1D_blkaddr(adds)
             if file is None:
                 for i, add in enumerate(self.tolist(tmp_adds)):
-                    print(f"{tmp_adds[i]}: {add}")
+                    print(f"{tmp_adds[i]} : {add}")
             else:
                 for i, add in enumerate(self.tolist(tmp_adds)):
-                    file.write(f"{tmp_adds[i]}: {add}\n")
+                    file.write(f"{tmp_adds[i]} : {add}\n")
 
     def get_size(self):
         """
@@ -314,7 +314,7 @@ class AddressMananer:
 
         return sub_indices[mask]
 
-    def _get_erasable(self, sel_plane: list = None):
+    def _get_erasable(self, sel_plane: int = None):
         """
         adds 배열에서 BAD 가 아닌 값을 갖는 index 반환
         sel_plane : 선택된 plane 인덱스
@@ -460,7 +460,7 @@ class AddressMananer:
 
         res = np.array(arr_tot, dtype=int)
 
-        return res.reshpae(res.shape[0], 1, -1)  # shape: (?, 1, 2)
+        return res.reshape(res.shape[0], 1, -1)  # shape: (?, 1, 2)
 
     def _get_multi_readable(self, sel_plane: list, offset: int = None, mode=TLC):
         """
@@ -499,11 +499,11 @@ class AddressMananer:
         for i in range(blkadds.shape[0]):
             r = minvals[i] + 1
             Ai_repeat = np.repeat(blkadds[i : i + 1, :], r, axis=0)
-            ri = np.repeat(np.range(r).reshape(-1, 1), blkadds.shape[1], axis=1)
+            ri = np.repeat(np.arange(r).reshape(-1, 1), blkadds.shape[1], axis=1)
             combined = np.dstack([Ai_repeat, ri])
             arr_tot.extend(combined)
 
-        return np.vstack(arr_tot)
+        return np.vstack(arr_tot) # shape: (?, len(sel_plane), 2)
 
     def get_erasable(self, sel_plane: int | list = None, force_new: bool = True):
         """
@@ -542,7 +542,7 @@ class AddressMananer:
         multi addrPGMable 반환
         """
         if force_new:
-            self.addrPGMable = self._get_multi_pgmable(sel_plane=sel_plane, mode=mode)
+            self.addrPGMable = self._get_multi_pgmable(mode=mode, sel_plane=sel_plane)
         return self.addrPGMable
 
     def get_readable(
@@ -572,7 +572,7 @@ class AddressMananer:
         """
         if force_new:
             self.addrReadable = self._get_multi_readable(
-                sel_plane=sel_plane, offset=offset, mode=mode
+                offset=offset, sel_plane=sel_plane, offset=offset, mode=mode
             )
         return self.addrReadable
 
@@ -586,7 +586,7 @@ class AddressMananer:
             return self.addrErasable
         else:
             self.oversample = False
-            idx = np.random.chocie(size_tot, size=size, replace=False)
+            idx = np.random.choice(size_tot, size=size, replace=False)
             return self.addrErasable[idx]
 
     def sample_pgmable(self, size: int = 1, sequential: bool = False):
@@ -631,7 +631,7 @@ class AddressMananer:
         """
         size_tot = len(self.addrReadable)
 
-        if sequential == False:
+        if not sequential:
             if size > size_tot:
                 self.oversample = True
                 return self.addrReadable
@@ -686,7 +686,7 @@ class AddressMananer:
         sel_plane : 선택된 plane 인덱스
         """
         if sel_plane is None or isinstance(sel_plane, int) or len(sel_plane) == 1:
-            self.get_pgmable(mode=mode, sel_plane=sel_plane)
+            self.get_pgmable(sel_plane=sel_plane, mode=mode)
         else:
             self.get_multi_pgmable(sel_plane=sel_plane, mode=mode)
 
@@ -713,7 +713,7 @@ class AddressMananer:
         sel_plane : 선택된 plane 인덱스
         """
         if sel_plane is None or isinstance(sel_plane, int) or len(sel_plane) == 1:
-            self.get_readable(offset=offset, mode=mode, sel_plane=sel_plane)
+            self.get_readable(sel_plane=sel_plane, mode=mode, offset=offset)
         else:
             self.get_multi_readable(sel_plane=sel_plane, mode=mode, offset=offset)
 
@@ -733,7 +733,7 @@ class AddressMananer:
                 addr = {k: vec[i] for i, k in enumerate(ADDR_KEYS)}
                 block = addr["block"]
                 page = addr["page"]
-                block_traces.setdefault(block, []).append((page, t, page))
+                block_traces.setdefault(block, []).append((page, t, cmd_id))
 
         # Define a color palette
         colors = [
@@ -781,7 +781,7 @@ class AddressMananer:
         ]
 
         ax.legend(handles=legend_elements, title="Commands")
-        ax.set_xlabels("Block")
+        ax.set_xlabel("Block")
         ax.set_ylabel("Page")
         ax.set_zlabel("Time")
         ax.set_title(title)
@@ -813,8 +813,8 @@ class AddressMananer:
                 block = addr["block"]
                 page = addr["page"]
                 if binned:
-                    block = int(block / self.num_blocks * block_bins - 1)
-                    page = int(page / self.pagesize * page_bins - 1)
+                    block = int(block / self.num_blocks * (block_bins - 1))
+                    page = int(page / self.pagesize * (page_bins - 1))
 
                 block_idxs.append(block)
                 page_idxs.append(page)
@@ -833,7 +833,7 @@ class AddressMananer:
 
         plt.figure(figsize=(10, 6))
         sns.heatmap(
-            heatmap_array,
+            heatmap_array.T,
             cmap="Reds",
             cbar=True,
             xticklabels=xtiklabels,
@@ -849,7 +849,7 @@ class AddressMananer:
     def visual_freq_histograms(self, seq: list, title="Operation Frequency Histograms"):
         """
         Generate frequency histograms for commands, planes, blocks, and pages from sequence data
-        seq: (cmd_id, (plane, block, page))
+        seq: (cmd_id, (plane, block, page)) tuples
         title: figure title
         """
         # Extract all components from sequence
@@ -876,7 +876,7 @@ class AddressMananer:
             cmd_counts[cmd] = cmd_counts.get(cmd, 0) + 1
 
         cmd_names = list(CMD_VOCAB.keys())
-        cmd_values = [cmd_counts.get(cmd, 0) for cmd in cmd_names]
+        cmd_values = [cmd_counts.get(i, 0) for i in range(len(cmd_names))]
 
         axes[0, 0].bar(range(len(cmd_names)), cmd_values)
         axes[0, 0].set_xticks(range(len(cmd_names)))
@@ -940,7 +940,7 @@ if 1 == 1:
     badlist = []
 
     # instance creation
-    addman = AddressMananer(
+    addman = AddressManager(
         num_planes=num_planes,
         num_blocks=num_blocks,
         pagesize=pagesize,
@@ -949,10 +949,10 @@ if 1 == 1:
         badlist=badlist,
     )
 
-    # dict 초기화 : cmd, planes, modes
+    # dict 초기화 : cmds, planes, modes
     dict_cmds = {i: 0 for i in ("ERASE", "PGM", "READ")}
     comb_planes = all_subsets(set(range(num_planes)))
-    # print(f"plane combinations: {comb_planes})
+    # print(f"plane combinations: {comb_planes}")
     dict_planes = {str(comb): 0 for comb in comb_planes}
     dict_modes = {mode: 0 for mode in (TLC, SLC)}
 
@@ -980,7 +980,22 @@ if 1 == 1:
         f"pre erase succ rate: {cnt/cnt_tot:.2f}, total blocks: {num_blocks}, attempt:{cnt_tot}, success: {cnt}"
     )
     print(
-        f"{test_mode} erased block rate: {np.sum((states > ERASE) & (modes == test_mode))/num_blocks}"
+        f"{test_mode} erased block rate: {np.sum((states == ERASE) & (modes == test_mode))/num_blocks}"
+    )
+
+    # 사전 pgm
+    cnt_tot = cnt = 0
+    for _ in range(int(erased_blocks * pagesize * p_init_pgm)):
+        adds = addman.random_pgm(mode=test_mode)
+        cnt_tot += 1
+        if len(adds):
+            cnt += 1
+
+    print(
+        f"pre pgm succ rate: {cnt/cnt_tot:.2f}, total blocks: {num_blocks}, attempt:{cnt_tot}, success: {cnt}"
+    )
+    print(
+        f"{test_mode} pgmed block rate: {np.sum((states > ERASE) & (modes == test_mode))/num_blocks}"
     )
 
     # sampling 반복
@@ -990,7 +1005,7 @@ if 1 == 1:
         for i in range(num_samples):
             op = np.random.choice(list(CMD_VOCAB.keys()), p=p_opers)
             sel_plane = comb_planes[np.random.choice(len(comb_planes), p=p_planes)]
-            # mode = np.random.choice(list(dict_modes.keys()), p=p_planes)
+            # mode = np.random.choice(list(dict_modes.keys()), p=p_modes)
             mode = test_mode
             match op:
                 case "ERASE":
