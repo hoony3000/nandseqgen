@@ -38,7 +38,7 @@ class DeduplicateBase:
         if cls not in cls._class_counters:
             cls._class_counters[cls] = itertools.count()
             # python 내부 메모리 관리를 위한 garbage collection 을 위한 구문. chatGPT 제안해서 씀
-            cls._class_instances_by_id[cls] = {}
+            cls._class_instances_by_id[cls] = weakref.WeakValueDictionary()
         return cls._class_counters[cls]
 
     @classmethod
@@ -123,6 +123,7 @@ class NamedInstanceBase(DeduplicateBase):
                 raise ValueError(
                     f"len(weights) does not match the size of all instances: {len(weights)} != {size_all}"
                 )
+            
         ids = np.random.choice(cls.len_class(), size=_size, replace=replace, p=_weights)
         return [cls.get_by_id(id) for id in ids]
 
@@ -130,7 +131,7 @@ class NamedInstanceBase(DeduplicateBase):
         """
         _instance_by_name update
         """
-        self.__class__.instance_by_name[self.name] = self
+        self.__class__._instance_by_name[self.name] = self
 
     def __repr__(self):
         return f"class:{self.__class__.__name__}, name:{self.name}, id:{self.id}"
@@ -200,7 +201,7 @@ class StateSeq(DeduplicateBase):
 
         # times 와 states 의 차원 비교 및 length
         if len(self.times) == len(self.states):
-            self.legnth = len(self.times)
+            self.length = len(self.times)
         else:
             raise ValueError("len(times) != len(states)")
 
@@ -326,7 +327,7 @@ class StateSeq(DeduplicateBase):
         """
         idx = self.get_idx_by_time(time)
 
-        if self.legnth == idx + 1:
+        if self.length == idx + 1:
             tmp_seq = self.slice_tail(0)
         else:
             tmp_seq = self.slice_head(idx + 1)
@@ -444,9 +445,9 @@ def End(state: str) -> StateSeq:
 class Operation(NamedInstanceBase):
     """
     Operation class 정의
-    name : operation 이름
-    seq : StateSeq instance
-    applyto : die-level 또는 plane-level
+    name : instance 이름
+    seq : StateSeq
+    applyto : Operation 추가를 die-level, 혹은 plane-level 에 추가할 지 정하는 변수
     """
 
     name: str
@@ -810,14 +811,14 @@ class NANDScheduler:
         self.statetable = Matrix2D(
             [
                 [StateTable(self.clock) for _ in range(self.num_planes)]
-                for _ in range(self.num_die)
+                for _ in range(self.num_dies)
             ]
         )
         self.targets = np.zeros((num_dies, num_planes))
         self.indice = tuple(np.ndindex(self.targets.shape))
         self.mapper = StateMapper()
         self.addman = [
-            AddressMananer(num_planes, num_blocks, pagesize, GOOD)
+            AddressManager(num_planes, num_blocks, pagesize, GOOD)
             for _ in range(self.num_dies)
         ]
         self.cur_states = np.full((num_dies, num_planes), "idle", dtype=str)
@@ -906,9 +907,9 @@ class NANDScheduler:
         return [
             [
                 self.statetable[die, plane].expect(_time)
-                for plane in range(self.num_plane)
+                for plane in range(self.num_planes)
             ]
-            for die in range(self.num_die)
+            for die in range(self.num_dies)
         ]
 
     def _set_targets(self, sel_die: int, sel_plane: int, applyto="plane"):

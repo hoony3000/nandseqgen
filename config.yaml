@@ -1,3 +1,9 @@
+Architecture:
+  num_dies               : 2
+  num_planes             : 4
+  num_blocks             : 10
+  pagesize               : 40
+
 TimeSpec:
   tERSL                  : 150000
   tPGMSL                 : 150000

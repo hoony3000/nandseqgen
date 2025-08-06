@@ -118,16 +118,30 @@ if __name__ == "__main__":
         applyto="die",
     )
 
+    # HostReq 정의 (수정중)
+    name = "Write"
+    Write = HostReq.create(name=name)
+    name = "Multi Write"
+    Multi_Write = HostReq.create(name=name)
+    name = "Read"
+    Read = HostReq.create(name=name)
+    name = "Multi Read"
+    Multi_Read = HostReq.create(name=name)
+    ops = HostReq.samples(size=1, replace=False)
+    print(ops)
+    print(HostReq.len_class())
+    print(HostReq.get_id_by_name("Multi Write"))
+
     # scheduler 동작 순서 예시
 
-    sched = NANDScheduler(
-        num_dies=num_dies,
-        num_planes=num_planes,
-        num_blocks=num_blocks,
-        pagesize=pagesize
-    )
-    len_op = Operation.len_class()
-    id = np.random.choice(len_op, size=1, replace=True).tolist()[0]
-    op = Operation.get_by_id(id)
-    sched.setnow(0, 0, op)
-    sched.stat(-1, -1)
+    # sched = NANDScheduler(
+    #     num_dies=num_dies,
+    #     num_planes=num_planes,
+    #     num_blocks=num_blocks,
+    #     pagesize=pagesize
+    # )
+    # len_op = Operation.len_class()
+    # id = np.random.choice(len_op, size=1, replace=True).tolist()[0]
+    # op = Operation.get_by_id(id)
+    # sched.setnow(0, 0, op)
+    # sched.stat(-1, -1)
