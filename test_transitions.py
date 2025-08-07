@@ -1,6 +1,7 @@
 import yaml
 import os
 from transitions import Machine
+from transitions.core import MachineError
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.styles import Style
@@ -8,9 +9,6 @@ from prompt_toolkit.styles import Style
 RULE_FILE = "rules.yaml"
 COMMAND_FILE = "commands.yaml"
 
-# ---------------------
-# YAML load/save
-# ---------------------
 def load_rules():
     if not os.path.exists(RULE_FILE):
         save_rules({})
@@ -23,14 +21,11 @@ def save_rules(rules):
 
 def load_commands():
     if not os.path.exists(COMMAND_FILE):
-        print(f"[ERROR] '{COMMAND_FILE}' not found. Please create it with a list of commands.")
+        print(f"[ERROR] '{COMMAND_FILE}' not found.")
         exit(1)
     with open(COMMAND_FILE, "r") as f:
         return yaml.safe_load(f) or []
 
-# ---------------------
-# State Machine Builder
-# ---------------------
 def build_machine(rules):
     states = set(rules.keys())
     for ops in rules.values():
@@ -40,12 +35,8 @@ def build_machine(rules):
     transitions = []
     for src, op_map in rules.items():
         for op_name, op_info in op_map.items():
-            dest = op_info['next_states'][0]  # 첫 상태는 즉시 전이
-            transitions.append({
-                'trigger': op_name,
-                'source': src,
-                'dest': dest  # self-transition 포함
-            })
+            dest = op_info['next_states'][0]
+            transitions.append({'trigger': op_name, 'source': src, 'dest': dest})
 
     class NANDController:
         pass
@@ -54,9 +45,6 @@ def build_machine(rules):
     machine = Machine(model=controller, states=list(states), transitions=transitions, initial='idle')
     return controller, machine, list(states)
 
-# ---------------------
-# Status Display
-# ---------------------
 def print_status(controller, pending_transitions):
     print("=" * 40)
     print(f"Current State: {controller.state}")
@@ -66,9 +54,6 @@ def print_status(controller, pending_transitions):
         print("Next State(s): None")
     print("=" * 40)
 
-# ---------------------
-# Interactive Loop
-# ---------------------
 def interactive_loop():
     rules = load_rules()
     commands = load_commands()
@@ -77,15 +62,14 @@ def interactive_loop():
 
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor")
+    print("NAND Transition Interactive Editor (Safe Execution)")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
         print_status(controller, pending_transitions)
 
-        defined_cmds = set(rules.get(controller.state, {}).keys())
+        current_state = controller.state
         cmd_completer = WordCompleter(commands + ["advance", "exit"], ignore_case=True)
-
         cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
@@ -104,14 +88,14 @@ def interactive_loop():
             print(f"'{cmd}' is not a valid command from commands.yaml.")
             continue
 
-        current_state = controller.state
-
+        # Add rule if undefined
         if current_state not in rules:
             rules[current_state] = {}
 
         if cmd not in rules[current_state]:
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
+            # 자동완성 상태 이름
             _, _, all_states = build_machine(rules)
             state_completer = WordCompleter(all_states, ignore_case=True)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
@@ -127,45 +111,36 @@ def interactive_loop():
                 'next_states': next_states,
                 'probability': prob
             }
-
             save_rules(rules)
+
+            # ✅ 머신 재구성 후 새 controller 사용
             controller, machine, all_states = build_machine(rules)
 
-            if hasattr(controller, cmd):
+        # ✅ 안전하게 명령 실행
+        if hasattr(controller, cmd):
+            try:
+                prev_state = controller.state
                 getattr(controller, cmd)()
-                if current_state == controller.state:
-                    print(f"Rule added and executed: state remained as '{controller.state}'")
+
+                if prev_state == controller.state:
+                    print(f"Command executed: state remained as '{controller.state}'")
                 else:
-                    print(f"Rule added and executed: state changed → {controller.state}")
+                    print(f"Command executed: state changed → {controller.state}")
+
+                next_states = rules[prev_state][cmd]['next_states']
                 if len(next_states) > 1:
                     pending_transitions = next_states[1:]
                     print(f"Scheduled future transitions: {pending_transitions}")
                 else:
                     pending_transitions = []
-            else:
-                print(f"Rule added, but command '{cmd}' not executable.")
-            continue
 
-        # 명령 실행 (이미 정의된 경우)
-        op_info = rules[current_state][cmd]
-        next_states = op_info.get('next_states', [])
-
-        if hasattr(controller, cmd):
-            getattr(controller, cmd)()
-            if current_state == controller.state:
-                print(f"Command executed: state remained as '{controller.state}'")
-            else:
-                print(f"Command executed: state changed → {controller.state}")
-            if len(next_states) > 1:
-                pending_transitions = next_states[1:]
-                print(f"Scheduled future transitions: {pending_transitions}")
-            else:
-                pending_transitions = []
+            except MachineError as e:
+                print("[ERROR] MachineError:", e)
+                print("[DEBUG] Current state:", controller.state)
+                print("[DEBUG] Command:", cmd)
+                print("[DEBUG] Registered transitions:", controller.get_triggers(controller.state))
         else:
-            print(f"Command '{cmd}' is defined but not executable in current state.")
+            print(f"Command '{cmd}' is not executable in current state.")
 
-# ---------------------
-# Entry point
-# ---------------------
 if __name__ == "__main__":
     interactive_loop()
