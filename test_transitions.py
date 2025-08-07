@@ -1,8 +1,9 @@
 import yaml
-from transitions import Machine
 import os
-import readline
-import rlcompleter
+from transitions import Machine
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.styles import Style
 
 RULE_FILE = "rules.yaml"
 COMMAND_FILE = "commands.yaml"
@@ -54,33 +55,19 @@ def build_machine(rules):
     return controller, machine, list(states)
 
 # ---------------------
-# Autocomplete
+# Display info
 # ---------------------
-def setup_autocomplete(commands, states, mode="command"):
-    def completer(text, state):
-        pool = commands if mode == "command" else states
-        options = [item for item in pool if item.startswith(text)]
-        if state < len(options):
-            return options[state]
-        return None
-
-    readline.set_completer(completer)
-    readline.parse_and_bind("tab: complete")
+def print_status(controller, pending_transitions):
+    print("=" * 40)
+    print(f"Current State: {controller.state}")
+    if pending_transitions:
+        print(f"Next State(s): {pending_transitions}")
+    else:
+        print("Next State(s): None")
+    print("=" * 40)
 
 # ---------------------
-# CLI Display
-# ---------------------
-def print_available_ops(rules, current_state, commands):
-    defined_cmds = set(rules.get(current_state, {}).keys())
-    undefined_cmds = [cmd for cmd in commands if cmd not in defined_cmds]
-
-    print("\nAvailable commands to define:")
-    for i, cmd in enumerate(undefined_cmds):
-        print(f"  {i + 1}. {cmd}")
-    return undefined_cmds
-
-# ---------------------
-# Main loop
+# Main interaction loop
 # ---------------------
 def interactive_loop():
     rules = load_rules()
@@ -88,20 +75,20 @@ def interactive_loop():
     controller, machine, all_states = build_machine(rules)
     pending_transitions = []
 
-    setup_autocomplete(commands, all_states, mode="command")
+    style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (Auto-complete enabled)")
-    print("Type 'exit' to quit, 'advance' to progress time.\n")
+    print("NAND Transition Interactive Editor (with prompt_toolkit)")
+    print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
-        print(f"\nCurrent State: {controller.state}")
-        if pending_transitions:
-            print(f"Scheduled future transitions: {pending_transitions}")
-        else:
-            print("No scheduled future transitions.")
+        print_status(controller, pending_transitions)
 
-        available_cmds = print_available_ops(rules, controller.state, commands)
-        cmd = input("Enter command (or 'advance' / 'exit'): ").strip()
+        defined_cmds = set(rules.get(controller.state, {}).keys())
+        available_cmds = [cmd for cmd in commands if cmd not in defined_cmds]
+
+        cmd_completer = WordCompleter(commands + ["advance", "exit"], ignore_case=True)
+
+        cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
             continue
@@ -125,16 +112,15 @@ def interactive_loop():
             rules[current_state] = {}
 
         if cmd not in rules[current_state]:
-            print(f"Command '{cmd}' is not defined for state '{current_state}'")
+            print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
-            # Enable state name autocomplete during next_state entry
-            _, _, all_states = build_machine(rules)
-            setup_autocomplete(commands, all_states, mode="state")
-            next_raw = input("Enter comma-separated next_states (e.g., erasing,erase_done): ").strip()
+            # 상태 자동완성
+            state_completer = WordCompleter(all_states, ignore_case=True)
+            next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
             next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
 
             try:
-                prob = float(input("Enter probability (0.0 ~ 1.0): ").strip())
+                prob = float(prompt("Enter probability (0.0 ~ 1.0): ", style=style).strip())
             except ValueError:
                 prob = 1.0
                 print("Invalid input. Using default probability = 1.0")
@@ -147,11 +133,10 @@ def interactive_loop():
             save_rules(rules)
             controller, machine, all_states = build_machine(rules)
             pending_transitions = []
-            setup_autocomplete(commands, all_states, mode="command")
             print(f"Rule added: {current_state} + {cmd} → {next_states} (p={prob})")
             continue
 
-        # Execute command
+        # 명령 실행
         op_info = rules[current_state][cmd]
         next_states = op_info.get('next_state', [])
 
