@@ -70,7 +70,7 @@ def interactive_loop():
         print_status(controller, pending_transitions)
 
         current_state = controller.state
-        cmd_completer = FuzzyWordCompleter(commands + base_commands, ignore_case=True)
+        cmd_completer = FuzzyWordCompleter(commands + base_commands)
         cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
@@ -89,16 +89,14 @@ def interactive_loop():
             print(f"'{cmd}' is not a valid command from commands.yaml.")
             continue
 
-        # Add rule if undefined
         if current_state not in rules:
             rules[current_state] = {}
 
         if cmd not in rules[current_state]:
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
-            # fuzzy 상태 자동완성
             _, _, all_states = build_machine(rules, initial_state=current_state)
-            state_completer = FuzzyWordCompleter(all_states, ignore_case=True)
+            state_completer = FuzzyWordCompleter(all_states)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
             next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
 
@@ -116,7 +114,6 @@ def interactive_loop():
 
             controller, machine, all_states = build_machine(rules, initial_state=current_state)
 
-        # 안전하게 명령 실행
         if hasattr(controller, cmd):
             try:
                 prev_state = controller.state
