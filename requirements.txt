@@ -5,3 +5,4 @@ seaborn
 matplotlib
 black
 pyreadline3
+prompt_toolkit
