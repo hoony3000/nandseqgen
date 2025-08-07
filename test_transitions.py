@@ -35,7 +35,7 @@ def build_machine(rules, initial_state="idle"):
     transitions = []
     for src, op_map in rules.items():
         for op_name, op_info in op_map.items():
-            if op_info['next_states']:  # skip empty placeholder
+            if op_info['next_states']:
                 dest = op_info['next_states'][0]
                 transitions.append({'trigger': op_name, 'source': src, 'dest': dest})
 
@@ -55,16 +55,34 @@ def print_status(controller, pending_transitions):
         print("Next State(s): None")
     print("=" * 40)
 
+def ensure_state_has_all_commands(state, rules, commands):
+    if state not in rules:
+        rules[state] = {}
+
+    updated = False
+    for cmd in commands:
+        if cmd not in rules[state]:
+            rules[state][cmd] = {'next_states': [], 'probability': ""}
+            updated = True
+
+    if updated:
+        print(f"[INFO] Placeholder added for missing commands in state '{state}'")
+        save_rules(rules)
+
 def interactive_loop():
     rules = load_rules()
     commands = load_commands()
+
+    # 최초 상태 idle 보장
+    ensure_state_has_all_commands("idle", rules, commands)
+
     controller, machine, all_states = build_machine(rules)
     pending_transitions = []
 
     base_commands = ["advance", "exit"]
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (State-Preserving with Placeholders)")
+    print("NAND Transition Interactive Editor")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
@@ -90,15 +108,12 @@ def interactive_loop():
             print(f"'{cmd}' is not a valid command from commands.yaml.")
             continue
 
-        # 최초 상태 추가 시 모든 command placeholder 생성
-        if current_state not in rules:
-            rules[current_state] = {}
-            for each_cmd in commands:
-                rules[current_state][each_cmd] = {'next_states': [], 'probability': ""}
+        # 현재 상태가 rules에 없거나 명령어 누락된 경우 placeholder 채우기
+        ensure_state_has_all_commands(current_state, rules, commands)
 
-        # 해당 command가 아직 설정 안 되어있거나 placeholder 상태라면 사용자 입력 받기
-        rule_entry = rules[current_state].get(cmd)
-        if not rule_entry or not rule_entry['next_states']:
+        # 해당 command가 placeholder일 경우, 사용자에게 정보 입력 받기
+        rule_entry = rules[current_state][cmd]
+        if not rule_entry['next_states']:
             print(f"Defining rule for '{cmd}' in state '{current_state}'")
 
             _, _, all_states = build_machine(rules, initial_state=current_state)
@@ -123,13 +138,15 @@ def interactive_loop():
         if hasattr(controller, cmd):
             try:
                 prev_state = controller.state
-
                 getattr(controller, cmd)()
 
                 if prev_state == controller.state:
                     print(f"Command executed: state remained as '{controller.state}'")
                 else:
                     print(f"Command executed: state changed → {controller.state}")
+
+                    # 전이된 상태에 대해 command 누락 검사
+                    ensure_state_has_all_commands(controller.state, rules, commands)
 
                 next_states = rules[prev_state][cmd]['next_states']
                 if len(next_states) > 1:
