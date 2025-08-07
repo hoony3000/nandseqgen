@@ -60,6 +60,7 @@ def interactive_loop():
     controller, machine, all_states = build_machine(rules)
     pending_transitions = []
 
+    base_commands = ["advance", "exit"]
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
     print("NAND Transition Interactive Editor (State-Preserving)")
@@ -69,7 +70,7 @@ def interactive_loop():
         print_status(controller, pending_transitions)
 
         current_state = controller.state
-        cmd_completer = WordCompleter(commands + ["advance", "exit"], ignore_case=True)
+        cmd_completer = WordCompleter(commands + base_commands, ignore_case=True)
         cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
@@ -113,8 +114,7 @@ def interactive_loop():
             }
             save_rules(rules)
 
-            # ✅ 머신 재구성 전 현재 상태 백업 후 유지
-            current_state = controller.state
+            # ✅ 머신 재구성 시 현재 상태 유지
             controller, machine, all_states = build_machine(rules, initial_state=current_state)
 
         # ✅ 안전하게 명령 실행
@@ -122,7 +122,6 @@ def interactive_loop():
             try:
                 prev_state = controller.state
 
-                # 디버그 로그
                 print("[DEBUG] Current state:", controller.state)
                 print("[DEBUG] Attempting command:", cmd)
                 print("[DEBUG] Valid triggers from this state:", machine.get_triggers(controller.state))
