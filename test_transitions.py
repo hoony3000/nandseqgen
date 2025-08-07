@@ -3,7 +3,7 @@ import os
 from transitions import Machine
 from transitions.core import MachineError
 from prompt_toolkit import prompt
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import FuzzyWordCompleter
 from prompt_toolkit.styles import Style
 
 RULE_FILE = "rules.yaml"
@@ -63,14 +63,14 @@ def interactive_loop():
     base_commands = ["advance", "exit"]
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (State-Preserving)")
+    print("NAND Transition Interactive Editor (Fuzzy Matching Enabled)")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
         print_status(controller, pending_transitions)
 
         current_state = controller.state
-        cmd_completer = WordCompleter(commands + base_commands, ignore_case=True)
+        cmd_completer = FuzzyWordCompleter(commands + base_commands, ignore_case=True)
         cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
@@ -96,9 +96,9 @@ def interactive_loop():
         if cmd not in rules[current_state]:
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
-            # 자동완성 상태 이름
+            # fuzzy 상태 자동완성
             _, _, all_states = build_machine(rules, initial_state=current_state)
-            state_completer = WordCompleter(all_states, ignore_case=True)
+            state_completer = FuzzyWordCompleter(all_states, ignore_case=True)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
             next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
 
@@ -114,10 +114,9 @@ def interactive_loop():
             }
             save_rules(rules)
 
-            # ✅ 머신 재구성 시 현재 상태 유지
             controller, machine, all_states = build_machine(rules, initial_state=current_state)
 
-        # ✅ 안전하게 명령 실행
+        # 안전하게 명령 실행
         if hasattr(controller, cmd):
             try:
                 prev_state = controller.state
