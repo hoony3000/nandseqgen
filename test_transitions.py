@@ -18,7 +18,6 @@ def load_rules():
         return yaml.safe_load(f) or {}
 
 def save_rules(rules):
-    # Force block-style (no {}), and sorted as-is
     with open(RULE_FILE, "w") as f:
         yaml.safe_dump(rules, f, sort_keys=False, default_flow_style=False)
 
@@ -56,7 +55,7 @@ def build_machine(rules):
     return controller, machine, list(states)
 
 # ---------------------
-# Display info
+# Status Display
 # ---------------------
 def print_status(controller, pending_transitions):
     print("=" * 40)
@@ -68,7 +67,7 @@ def print_status(controller, pending_transitions):
     print("=" * 40)
 
 # ---------------------
-# Main interaction loop
+# Interactive Loop
 # ---------------------
 def interactive_loop():
     rules = load_rules()
@@ -78,7 +77,7 @@ def interactive_loop():
 
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (prompt_toolkit + YAML block style)")
+    print("NAND Transition Interactive Editor")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
@@ -88,7 +87,6 @@ def interactive_loop():
         available_cmds = [cmd for cmd in commands if cmd not in defined_cmds]
 
         cmd_completer = WordCompleter(commands + ["advance", "exit"], ignore_case=True)
-
         cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
@@ -115,7 +113,7 @@ def interactive_loop():
         if cmd not in rules[current_state]:
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
-            # 상태 자동완성
+            # 상태 이름 자동완성
             _, _, all_states = build_machine(rules)
             state_completer = WordCompleter(all_states, ignore_case=True)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
@@ -134,11 +132,21 @@ def interactive_loop():
 
             save_rules(rules)
             controller, machine, all_states = build_machine(rules)
-            pending_transitions = []
-            print(f"Rule added: {current_state} + {cmd} → {next_states} (p={prob})")
+
+            # ✅ 등록한 명령 즉시 실행
+            if hasattr(controller, cmd):
+                getattr(controller, cmd)()
+                print(f"Rule added and executed: {current_state} + {cmd} → {next_states}")
+                if len(next_states) > 1:
+                    pending_transitions = next_states[1:]
+                    print(f"Scheduled future transitions: {pending_transitions}")
+                else:
+                    pending_transitions = []
+            else:
+                print(f"Rule added, but command '{cmd}' not executable.")
             continue
 
-        # 명령 실행
+        # 명령 실행 (이미 등록된 경우)
         op_info = rules[current_state][cmd]
         next_states = op_info.get('next_states', [])
 
