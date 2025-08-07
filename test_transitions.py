@@ -18,8 +18,9 @@ def load_rules():
         return yaml.safe_load(f) or {}
 
 def save_rules(rules):
+    # Force block-style (no {}), and sorted as-is
     with open(RULE_FILE, "w") as f:
-        yaml.safe_dump(rules, f, sort_keys=False, default_flow_style=True)
+        yaml.safe_dump(rules, f, sort_keys=False, default_flow_style=False)
 
 def load_commands():
     if not os.path.exists(COMMAND_FILE):
@@ -35,12 +36,12 @@ def build_machine(rules):
     states = set(rules.keys())
     for ops in rules.values():
         for op_info in ops.values():
-            states.update(op_info['next_state'])
+            states.update(op_info['next_states'])
 
     transitions = []
     for src, op_map in rules.items():
         for op_name, op_info in op_map.items():
-            dest = op_info['next_state'][0]
+            dest = op_info['next_states'][0]
             transitions.append({
                 'trigger': op_name,
                 'source': src,
@@ -77,7 +78,7 @@ def interactive_loop():
 
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (with prompt_toolkit)")
+    print("NAND Transition Interactive Editor (prompt_toolkit + YAML block style)")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
@@ -115,6 +116,7 @@ def interactive_loop():
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
             # 상태 자동완성
+            _, _, all_states = build_machine(rules)
             state_completer = WordCompleter(all_states, ignore_case=True)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
             next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
@@ -126,7 +128,7 @@ def interactive_loop():
                 print("Invalid input. Using default probability = 1.0")
 
             rules[current_state][cmd] = {
-                'next_state': next_states,
+                'next_states': next_states,
                 'probability': prob
             }
 
@@ -138,7 +140,7 @@ def interactive_loop():
 
         # 명령 실행
         op_info = rules[current_state][cmd]
-        next_states = op_info.get('next_state', [])
+        next_states = op_info.get('next_states', [])
 
         if hasattr(controller, cmd):
             getattr(controller, cmd)()
