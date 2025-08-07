@@ -40,11 +40,11 @@ def build_machine(rules):
     transitions = []
     for src, op_map in rules.items():
         for op_name, op_info in op_map.items():
-            dest = op_info['next_states'][0]
+            dest = op_info['next_states'][0]  # 첫 상태는 즉시 전이
             transitions.append({
                 'trigger': op_name,
                 'source': src,
-                'dest': dest
+                'dest': dest  # self-transition 포함
             })
 
     class NANDController:
@@ -84,9 +84,8 @@ def interactive_loop():
         print_status(controller, pending_transitions)
 
         defined_cmds = set(rules.get(controller.state, {}).keys())
-        available_cmds = [cmd for cmd in commands if cmd not in defined_cmds]
-
         cmd_completer = WordCompleter(commands + ["advance", "exit"], ignore_case=True)
+
         cmd = prompt("> Enter command: ", completer=cmd_completer, style=style).strip()
 
         if not cmd:
@@ -113,7 +112,6 @@ def interactive_loop():
         if cmd not in rules[current_state]:
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
-            # 상태 이름 자동완성
             _, _, all_states = build_machine(rules)
             state_completer = WordCompleter(all_states, ignore_case=True)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
@@ -133,10 +131,12 @@ def interactive_loop():
             save_rules(rules)
             controller, machine, all_states = build_machine(rules)
 
-            # ✅ 등록한 명령 즉시 실행
             if hasattr(controller, cmd):
                 getattr(controller, cmd)()
-                print(f"Rule added and executed: {current_state} + {cmd} → {next_states}")
+                if current_state == controller.state:
+                    print(f"Rule added and executed: state remained as '{controller.state}'")
+                else:
+                    print(f"Rule added and executed: state changed → {controller.state}")
                 if len(next_states) > 1:
                     pending_transitions = next_states[1:]
                     print(f"Scheduled future transitions: {pending_transitions}")
@@ -146,13 +146,16 @@ def interactive_loop():
                 print(f"Rule added, but command '{cmd}' not executable.")
             continue
 
-        # 명령 실행 (이미 등록된 경우)
+        # 명령 실행 (이미 정의된 경우)
         op_info = rules[current_state][cmd]
         next_states = op_info.get('next_states', [])
 
         if hasattr(controller, cmd):
             getattr(controller, cmd)()
-            print(f"Command success → New state: {controller.state}")
+            if current_state == controller.state:
+                print(f"Command executed: state remained as '{controller.state}'")
+            else:
+                print(f"Command executed: state changed → {controller.state}")
             if len(next_states) > 1:
                 pending_transitions = next_states[1:]
                 print(f"Scheduled future transitions: {pending_transitions}")
