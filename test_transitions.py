@@ -26,7 +26,7 @@ def load_commands():
     with open(COMMAND_FILE, "r") as f:
         return yaml.safe_load(f) or []
 
-def build_machine(rules):
+def build_machine(rules, initial_state="idle"):
     states = set(rules.keys())
     for ops in rules.values():
         for op_info in ops.values():
@@ -42,7 +42,7 @@ def build_machine(rules):
         pass
 
     controller = NANDController()
-    machine = Machine(model=controller, states=list(states), transitions=transitions, initial='idle')
+    machine = Machine(model=controller, states=list(states), transitions=transitions, initial=initial_state)
     return controller, machine, list(states)
 
 def print_status(controller, pending_transitions):
@@ -62,7 +62,7 @@ def interactive_loop():
 
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (Safe Execution)")
+    print("NAND Transition Interactive Editor (State-Preserving)")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
@@ -96,7 +96,7 @@ def interactive_loop():
             print(f"Command '{cmd}' not yet defined for state '{current_state}'")
 
             # 자동완성 상태 이름
-            _, _, all_states = build_machine(rules)
+            _, _, all_states = build_machine(rules, initial_state=current_state)
             state_completer = WordCompleter(all_states, ignore_case=True)
             next_raw = prompt("Enter comma-separated next_states: ", completer=state_completer, style=style).strip()
             next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
@@ -113,13 +113,21 @@ def interactive_loop():
             }
             save_rules(rules)
 
-            # ✅ 머신 재구성 후 새 controller 사용
-            controller, machine, all_states = build_machine(rules)
+            # ✅ 머신 재구성 전 현재 상태 백업 후 유지
+            current_state = controller.state
+            controller, machine, all_states = build_machine(rules, initial_state=current_state)
 
         # ✅ 안전하게 명령 실행
         if hasattr(controller, cmd):
             try:
                 prev_state = controller.state
+
+                # 디버그 로그
+                print("[DEBUG] Current state:", controller.state)
+                print("[DEBUG] Attempting command:", cmd)
+                print("[DEBUG] Valid triggers from this state:", machine.get_triggers(controller.state))
+                print("[DEBUG] Rule:", rules.get(controller.state, {}).get(cmd, {}))
+
                 getattr(controller, cmd)()
 
                 if prev_state == controller.state:
@@ -135,10 +143,11 @@ def interactive_loop():
                     pending_transitions = []
 
             except MachineError as e:
-                print("[ERROR] MachineError:", e)
+                print("[❌ ERROR] MachineError:", e)
+                print("[DEBUG] Available states:", machine.states)
                 print("[DEBUG] Current state:", controller.state)
-                print("[DEBUG] Command:", cmd)
-                print("[DEBUG] Registered transitions:", controller.get_triggers(controller.state))
+                print("[DEBUG] Attempted command:", cmd)
+                print("[DEBUG] Registered triggers:", machine.get_triggers(controller.state))
         else:
             print(f"Command '{cmd}' is not executable in current state.")
 
