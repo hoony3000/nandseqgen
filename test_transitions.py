@@ -1,22 +1,31 @@
 import yaml
 from transitions import Machine
 import os
+import readline
+import rlcompleter
 
 RULE_FILE = "rules.yaml"
+COMMAND_FILE = "commands.yaml"
 
 # ---------------------
-# Rule file handling
+# YAML load/save
 # ---------------------
 def load_rules():
     if not os.path.exists(RULE_FILE):
-        print(f"[Info] No rule file found. Creating empty rule set at {RULE_FILE}")
         save_rules({})
     with open(RULE_FILE, "r") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 def save_rules(rules):
     with open(RULE_FILE, "w") as f:
         yaml.safe_dump(rules, f, sort_keys=False, default_flow_style=True)
+
+def load_commands():
+    if not os.path.exists(COMMAND_FILE):
+        print(f"[ERROR] '{COMMAND_FILE}' not found. Please create it with a list of commands.")
+        exit(1)
+    with open(COMMAND_FILE, "r") as f:
+        return yaml.safe_load(f) or []
 
 # ---------------------
 # State Machine Builder
@@ -25,13 +34,12 @@ def build_machine(rules):
     states = set(rules.keys())
     for ops in rules.values():
         for op_info in ops.values():
-            next_states = op_info['next_state']
-            states.update(next_states)
+            states.update(op_info['next_state'])
 
     transitions = []
     for src, op_map in rules.items():
         for op_name, op_info in op_map.items():
-            dest = op_info['next_state'][0]  # only the first is used for immediate transition
+            dest = op_info['next_state'][0]
             transitions.append({
                 'trigger': op_name,
                 'source': src,
@@ -43,102 +51,123 @@ def build_machine(rules):
 
     controller = NANDController()
     machine = Machine(model=controller, states=list(states), transitions=transitions, initial='idle')
-    return controller, machine
+    return controller, machine, list(states)
 
 # ---------------------
-# Operation Display
+# Autocomplete
 # ---------------------
-def print_available_ops(rules, current_state):
-    if current_state not in rules:
-        print("No operations defined for this state.")
-        return
-    print("\nAvailable operations:")
-    for op, meta in rules[current_state].items():
-        prob = meta.get('probability', 1.0)
-        next_states = meta.get('next_state', [])
-        print(f"  - {op} → {next_states} (p={prob})")
-    print()
+def setup_autocomplete(commands, states, mode="command"):
+    def completer(text, state):
+        pool = commands if mode == "command" else states
+        options = [item for item in pool if item.startswith(text)]
+        if state < len(options):
+            return options[state]
+        return None
+
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
 
 # ---------------------
-# Interactive Loop
+# CLI Display
+# ---------------------
+def print_available_ops(rules, current_state, commands):
+    defined_cmds = set(rules.get(current_state, {}).keys())
+    undefined_cmds = [cmd for cmd in commands if cmd not in defined_cmds]
+
+    print("\nAvailable commands to define:")
+    for i, cmd in enumerate(undefined_cmds):
+        print(f"  {i + 1}. {cmd}")
+    return undefined_cmds
+
+# ---------------------
+# Main loop
 # ---------------------
 def interactive_loop():
     rules = load_rules()
-    controller, machine = build_machine(rules)
-    pending_transitions = []  # Track time-based transitions
+    commands = load_commands()
+    controller, machine, all_states = build_machine(rules)
+    pending_transitions = []
 
-    print("NAND Transition Interactive Editor (with Time-based Transitions)")
+    setup_autocomplete(commands, all_states, mode="command")
+
+    print("NAND Transition Interactive Editor (Auto-complete enabled)")
     print("Type 'exit' to quit, 'advance' to progress time.\n")
 
     while True:
-        print(f"\n[Current State] {controller.state}")
+        print(f"\nCurrent State: {controller.state}")
         if pending_transitions:
             print(f"Scheduled future transitions: {pending_transitions}")
         else:
             print("No scheduled future transitions.")
 
-        print_available_ops(rules, controller.state)
-        cmd = input("Enter NAND operation or 'advance': ").strip()
+        available_cmds = print_available_ops(rules, controller.state, commands)
+        cmd = input("Enter command (or 'advance' / 'exit'): ").strip()
 
         if not cmd:
-            continue  # Ignore empty input
-
-        if cmd.lower() == 'exit':
+            continue
+        if cmd == "exit":
             print("Exiting.")
             break
-
-        if cmd.lower() == 'advance':
+        if cmd == "advance":
             if pending_transitions:
-                next_state = pending_transitions.pop(0)
-                controller.state = next_state
+                controller.state = pending_transitions.pop(0)
                 print(f"Time advanced → New state: {controller.state}")
             else:
                 print("No scheduled transitions.")
             continue
+        if cmd not in commands:
+            print(f"'{cmd}' is not a valid command from commands.yaml.")
+            continue
+
+        current_state = controller.state
+
+        if current_state not in rules:
+            rules[current_state] = {}
+
+        if cmd not in rules[current_state]:
+            print(f"Command '{cmd}' is not defined for state '{current_state}'")
+
+            # Enable state name autocomplete during next_state entry
+            _, _, all_states = build_machine(rules)
+            setup_autocomplete(commands, all_states, mode="state")
+            next_raw = input("Enter comma-separated next_states (e.g., erasing,erase_done): ").strip()
+            next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
+
+            try:
+                prob = float(input("Enter probability (0.0 ~ 1.0): ").strip())
+            except ValueError:
+                prob = 1.0
+                print("Invalid input. Using default probability = 1.0")
+
+            rules[current_state][cmd] = {
+                'next_state': next_states,
+                'probability': prob
+            }
+
+            save_rules(rules)
+            controller, machine, all_states = build_machine(rules)
+            pending_transitions = []
+            setup_autocomplete(commands, all_states, mode="command")
+            print(f"Rule added: {current_state} + {cmd} → {next_states} (p={prob})")
+            continue
+
+        # Execute command
+        op_info = rules[current_state][cmd]
+        next_states = op_info.get('next_state', [])
 
         if hasattr(controller, cmd):
-            current_state = controller.state
-            op_info = rules.get(current_state, {}).get(cmd, {})
-            next_states = op_info.get('next_state', [])
-
             getattr(controller, cmd)()
             print(f"Command success → New state: {controller.state}")
-
             if len(next_states) > 1:
                 pending_transitions = next_states[1:]
                 print(f"Scheduled future transitions: {pending_transitions}")
             else:
                 pending_transitions = []
         else:
-            print(f"Invalid operation '{cmd}' in state '{controller.state}'.")
-
-            choice = input("Would you like to define this transition? (y/n): ").strip().lower()
-            if choice == 'y':
-                next_raw = input("Enter comma-separated states (e.g., erasing,erase_done): ").strip()
-                next_states = [s.strip() for s in next_raw.split(",") if s.strip()]
-                try:
-                    prob = float(input("Enter the probability of this operation (0.0 ~ 1.0): ").strip())
-                except ValueError:
-                    prob = 1.0
-                    print("Invalid input. Defaulting probability to 1.0")
-
-                if controller.state not in rules:
-                    rules[controller.state] = {}
-
-                rules[controller.state][cmd] = {
-                    'next_state': next_states,
-                    'probability': prob
-                }
-
-                save_rules(rules)
-                controller, machine = build_machine(rules)
-                pending_transitions = []
-                print(f"Rule added: {controller.state} + {cmd} → {next_states} (p={prob})")
-            else:
-                print("Skipping update.")
+            print(f"Command '{cmd}' is defined but not executable in current state.")
 
 # ---------------------
-# Main Entry
+# Entry point
 # ---------------------
 if __name__ == "__main__":
     interactive_loop()

@@ -1,6 +1,1 @@
-idle:
-  erase:
-    next_state:
-      - erasing
-      - erase_done
-    probability: 1.0
+idle: {}

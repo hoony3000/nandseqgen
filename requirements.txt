@@ -4,3 +4,4 @@ PyYAML
 seaborn
 matplotlib
 black
+pyreadline3
