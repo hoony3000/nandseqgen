@@ -35,8 +35,9 @@ def build_machine(rules, initial_state="idle"):
     transitions = []
     for src, op_map in rules.items():
         for op_name, op_info in op_map.items():
-            dest = op_info['next_states'][0]
-            transitions.append({'trigger': op_name, 'source': src, 'dest': dest})
+            if op_info['next_states']:  # skip empty placeholder
+                dest = op_info['next_states'][0]
+                transitions.append({'trigger': op_name, 'source': src, 'dest': dest})
 
     class NANDController:
         pass
@@ -63,7 +64,7 @@ def interactive_loop():
     base_commands = ["advance", "exit"]
     style = Style.from_dict({"prompt": "#00ffff bold"})
 
-    print("NAND Transition Interactive Editor (Fuzzy Matching Enabled)")
+    print("NAND Transition Interactive Editor (State-Preserving with Placeholders)")
     print("Type 'advance' to progress time, 'exit' to quit.\n")
 
     while True:
@@ -89,11 +90,16 @@ def interactive_loop():
             print(f"'{cmd}' is not a valid command from commands.yaml.")
             continue
 
+        # 최초 상태 추가 시 모든 command placeholder 생성
         if current_state not in rules:
             rules[current_state] = {}
+            for each_cmd in commands:
+                rules[current_state][each_cmd] = {'next_states': [], 'probability': ""}
 
-        if cmd not in rules[current_state]:
-            print(f"Command '{cmd}' not yet defined for state '{current_state}'")
+        # 해당 command가 아직 설정 안 되어있거나 placeholder 상태라면 사용자 입력 받기
+        rule_entry = rules[current_state].get(cmd)
+        if not rule_entry or not rule_entry['next_states']:
+            print(f"Defining rule for '{cmd}' in state '{current_state}'")
 
             _, _, all_states = build_machine(rules, initial_state=current_state)
             state_completer = FuzzyWordCompleter(all_states)
@@ -111,17 +117,12 @@ def interactive_loop():
                 'probability': prob
             }
             save_rules(rules)
-
             controller, machine, all_states = build_machine(rules, initial_state=current_state)
 
+        # 명령 실행
         if hasattr(controller, cmd):
             try:
                 prev_state = controller.state
-
-                print("[DEBUG] Current state:", controller.state)
-                print("[DEBUG] Attempting command:", cmd)
-                print("[DEBUG] Valid triggers from this state:", machine.get_triggers(controller.state))
-                print("[DEBUG] Rule:", rules.get(controller.state, {}).get(cmd, {}))
 
                 getattr(controller, cmd)()
 
