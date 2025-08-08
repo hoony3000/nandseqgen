@@ -55,12 +55,22 @@ st.title("NAND 상태 전이 편집기 (with 시각화)")
 rules = load_yaml(RULE_FILE)
 commands = load_yaml(COMMAND_FILE)
 df = build_dataframe(rules, commands)
+
+# 🔍 검색 입력창
+query = st.text_input("🔍 Search (state or command)")
+if query:
+    query = query.lower()
+    df = df[df['state'].str.lower().str.contains(query) | df['command'].str.lower().str.contains(query)]
+
+# 테이블 편집기
 edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
+# 저장 버튼
 if st.button("💾 Save rules.yaml"):
     save_rules_from_df(edited_df)
     st.success("Saved to rules.yaml")
 
+# 그래프 시각화
 st.subheader("🔍 상태 전이 그래프")
 graph_file = render_graph(edited_df)
 with open(graph_file, "r", encoding="utf-8") as f:
