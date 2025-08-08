@@ -4,11 +4,16 @@ import yaml
 from pyvis.network import Network
 
 RULE_FILE = "rules.yaml"
+TEMPLATE_FILE = "template.yaml"
+STATE_TEMPLATE_FILE = "state_templates.yaml"
 COMMAND_FILE = "commands.yaml"
 
 def load_yaml(file):
-    with open(file, "r") as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with open(file, "r") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
 
 def save_yaml(file, data):
     with open(file, "w") as f:
@@ -44,20 +49,32 @@ def render_graph(df):
         next_states = [s.strip() for s in row.next_states.split(",") if s.strip()]
         if not next_states:
             continue
-
         net.add_node(src)
         net.add_node(next_states[0])
         net.add_edge(src, next_states[0], label=cmd)
-
         for i in range(1, len(next_states)):
             net.add_node(next_states[i])
             net.add_edge(next_states[i - 1], next_states[i], label="⏱")
-
     net.save_graph("graph.html")
     return "graph.html"
 
-# Streamlit UI
-st.title("NAND 상태 전이 편집기 (with 시각화)")
+def build_rules_from_templates():
+    templates = load_yaml(TEMPLATE_FILE)
+    state_map = load_yaml(STATE_TEMPLATE_FILE)
+    rules = {}
+    for state, tpl_name in state_map.items():
+        tpl = templates.get(tpl_name, {})
+        rules[state] = {cmd: dict(defn) for cmd, defn in tpl.items()}
+    save_yaml(RULE_FILE, rules)
+    return rules
+
+# UI 시작
+st.title("📐 NAND 상태 전이 편집기 (템플릿 기반)")
+
+if st.button("🔄 템플릿 적용하여 rules.yaml 생성"):
+    rules = build_rules_from_templates()
+    st.success("✅ 템플릿에서 rules.yaml 생성 완료")
+
 rules = load_yaml(RULE_FILE)
 commands = load_yaml(COMMAND_FILE)
 df = build_dataframe(rules, commands)
