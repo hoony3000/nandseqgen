@@ -23,7 +23,7 @@ mixture:
   classes:
     host:   0.70
     gc:     0.20
-    reclaim:0.10
+    reclaim: 0.10
 
 # 상태-의존 가중치 함수 정의(버킷 기반)
 state_buckets:
