@@ -6,7 +6,7 @@
 - Q : propose 할 때 모든 context check 다 하나?
 - A : self.now, global_state, local_state 만 참고해서 제안
 - Q : global_state, local_state 는 언제 업데이트 되는가?
-- A : 'PHASE_HOOK' event 처리 시 맨 첫번째로 업데이트 후 propose 실행
+- A : 'PHASE_HOOK' event 처리 시 맨 첫번째로 업데이트 후 propose 실행. 이후 
 - Q : global_state 가 포함하고 있는 값들은?
 - A : pgmable_ratio, readable_ratio
 - Q : local_state 가 포함하고 있는 값들은?
@@ -130,9 +130,11 @@
   - obligation 생성 : addr.on_commit(op, self.now)
 
 ## 보완 사항
-- local_state 에 nand_state 포함되어야 한다. 예를 들면, erase_busy, pgm_busy 등. nand_state 에 따라 금지/허용 operation 이 나뉘기 때문에 핵심적인 요소
-- plane_busy_frac 의미를 명확히 하고, 값을 반환하는 로직 구현 필요.
-- _schedule_operation 에서 dur 계산 로직 수정 필요. StateSeq, Operation clss 구현과 연결됨.Stateseq.times 는 절대값을 저장하므로 마지막 값만 추출해서 사용가능. 하지만, 현재 구현상 times 에 저장되는 값은 state 의 끝나는 시간이 저장됨. 그리고 operation 이 끝난 후는 state 가 다른 operation 이 수행되기 전까지 무한히 유지되므로 times 의 마지막 값은 10ms 의 매우 큰 값이 저장돼 있음 
+- addr.observe_states(hook.die, hook.plane) 에서 시간 정보 추가 필요 > addr.observe_states(hook.die, hook.plane, sch.now)
+  - local_state 에 nand_state 포함되어야 한다. 예를 들면, erase_busy, pgm_busy 등. nand_state 에 따라 금지/허용 operation 이 나뉘기 때문에 핵심적인 요소
+  - plane_busy_frac 의미를 명확히 하고, 값을 반환하는 로직 구현 필요.
+- make_phase_hooks 으로 'PHASE_HOOK' event push 할 떄 pattern time resolution 고려 time sampling 필요
+- sch._schedule_operation 에서 dur 계산 로직 수정 필요. StateSeq, Operation clss 구현과 연결됨.Stateseq.times 는 절대값을 저장하므로 마지막 값만 추출해서 사용가능. 하지만, 현재 구현상 times 에 저장되는 값은 state 의 끝나는 시간이 저장됨. 그리고 operation 이 끝난 후는 state 가 다른 operation 이 수행되기 전까지 무한히 유지되므로 times 의 마지막 값은 10ms 의 매우 큰 값이 저장돼 있음 
   - @dataclass<br>
   class StateSeq<br>
   times: List[float]<br>
