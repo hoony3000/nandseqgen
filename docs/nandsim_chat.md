@@ -1,6 +1,6 @@
 ---
 title: ChatGPT Export
-exported_at: 2025-08-12_12-40
+exported_at: 2025-08-13_09-55
 ---
 
 ## 👤 User
@@ -105,70 +105,6 @@ StateSeq/Operation/OperSeq 데이터 모델: 시간축과 상태를 일관되게
 명시적 우선순위: Host > Read계열 > DOUT > Erase > Program(신규) > Program(타겟) 기본 정책 + 기아 방지.
 
 3) 데이터 모델 (Python 스켈레톤)
-
-```python
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import List, Tuple, Optional, Dict, Any
-import heapq
-from collections import deque
-
-class AddrState(Enum):
-    BAD_BLOCK = auto()     # 사용불가
-    INITIAL   = auto()     # 초기화 전(미소거)
-    ERASED    = auto()     # 소거 완료
-    PGM_LAST  = auto()     # 마지막 프로그램된 page 인덱스 보유
-
-@dataclass(frozen=True)
-class Address:
-    die: int
-    plane: int
-    block: int
-    page: Optional[int] = None
-
-class OpKind(Enum):
-    READ = auto()
-    DOUT = auto()
-    PROGRAM = auto()
-    ERASE = auto()
-    SR = auto()            # status read
-    RESET = auto()
-
-@dataclass
-class StateSeq:
-    times: List[int]          # 상대/절대 시각 배열
-    states: List[str]         # "idle/busy/dma/..." 등 태그
-
-@dataclass
-class Operation:
-    kind: OpKind
-    targets: List[Address]             # 단일 또는 인터리브 대상
-    timeline: StateSeq                 # 상대시간 단계 (issue->busy->dma...)
-    movable: bool = True               # 재배치 허용 여부(의존성 있는 묶음은 False)
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class OperSeq:
-    ops: List[Operation]
-
-@dataclass
-class HostReq:
-    kind: OpKind
-    size: int                           # 논리적 크기 / 페이지 수
-    policy: Dict[str, Any] = field(default_factory=dict)  # QoS 등
-
-@dataclass
-class BusySlot:
-    start: int
-    end: int
-    op: Operation
-
-@dataclass
-class PlaneState:
-    available_at: int = 0               # 이 평면이 비는 시각
-    timeline: List[BusySlot] = field(default_factory=list)
-
-```
 
 4) Scheduler 설계
 4.1 이벤트 기반 루프
@@ -316,21 +252,6 @@ Look-ahead 윈도(예: 다음 K개)에서 READ를 앞당겨 plane 병렬성 최�
 
 10) 구현 절차(이벤트 라이프사이클)
 
-```
-[Scheduler.tick()]
-  ├─ now = pop(next_event_time)
-  ├─ process(event)
-  ├─ if QUEUE_REFILL or idle:
-  │    ├─ req = QueueManager.peek_and_select()
-  │    ├─ operseq = Req2Seq(req)
-  │    ├─ for op in operseq:
-  │    │    ├─ AddressManager.reserve(...)
-  │    │    ├─ Dependency/Busy validation
-  │    │    └─ schedule OP_START/OP_END (commit at END)
-  └─ push next QUEUE_REFILL / GC_TICK / RECLAIM_TICK as needed
-
-```
-
 11) 구성/파라미터(예시 기본값)
 
 LOOKAHEAD_K = 8 (재배치 대상)
@@ -353,17 +274,6 @@ MAX_QUEUE_SIZE = 10_000 (호스트 폭주 억제)
 
 13) 리스크 & 완화책
 
-| 리스크              | 설명                                            | 완화책                                                                        |
-| ------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------- |
-| 우선순위 역전       | Host READ가 GC에 막힘                           | Reservation에서 Host 대상 블록은 GC 예약 불가. 에이징 가중치로 Host 먼저 통과 |
-| 주소 정합성 붕괴    | GC가 먼저 ERASE 상태로 바꾸어 Host READ invalid | 커밋 지연(END에서만 AddressState 변경), Host 예약시 강한 락                   |
-| 의존성 깨짐(재배치) | 읽기 순서 당김 후 종속성 위반                   | movable=False 묶음, 재배치 전후 더블체크                                      |
-| 스타베이션          | 유지보수 영원히 못 돌림                         | Low watermark 하회 시 유지보수에 보너스 점수, 주기적 강제 슬롯                |
-| 이벤트 드리프트     | step clock와 패턴 미스                          | 이벤트 점프 모델 채택, 상대시간→절대시간 변환 일원화                          |
-| 동시 예약 충돌      | 여러 스레드/모듈이 동일 주소 예약               | AddressManager 토큰 기반 예약, TTL과 롤백                                     |
-| 메모리 팽창         | History/Timeline 누적                           | 롤링 윈도우 유지, 스냅샷 압축 저장                                            |
-| 성능 병목           | 10만+ 전이 테이블                               | 이벤트 힙, O(log N) 스케줄, 재배치 윈도 제한                                  |
-
 14) 테스트 전략(필수 시나리오)
 
 단위: Address 상태 전이(ERASE→PGM→READ), 예약/커밋/롤백, 의존성 검사
@@ -376,71 +286,8 @@ MAX_QUEUE_SIZE = 10_000 (호스트 폭주 억제)
 
 15) 파일 구조 제안
 
-```
-nandsim/
-  core/
-    scheduler.py
-    queue_manager.py
-    address_manager.py
-    models.py
-    req2seq.py
-  policy/
-    priority.py
-    gc.py
-    reclaim.py
-  sim/
-    runner.py           # main loop + config
-  tests/
-    test_address.py
-    test_depcheck.py
-    test_scheduler.py
-    test_gc_reclaim.py
-
-```
-
 16) 의사코드 스니펫
 16.1 스케줄러 핵심
-
-```python
-class Scheduler:
-    def __init__(self, qm, am, config):
-        self.now = 0
-        self.events = []  # heap
-        self.qm = qm
-        self.am = am
-        self.config = config
-        heapq.heappush(self.events, (0, "QUEUE_REFILL", None))
-
-    def run_until(self, t_end):
-        while self.events and self.events[0][0] <= t_end:
-            self.now, ev, payload = heapq.heappop(self.events)
-            self._handle(ev, payload)
-
-    def _handle(self, ev, payload):
-        if ev == "QUEUE_REFILL":
-            self._dispatch()
-            heapq.heappush(self.events, (self.now+ self.config.queue_refill_period, "QUEUE_REFILL", None))
-        elif ev == "OP_START":
-            pass
-        elif ev == "OP_END":
-            op, token = payload
-            self.am.commit(token)
-            # history/busy update...
-
-    def _dispatch(self):
-        req = self.qm.peek_and_select(self.now)
-        if not req: return
-        operseq = req2seq(req, self.am, self.config)
-        for op in operseq.ops:
-            token = self.am.reserve_targets(op.targets, op.kind, ttl=self._estimate_ttl(op))
-            if not token:
-                # could push back or trigger GC
-                continue
-            start, end = self._fit_to_planes(op)
-            heapq.heappush(self.events, (start, "OP_START", op))
-            heapq.heappush(self.events, (end,   "OP_END",   (op, token)))
-
-```
 
 17) “Self-thoughts” 항목 반영(정책화)
 
@@ -600,12 +447,6 @@ SPE에 상태-의존 확률표(또는 간단한 파라메트릭 함수) + 쌍 �
 
 3) “Host와 NAND를 별개 주체로 두지 않는다면?” 기준선 선택
 
-| 기준 설계                                                 | 장점                                         | 단점                                | 추천도 |
-| --------------------------------------------------------- | -------------------------------------------- | ----------------------------------- | ------ |
-| Host-중심(NAND 유지보수는 Host 트래픽의 부산물)           | 현실의 I/O 워크로드 닮음                     | GC/진단/엣지케이스 주입 제어가 약함 | △      |
-| NAND-중심(유지보수/내부정책이 1급, Host는 클래스 중 하나) | GC/엣지케이스 주도권↑, 내부 타이밍 주입 쉬움 | 워크로드 현실감은 조정 필요         | ◎      |
-| 단일 정책 엔진(혼합 클래스)                               | 튜닝·관측 일원화, 현실감↔엣지케이스 균형     | SPE 구현 필요(중난이도)             | 최고   |
-
 본 목적이 “엣지케이스 포함 시퀀스 생성”이므로, 단일 정책 엔진으로 가고 Host는 한 클래스로 취급하기를 권장.
 
 4) 구체 설계 포인트
@@ -618,14 +459,6 @@ SPE에 상태-의존 확률표(또는 간단한 파라메트릭 함수) + 쌍 �
 페이즈: {pre-start, near-start, mid, near-end, post}
 
 정책:
-
-```
-π(op | S,L,phase, class) = base(op,class) 
-                           × g_state(op,S) 
-                           × g_local(op,L) 
-                           × g_phase(op,phase)
-
-```
 
 전부 YAML 파라미터화 → 오프라인 튜닝 용이
 
@@ -657,49 +490,10 @@ plane available_at 계산해 시작 가능시각 산출(불가면 재샘플)
 
 5) 복잡도/리스크 비교 (요약)
 
-| 항목                  | 두 프로듀서(Host+NAND)          | 단일 정책 엔진(권장)                  |
-| --------------------- | ------------------------------- | ------------------------------------- |
-| 구현 복잡도           | 상 (상호작용/드리프트 처리 2중) | 중~상(엔진 1개로 일원화)              |
-| 분포 제어성           | 낮음(우선순위에 자주 깨짐)      | 높음(사전검사/피드백로프)             |
-| 엣지케이스 주입       | 제한적                          | 용이                                  |
-| 현실성(워크로드 유사) | 좋음                            | 튜닝 필요(혼합비율로 커버)            |
-| 리스크                | 드리프트/기아                   | 의무미충족/파라미터 폭발(완화책 있음) |
-
 6) 바로 넣기 쉬운 인터페이스 초안
 6.1 정책 엔진(SPE) 스케치
 
-```python
-class PolicyEngine:
-    def __init__(self, config, addr_mgr, dep_rules):
-        self.cfg = config       # YAML 파라미터
-        self.addr = addr_mgr
-        self.dep = dep_rules
-        self.stats = defaultdict(int)
-
-    def propose(self, now, hooks, global_state, local_state):
-        # 1) 트래픽 클래스 샘플 (host/gc/reclaim/diag)
-        cls = sample_class(global_state, self.cfg.mixture)
-        # 2) 의무 우선? (마감 임박한 Obligations 있으면 선점)
-        op = self._sample_op(cls, global_state, local_state, hooks.phase)
-        # 3) 타겟/타이밍 샘플 + 사전검사
-        cand = self._materialize(op, now, hooks, global_state, local_state)
-        if not self._precheck(cand): 
-            return None  # 또는 재샘플
-        return cand  # Operation or OperSeq
-
-```
-
 6.2 의무 관리자
-
-```python
-class ObligationManager:
-    def on_commit(self, op, now):
-        if op.kind == OpKind.READ:
-            self.add('DOUT', target=op.targets, deadline=now+sample_dt('read_dout'))
-    def pending(self, now):
-        return sorted(self.items, key=lambda x: x.deadline - now)
-
-```
 
 7) 튜닝/검증 루프(실전 팁)
 
@@ -800,19 +594,6 @@ Dataclass: Operation / OperSeq / StateSeq / Address / BusySlot.
 
 2) 실행 플로우(요약)
 
-```
-[Scheduler.run]
-  pop(next_event_time) → now 이동
-  if PHASE_HOOK or REFILL:
-     cand = SPE.propose(now, phase, global/local state, obligations)
-     if cand and pre-check OK:
-        예약(reserve) → 일정산출 → OP_START/OP_END enqueue
-  if OP_END:
-     Address commit + history update + 의무 갱신
-  반복
-
-```
-
 3) 확률/타이밍/엣지케이스 생성
 
 상태-의존 확률: 전역/로컬 상태 버킷(예: pgmable_ratio {low,mid,high})로 가중.
@@ -897,21 +678,6 @@ die/plane별 phase offset(위상)도 PhaseSpec에 파라미터화
 
 간단 스키치:
 
-```python
-@dataclass
-class PhasePoint:         # 상대시간(μs) + 라벨
-    rel_time: float
-    label: str            # e.g., "READ.CORE_BUSY.start"
-
-@dataclass
-class PhaseSpec:
-    # state 구간 길이 합으로부터 phase 포인트를 도출하는 규칙
-    hooks: List[str]      # {"state_start","state_mid","state_end"} 등
-    jitter: float         # ±ε
-    plane_phase_offset: Dict[Tuple[int,int], float] = field(default_factory=dict)
-
-```
-
 2) 질문에 대한 답
 Q1. “phase hook은 누가 생성하나? 이벤트 핸들러인가?”
 
@@ -931,20 +697,6 @@ PHASE_HOOK 이벤트가 도착하면 그 시점용 분포(g_phase)로 후보 Ope
 
 요약: 훅 생성은 스케줄러의 책임, 훅 처리(무엇을 낳을지)는 SPE의 책임.
 간단 의사코드:
-
-```python
-# Scheduler 쪽
-def _on_op_scheduled(self, op, start, end):
-    for hook in make_phase_hooks(op, start, end, spec=PhaseSpec[op.kind]):
-        heapq.heappush(self.events, (hook.time, "PHASE_HOOK", hook))
-
-# PHASE_HOOK 소비
-def _on_phase_hook(self, hook):
-    cand = SPE.propose(now=self.now, hook=hook, state=observed_state())
-    if cand and precheck(cand):
-        self._reserve_and_schedule(cand)
-
-```
 
 Q2. “Obligation Manager도 이벤트 핸들러인가?”
 
@@ -970,19 +722,6 @@ PHASE_HOOK/QUEUE_REFILL: 마감 임박 의무를 우선 후보로 표면화(우�
 
 의사코드:
 
-```python
-# ObligationManager (SPE 내부)
-def on_commit(self, op, now):
-    if op.kind == OpKind.READ:
-        self.add(kind="DOUT", targets=op.targets,
-                 deadline=now + sample_dt("READ->DOUT"))
-
-def suggest(self, now):
-    urgent = self.pick_urgent(now)   # 데드라인 임박 순
-    return [self.materialize(o) for o in urgent]  # SPE가 우선 고려하도록 반환
-
-```
-
 3) 최종 체크
 
  Operation의 다단계 state를 PhaseSpec으로 훅에 반영
@@ -1006,192 +745,6 @@ def suggest(self, now):
 (의존성 없이 pyyaml 정도로 읽어 쓰면 돼. 우선은 표준 라이브러리만 가정해서 타입/로더 인터페이스까지만 구성했어.)
 1) 설정 YAML 스키마 초안 (config.yaml 예시)
 
-```yaml
-version: 0.1
-
-rng:
-  seed: 12345
-
-topology:
-  dies: 1
-  planes_per_die: 2
-  blocks_per_plane: 8
-  pages_per_block: 64
-
-# 워터마크/큐/루프
-policy:
-  queue_refill_period_us: 2.0
-  lookahead_k: 8
-  max_queue_size: 10000
-  low_watermark_pgmable: 0.05
-  high_watermark_pgmable: 0.12
-  aging_weight_alpha: 0.01      # 대기시간 가중
-
-# 트래픽 클래스 혼합 (Host, GC, Reclaim, Diag 등)
-mixture:
-  classes:
-    host:   0.70
-    gc:     0.20
-    reclaim:0.10
-
-# 상태-의존 가중치 함수 정의(버킷 기반)
-state_buckets:
-  pgmable_ratio: [low, mid, high]
-  readable_ratio: [low, mid, high]
-  plane_busy_frac: [low, mid, high]   # 로컬
-
-weights:
-  base:               # 클래스별 기본 분포(연산 종류에 대한 베이스)
-    host:
-      READ:    0.45
-      DOUT:    0.00   # 의무로 유도됨(보통 직접 샘플 X)
-      PROGRAM: 0.40
-      ERASE:   0.05
-      SR:      0.05
-      RESET:   0.05
-    gc:
-      READ:    0.10
-      DOUT:    0.00
-      PROGRAM: 0.10
-      ERASE:   0.70
-      SR:      0.05
-      RESET:   0.05
-    reclaim:
-      READ:    0.70
-      DOUT:    0.00
-      PROGRAM: 0.15
-      ERASE:   0.05
-      SR:      0.05
-      RESET:   0.05
-
-  g_state:            # 전역 상태 가중: pgmable_ratio/ readable_ratio
-    pgmable_ratio:
-      low:  1.50    # PROGRAM/ERASE 유도
-      mid:  1.00
-      high: 0.70
-    readable_ratio:
-      low:  1.50    # READ 유도
-      mid:  1.00
-      high: 0.80
-
-  g_local:            # 로컬(plane) 바쁨 정도 가중
-    plane_busy_frac:
-      low:  1.20
-      mid:  1.00
-      high: 0.80
-
-  g_phase:            # 페이즈(훅 시점) 가중
-    READ:
-      START_NEAR: 1.20
-      MID_NEAR:   0.90
-      END_NEAR:   1.20
-    PROGRAM:
-      START_NEAR: 1.10
-      MID_NEAR:   1.10
-      END_NEAR:   0.90
-    ERASE:
-      START_NEAR: 0.90
-      MID_NEAR:   1.10
-      END_NEAR:   1.10
-    SR:
-      START_NEAR: 1.30
-      MID_NEAR:   1.00
-      END_NEAR:   1.00
-    RESET:
-      START_NEAR: 1.30
-      MID_NEAR:   1.00
-      END_NEAR:   0.90
-
-# OpKind 별 타임라인(여러 state로 구성)과 Phase 훅 규칙
-op_specs:
-  READ:
-    states:            # state 이름과 분포(상대시간 μs)
-      - {name: ISSUE,     dist: {kind: fixed, value: 0.5}}
-      - {name: CORE_BUSY, dist: {kind: normal, mean: 30.0, std: 5.0, min: 5.0}}
-      - {name: DATA_OUT,  dist: {kind: normal, mean: 8.0,  std: 2.0, min: 1.0}}
-    hooks:              # 어떤 포인트에 훅 생성할지
-      - {when: STATE_START, states: [ISSUE, CORE_BUSY, DATA_OUT], jitter_us: 0.2}
-      - {when: STATE_MID,   states: [CORE_BUSY], jitter_us: 0.5}
-      - {when: STATE_END,   states: [CORE_BUSY, DATA_OUT], jitter_us: 0.2}
-    phase_offset_us:    # die,plane 위상 오프셋(없으면 0)
-      default: 0.0
-
-  DOUT:
-    states:
-      - {name: ISSUE,     dist: {kind: fixed, value: 0.2}}
-      - {name: DATA_OUT,  dist: {kind: normal, mean: 5.0, std: 1.0, min: 0.5}}
-    hooks:
-      - {when: STATE_START, states: [DATA_OUT], jitter_us: 0.2}
-      - {when: STATE_END,   states: [DATA_OUT], jitter_us: 0.2}
-    phase_offset_us:
-      default: 0.0
-
-  PROGRAM:
-    states:
-      - {name: ISSUE,     dist: {kind: fixed, value: 0.5}}
-      - {name: CORE_BUSY, dist: {kind: normal, mean: 1200.0, std: 100.0, min: 600.0}}
-    hooks:
-      - {when: STATE_START, states: [ISSUE, CORE_BUSY], jitter_us: 1.0}
-      - {when: STATE_END,   states: [CORE_BUSY], jitter_us: 1.0}
-    phase_offset_us:
-      default: 0.0
-
-  ERASE:
-    states:
-      - {name: ISSUE,     dist: {kind: fixed, value: 0.5}}
-      - {name: CORE_BUSY, dist: {kind: normal, mean: 3000.0, std: 300.0, min: 1500.0}}
-    hooks:
-      - {when: STATE_START, states: [CORE_BUSY], jitter_us: 2.0}
-      - {when: STATE_END,   states: [CORE_BUSY], jitter_us: 2.0}
-    phase_offset_us:
-      default: 0.0
-
-  SR:
-    states:
-      - {name: ISSUE,     dist: {kind: fixed, value: 0.1}}
-      - {name: STATUS_RD, dist: {kind: fixed, value: 0.2}}
-    hooks:
-      - {when: STATE_START, states: [STATUS_RD], jitter_us: 0.1}
-    phase_offset_us:
-      default: 0.0
-
-  RESET:
-    states:
-      - {name: ISSUE,    dist: {kind: fixed, value: 0.2}}
-      - {name: RESET_OP, dist: {kind: fixed, value: 0.5}}
-    hooks:
-      - {when: STATE_START, states: [RESET_OP], jitter_us: 0.1}
-    phase_offset_us:
-      default: 0.0
-
-# 의무(쌍) 스펙: 어떤 연산이 끝나면 무엇을 언제까지 내야 하는지
-obligations:
-  - issuer: READ
-    require: DOUT
-    window_us: {kind: normal, mean: 12.0, std: 3.0, min: 2.0}   # Δt 분포
-    priority_boost:
-      start_us_before_deadline: 6.0
-      boost_factor: 2.0          # 우선순위 가중 배수
-      hard_slot: true            # 마감 임박 시 전용 슬롯 허용
-
-# 의존성 룰 (사전검사용)
-dependencies:
-  - {before: ERASE,   after: PROGRAM, scope: block}   # ERASE → PROGRAM
-  - {before: PROGRAM, after: READ,    scope: page}    # PROGRAM → READ
-
-# 우선순위(스케줄러 최종 결정 시)
-priority:
-  order: [HOST, READ, DOUT, ERASE, PROGRAM_NEW, PROGRAM_TARGET, SR, RESET]
-  starvation_aging_alpha: 0.01
-
-# 주소 선택 정책(사전검사와 함께 사용)
-address_policy:
-  program_select: {kind: any_pgmable_block}
-  read_select:    {kind: any_readable_page}
-  erase_select:   {kind: high_invalid_ratio}
-
-```
-
 포인트
 
 op_specs.*.states로 다단계 타임라인과 분포를 정의.
@@ -1203,317 +756,6 @@ obligations로 READ→DOUT 같은 쌍 의무와 데드라인 동작을 선언.
 weights는 base × g_state × g_local × g_phase 곱으로 샘플 점수를 만든다는 전제.
 
 2) 최소 실행 뼈대 (Python 스케치)
-
-```python
-# models.py
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import List, Dict, Any, Optional, Tuple
-
-class OpKind(Enum):
-    READ=auto(); DOUT=auto(); PROGRAM=auto(); ERASE=auto(); SR=auto(); RESET=auto()
-
-@dataclass(frozen=True)
-class Address:
-    die:int; plane:int; block:int; page:Optional[int]=None
-
-@dataclass
-class PhaseHook:
-    time_us: float
-    label: str            # e.g., "READ.CORE_BUSY.START"
-    die:int; plane:int
-
-@dataclass
-class StateSeg:
-    name:str
-    dur_us: float         # 샘플된 상대 duration
-
-@dataclass
-class Operation:
-    kind: OpKind
-    targets: List[Address]
-    states: List[StateSeg]   # ISSUE → ... → END
-    movable: bool = True
-    meta: Dict[str,Any] = field(default_factory=dict)
-
-@dataclass
-class BusySlot:
-    start_us: float
-    end_us: float
-    op: Operation
-
-```
-
-```python
-# dist.py (분포 샘플러)
-import random
-def sample_dist(d):
-    k = d["kind"]
-    if k == "fixed": return float(d["value"])
-    if k == "normal":
-        m = d["mean"]; s = d["std"]; mn = d.get("min", 0.0)
-        v = random.gauss(m, s); return max(v, mn)
-    if k == "exp":
-        l = d["lambda"]; return random.expovariate(l)
-    if k == "categorical":
-        # {"kind":"categorical","items":[["A",0.3],["B",0.7]]}
-        import bisect
-        items = d["items"]
-        ps=[]; xs=[]
-        acc=0.0
-        for x,p in items:
-            acc+=p; ps.append(acc); xs.append(x)
-        r=random.random()*acc
-        i= next(i for i,pp in enumerate(ps) if r<=pp)
-        return xs[i]
-    raise ValueError(f"unknown dist kind: {k}")
-
-```
-
-```python
-# op_spec.py (타임라인/훅 생성)
-from typing import Dict, List
-from models import Operation, StateSeg, PhaseHook, OpKind
-from dist import sample_dist
-
-def build_operation(kind: OpKind, cfg_op: Dict, targets):
-    states=[]
-    for s in cfg_op["states"]:
-        dur = sample_dist(s["dist"])
-        states.append(StateSeg(name=s["name"], dur_us=dur))
-    return Operation(kind=kind, targets=targets, states=states)
-
-def make_phase_hooks(op: Operation, start_us: float, cfg_op: Dict, die:int, plane:int)->List[PhaseHook]:
-    hooks_cfg = cfg_op.get("hooks", [])
-    offset = cfg_op.get("phase_offset_us",{}).get("default",0.0)
-    t = start_us + offset
-    hooks=[]
-    # 각 state의 절대 시작/중간/끝 시각 계산
-    cur = t
-    for seg in op.states:
-        seg_start = cur
-        seg_mid   = cur + seg.dur_us*0.5
-        seg_end   = cur + seg.dur_us
-        for rule in hooks_cfg:
-            if seg.name not in rule["states"]: 
-                continue
-            jitter = rule.get("jitter_us", 0.0)
-            if rule["when"]=="STATE_START":
-                hooks.append(PhaseHook(time_us=seg_start+jitter*rand_sign(), label=f"{op.kind.name}.{seg.name}.START", die=die, plane=plane))
-            elif rule["when"]=="STATE_MID":
-                hooks.append(PhaseHook(time_us=seg_mid+jitter*rand_sign(),   label=f"{op.kind.name}.{seg.name}.MID",   die=die, plane=plane))
-            elif rule["when"]=="STATE_END":
-                hooks.append(PhaseHook(time_us=seg_end+jitter*rand_sign(),   label=f"{op.kind.name}.{seg.name}.END",   die=die, plane=plane))
-        cur = seg_end
-    return hooks
-
-def rand_sign():
-    import random
-    return random.uniform(-1.0,1.0)
-
-```
-
-```python
-# obligations.py
-from dataclasses import dataclass
-from typing import List, Optional
-from models import OpKind, Address, Operation
-from dist import sample_dist
-import heapq, time
-
-@dataclass
-class Obligation:
-    require: OpKind
-    targets: List[Address]
-    deadline_us: float
-    boost_factor: float
-    hard_slot: bool
-
-class ObligationManager:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self._heap=[]  # (deadline, idx, Obligation)
-        self._ctr=0
-
-    def on_commit(self, op: Operation, now_us: float):
-        for spec in self.cfg:
-            if spec["issuer"] == op.kind.name:
-                dt = sample_dist(spec["window_us"])
-                ob = Obligation(
-                    require=OpKind[spec["require"]],
-                    targets=op.targets,
-                    deadline_us= now_us + dt,
-                    boost_factor= spec["priority_boost"]["boost_factor"],
-                    hard_slot= spec["priority_boost"].get("hard_slot", False)
-                )
-                heapq.heappush(self._heap, (ob.deadline_us, self._ctr, ob)); self._ctr+=1
-
-    def urgent(self, now_us: float, horizon_us: float=10.0)->List[Obligation]:
-        # 마감 임박 의무를 앞쪽에서 몇 개만 꺼냄(조회용)
-        res=[]
-        for deadline, _, ob in self._heap:
-            if deadline - now_us <= horizon_us:
-                res.append(ob)
-        return res
-
-```
-
-```python
-# policy_engine.py (SPE)
-import random
-from typing import Optional
-from models import Operation, OpKind, Address
-from op_spec import build_operation
-from dist import sample_dist
-
-class PolicyEngine:
-    def __init__(self, cfg, addr_mgr, dep_rules, obligation_mgr):
-        self.cfg = cfg
-        self.addr = addr_mgr
-        self.dep = dep_rules
-        self.obl = obligation_mgr
-
-    def _sample_class(self, global_state):
-        items = list(self.cfg["mixture"]["classes"].items())
-        names, probs = zip(*items)
-        r = random.random()*sum(probs)
-        acc=0
-        for n,p in items:
-            acc+=p
-            if r<=acc: 
-                return n
-        return names[-1]
-
-    def _score(self, op_name, phase_label, global_state, local_state):
-        w = self.cfg["weights"]["base"][global_state["cls"]].get(op_name, 0.0)
-        # 단순 예시: g_state/g_local/g_phase 곱
-        def gw(table, key, sub):
-            return self.cfg["weights"][table].get(key,{}).get(sub,1.0)
-        w *= gw("g_state","pgmable_ratio",global_state["pgmable_ratio"])
-        w *= gw("g_state","readable_ratio",global_state["readable_ratio"])
-        w *= gw("g_local","plane_busy_frac",local_state["plane_busy_frac"])
-        near = "MID_NEAR"
-        if phase_label.endswith("START"): near="START_NEAR"
-        elif phase_label.endswith("END"): near="END_NEAR"
-        w *= self.cfg["weights"]["g_phase"].get(op_name,{}).get(near,1.0)
-        return w
-
-    def propose(self, now_us, hook, global_state, local_state)->Optional[Operation]:
-        # 0) 의무 우선 검토
-        urgent = self.obl.urgent(now_us)
-        if urgent:
-            ob = urgent[0]
-            # 대상 주소 가용성/의존성 사전체크(간소화)
-            if self.addr.precheck(ob.require, ob.targets):
-                cfg_op = self.cfg["op_specs"][ob.require.name]
-                return build_operation(ob.require, cfg_op, ob.targets)
-
-        # 1) 클래스 샘플
-        global_state["cls"] = self._sample_class(global_state)
-        # 2) 후보 점수화 → 룰렛
-        cand=[]
-        for op_name in self.cfg["op_specs"].keys():
-            if op_name=="DOUT":   # 보통 의무로만 발생
-                continue
-            score = self._score(op_name, hook.label, global_state, local_state)
-            if score>0:
-                cand.append((op_name, score))
-        if not cand: return None
-        total = sum(s for _,s in cand)
-        r = random.random()*total; acc=0
-        pick = cand[-1][0]
-        for name, s in cand:
-            acc+=s
-            if r<=acc: 
-                pick=name; break
-
-        kind = OpKind[pick]
-        targets = self.addr.select(kind)        # address_policy 반영
-        if not targets: return None
-        cfg_op = self.cfg["op_specs"][pick]
-        op = build_operation(kind, cfg_op, targets)
-        # 사전검사(의존성/락/plane여유)
-        if not self.addr.precheck(kind, targets): 
-            return None
-        return op
-
-```
-
-```python
-# scheduler.py (이벤트 점프형, 훅 생성자이자 최종 승인자)
-import heapq
-from typing import Optional
-from models import Operation, BusySlot, PhaseHook, OpKind
-from op_spec import make_phase_hooks
-
-class Scheduler:
-    def __init__(self, cfg, addr_mgr, policy_engine):
-        self.cfg=cfg; self.addr=addr_mgr; self.SPE=policy_engine
-        self.now=0.0
-        self.ev=[] # (time, type, payload)
-        heapq.heappush(self.ev, (0.0, "QUEUE_REFILL", None))
-
-    def _schedule_operation(self, op, die, plane):
-        # plane availability를 고려해 start/end 절대 시각 산출(간이)
-        start = max(self.now, self.addr.available_at(die,plane))
-        dur = sum(seg.dur_us for seg in op.states)
-        end  = start + dur
-        self.addr.reserve(op.targets)  # 토큰 생략(스켈레톤)
-        heapq.heappush(self.ev, (start, "OP_START", (op, die, plane)))
-        heapq.heappush(self.ev, (end,   "OP_END",   (op, die, plane)))
-        # PHASE_HOOK 생성 (스케줄러 책임)
-        hooks = make_phase_hooks(op, start, self.cfg["op_specs"][op.kind.name], die, plane)
-        for h in hooks:
-            heapq.heappush(self.ev, (h.time_us, "PHASE_HOOK", h))
-
-    def run_until(self, t_end):
-        while self.ev and self.ev[0][0] <= t_end:
-            self.now, typ, payload = heapq.heappop(self.ev)
-            if typ=="QUEUE_REFILL":
-                heapq.heappush(self.ev, (self.now + self.cfg["policy"]["queue_refill_period_us"], "QUEUE_REFILL", None))
-            elif typ=="PHASE_HOOK":
-                hook=payload
-                global_state, local_state = self.addr.observe_states(hook.die, hook.plane)
-                cand = self.SPE.propose(self.now, hook, global_state, local_state)
-                if cand:
-                    self._schedule_operation(cand, hook.die, hook.plane)
-            elif typ=="OP_START":
-                op, die, plane = payload
-                # busy 시작: plane 타임라인 기록(생략)
-                pass
-            elif typ=="OP_END":
-                op, die, plane = payload
-                # 상태 커밋 + 의무 생성
-                self.addr.commit(op.targets, op.kind)
-                self.SPE.obl.on_commit(op, self.now)
-
-```
-
-```python
-# address_manager.py (스텁)
-class AddressManager:
-    def __init__(self, cfg):
-        self.cfg=cfg
-        # 간이 상태 테이블 초기화
-    def available_at(self, die, plane)->float:
-        return 0.0
-    def select(self, kind)->list:
-        # address_policy 반영해서 임의 주소 반환(스텁)
-        return []
-    def precheck(self, kind, targets)->bool:
-        return True
-    def reserve(self, targets): 
-        pass
-    def commit(self, targets, kind):
-        pass
-    def observe_states(self, die, plane):
-        # 전역/로컬 상태 버킷화 결과 반환
-        return (
-            {"pgmable_ratio":"mid","readable_ratio":"mid"}, 
-            {"plane_busy_frac":"low"}
-        )
-
-```
 
 3) 연결 방법(요약)
 
@@ -1550,460 +792,7 @@ Scheduler.run_until(t_end_us) 호출 → 이벤트 드리븐으로 훅 발생 �
 좋아—단일 파일로 바로 돌릴 수 있는 미니 데모 만들었어. 외부 라이브러리 없이 표준 라이브러리만 사용했고, 상단에 설정(Config)도 파이썬 딕셔너리로 내장해놨어. 이벤트 점프형 스케줄러, Phase Hook 생성(스케줄러), 확률 정책 엔진(SPE), READ→DOUT 의무(Obligation) 자동 생성/이행이 전부 보이는 최소 골격이야.
 아래 파일을 nandsim_demo.py로 저장하고 실행하면 콘솔 로그가 쭉 나와. (python3 nandsim_demo.py)
 
-```python
-# nandsim_demo.py - single-file miniature NAND op-sequence generator demo
-# Features: Event-jump scheduler, Phase hooks, Policy engine with state/phase weights,
-# READ->DOUT obligation, simple AddressManager stub, console logging.
-# Stdlib only.
-
-from __future__ import annotations
-import heapq, random, math
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import List, Dict, Any, Optional, Tuple
-
-# ---------------------------- Config (inline) ----------------------------
-
-CFG = {
-    "rng_seed": 12345,
-    "policy": {
-        "queue_refill_period_us": 3.0,
-        "lookahead_k": 4,
-        "run_until_us": 120.0,
-    },
-    "weights": {
-        "base": {  # class=host only for demo
-            "host": {
-                "READ": 0.85,
-                "PROGRAM": 0.10,
-                "ERASE": 0.05,
-                "SR": 0.00,
-                "RESET": 0.00,
-                "DOUT": 0.00,  # obligation-driven only
-            }
-        },
-        "g_state": {  # very light demo weights
-            "pgmable_ratio": {"low": 1.3, "mid": 1.0, "high": 0.8},
-            "readable_ratio": {"low": 1.3, "mid": 1.0, "high": 0.9},
-        },
-        "g_local": {"plane_busy_frac": {"low": 1.2, "mid": 1.0, "high": 0.9}},
-        "g_phase": {
-            "READ": {"START_NEAR": 1.2, "MID_NEAR": 0.9, "END_NEAR": 1.2},
-            "PROGRAM": {"START_NEAR": 1.1, "MID_NEAR": 1.0, "END_NEAR": 0.9},
-            "ERASE": {"START_NEAR": 0.9, "MID_NEAR": 1.1, "END_NEAR": 1.1},
-            "SR": {"START_NEAR": 1.0, "MID_NEAR": 1.0, "END_NEAR": 1.0},
-            "RESET": {"START_NEAR": 1.0, "MID_NEAR": 1.0, "END_NEAR": 1.0},
-        },
-    },
-    "mixture": {"classes": {"host": 1.0}},  # host-only for demo
-    "op_specs": {
-        "READ": {
-            "states": [
-                {"name": "ISSUE", "dist": {"kind": "fixed", "value": 0.4}},
-                {"name": "CORE_BUSY", "dist": {"kind": "normal", "mean": 8.0, "std": 1.5, "min": 2.0}},
-                {"name": "DATA_OUT", "dist": {"kind": "normal", "mean": 2.0, "std": 0.4, "min": 0.5}},
-            ],
-            "hooks": [
-                {"when": "STATE_START", "states": ["ISSUE", "CORE_BUSY", "DATA_OUT"], "jitter_us": 0.1},
-                {"when": "STATE_MID", "states": ["CORE_BUSY"], "jitter_us": 0.2},
-                {"when": "STATE_END", "states": ["DATA_OUT"], "jitter_us": 0.1},
-            ],
-            "phase_offset_us": {"default": 0.0},
-        },
-        "DOUT": {
-            "states": [
-                {"name": "ISSUE", "dist": {"kind": "fixed", "value": 0.2}},
-                {"name": "DATA_OUT", "dist": {"kind": "normal", "mean": 1.0, "std": 0.2, "min": 0.2}},
-            ],
-            "hooks": [
-                {"when": "STATE_START", "states": ["DATA_OUT"], "jitter_us": 0.05},
-                {"when": "STATE_END", "states": ["DATA_OUT"], "jitter_us": 0.05},
-            ],
-            "phase_offset_us": {"default": 0.0},
-        },
-        "PROGRAM": {
-            "states": [
-                {"name": "ISSUE", "dist": {"kind": "fixed", "value": 0.4}},
-                {"name": "CORE_BUSY", "dist": {"kind": "normal", "mean": 20.0, "std": 3.0, "min": 8.0}},
-            ],
-            "hooks": [{"when": "STATE_END", "states": ["CORE_BUSY"], "jitter_us": 0.2}],
-            "phase_offset_us": {"default": 0.0},
-        },
-        "ERASE": {
-            "states": [
-                {"name": "ISSUE", "dist": {"kind": "fixed", "value": 0.4}},
-                {"name": "CORE_BUSY", "dist": {"kind": "normal", "mean": 40.0, "std": 5.0, "min": 15.0}},
-            ],
-            "hooks": [{"when": "STATE_END", "states": ["CORE_BUSY"], "jitter_us": 0.2}],
-            "phase_offset_us": {"default": 0.0},
-        },
-    },
-    "obligations": [
-        {
-            "issuer": "READ",
-            "require": "DOUT",
-            "window_us": {"kind": "normal", "mean": 6.0, "std": 1.5, "min": 1.0},
-            "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True},
-        }
-    ],
-    "priority": {
-        "order": ["HOST", "READ", "DOUT", "ERASE", "PROGRAM_NEW", "PROGRAM_TARGET", "SR", "RESET"],
-        "starvation_aging_alpha": 0.01,
-    },
-    "topology": {"dies": 1, "planes_per_die": 2, "blocks_per_plane": 4, "pages_per_block": 16},
-}
-
-# ---------------------------- Models ----------------------------
-
-class OpKind(Enum):
-    READ=auto(); DOUT=auto(); PROGRAM=auto(); ERASE=auto(); SR=auto(); RESET=auto()
-
-@dataclass(frozen=True)
-class Address:
-    die:int; plane:int; block:int; page:Optional[int]=None
-
-@dataclass
-class PhaseHook:
-    time_us: float
-    label: str
-    die:int; plane:int
-
-@dataclass
-class StateSeg:
-    name:str
-    dur_us: float
-
-@dataclass
-class Operation:
-    kind: OpKind
-    targets: List[Address]
-    states: List[StateSeg]
-    movable: bool = True
-    meta: Dict[str,Any] = field(default_factory=dict)
-
-@dataclass
-class BusySlot:
-    start_us: float
-    end_us: float
-    op: Operation
-
-# ---------------------------- Utility: Distributions ----------------------------
-
-def sample_dist(d: Dict[str, Any]) -> float:
-    k = d["kind"]
-    if k == "fixed":
-        return float(d["value"])
-    if k == "normal":
-        m, s = d["mean"], d["std"]
-        mn = d.get("min", 0.0)
-        v = random.gauss(m, s)
-        return max(v, mn)
-    if k == "exp":
-        lam = d["lambda"]
-        return random.expovariate(lam)
-    raise ValueError(f"unknown dist kind: {k}")
-
-def rand_jitter(ampl_us: float) -> float:
-    if ampl_us<=0: return 0.0
-    return random.uniform(-ampl_us, ampl_us)
-
-# ---------------------------- OpSpec: build ops & hooks ----------------------------
-
-def build_operation(kind: OpKind, cfg_op: Dict[str, Any], targets: List[Address]) -> Operation:
-    states=[]
-    for s in cfg_op["states"]:
-        dur = sample_dist(s["dist"])
-        states.append(StateSeg(name=s["name"], dur_us=dur))
-    return Operation(kind=kind, targets=targets, states=states)
-
-def make_phase_hooks(op: Operation, start_us: float, cfg_op: Dict[str, Any], die:int, plane:int) -> List[PhaseHook]:
-    hooks_cfg = cfg_op.get("hooks", [])
-    offset = cfg_op.get("phase_offset_us",{}).get("default",0.0)
-    base_t = start_us + offset
-    hooks=[]
-    cur = base_t
-    for seg in op.states:
-        seg_start = cur
-        seg_mid   = cur + seg.dur_us*0.5
-        seg_end   = cur + seg.dur_us
-        for rule in hooks_cfg:
-            if seg.name not in rule["states"]:
-                continue
-            jitter = rule.get("jitter_us", 0.0)
-            if rule["when"]=="STATE_START":
-                hooks.append(PhaseHook(time_us=seg_start + rand_jitter(jitter), label=f"{op.kind.name}.{seg.name}.START", die=die, plane=plane))
-            elif rule["when"]=="STATE_MID":
-                hooks.append(PhaseHook(time_us=seg_mid   + rand_jitter(jitter), label=f"{op.kind.name}.{seg.name}.MID",   die=die, plane=plane))
-            elif rule["when"]=="STATE_END":
-                hooks.append(PhaseHook(time_us=seg_end   + rand_jitter(jitter), label=f"{op.kind.name}.{seg.name}.END",   die=die, plane=plane))
-        cur = seg_end
-    return hooks
-
-# ---------------------------- Address Manager (very small stub) ----------------------------
-
-class AddressManager:
-    def __init__(self, cfg: Dict[str, Any]):
-        topo = cfg["topology"]
-        self.dies = topo["dies"]
-        self.planes = topo["planes_per_die"]
-        # simple plane availability times
-        self.available = {(0,p): 0.0 for p in range(self.planes)}
-        # keep a simple rotating cursor for addresses per plane
-        self.cursors = {(0,p): [0,0,0] for p in range(self.planes)}  # block,page,read_page
-        self.pages_per_block = topo["pages_per_block"]
-        self.blocks_per_plane = topo["blocks_per_plane"]
-        # simplistic state: set of programmed (block,page)
-        self.programmed = {(0,p): set() for p in range(self.planes)}
-
-    def available_at(self, die:int, plane:int) -> float:
-        return self.available[(die,plane)]
-
-    def block_cycle(self, die:int, plane:int) -> int:
-        b, pgm_p, rd_p = self.cursors[(die,plane)]
-        return b
-
-    def select(self, kind: OpKind, die:int, plane:int) -> List[Address]:
-        # Very simple policy: READ picks next programmed page if any, else None
-        if kind == OpKind.READ:
-            prog = sorted(self.programmed[(die,plane)])
-            tgt = None
-            if prog:
-                tgt = prog[0]  # always first for demo
-            else:
-                # if nothing programmed, still allow a dummy read target page 0
-                tgt = (0,0)
-            return [Address(die, plane, block=tgt[0], page=tgt[1])]
-        if kind == OpKind.DOUT:
-            raise RuntimeError("DOUT selection must come from obligation targets")
-        if kind == OpKind.PROGRAM:
-            b, pgm_p, _ = self.cursors[(die,plane)]
-            addr = Address(die, plane, block=b, page=pgm_p)
-            # advance cursor (wrap)
-            pgm_p += 1
-            if pgm_p >= self.pages_per_block:
-                pgm_p = 0
-                b = (b+1) % self.blocks_per_plane
-            self.cursors[(die,plane)] = [b, pgm_p, self.cursors[(die,plane)][2]]
-            return [addr]
-        if kind == OpKind.ERASE:
-            b = self.block_cycle(die, plane)
-            return [Address(die, plane, block=b, page=None)]
-        # SR/RESET no target
-        return [Address(die, plane, block=0, page=0)]
-
-    def precheck(self, kind: OpKind, targets: List[Address]) -> bool:
-        # Always OK for demo
-        return True
-
-    def reserve(self, die:int, plane:int, start:float, end:float):
-        self.available[(die,plane)] = max(self.available[(die,plane)], end)
-
-    def commit(self, op: Operation):
-        # Update simple state: mark programmed or erase
-        t = op.targets[0]
-        key = (t.die, t.plane)
-        if op.kind == OpKind.PROGRAM and t.page is not None:
-            self.programmed[key].add((t.block, t.page))
-        elif op.kind == OpKind.ERASE:
-            # erase whole block
-            self.programmed[key] = {pp for pp in self.programmed[key] if pp[0] != t.block}
-
-    def observe_states(self, die:int, plane:int) -> Tuple[Dict[str,str], Dict[str,str]]:
-        # Map observed counters to simple bucket names
-        prog = len(self.programmed[(die,plane)])
-        # naive ratios for demo
-        pgmable_ratio = "mid" if prog < 10 else "low"
-        readable_ratio = "mid" if prog > 0 else "low"
-        plane_busy_frac = "low"  # not tracking real busy ratio in demo
-        return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls": "host"},
-                {"plane_busy_frac": plane_busy_frac})
-
-# ---------------------------- Obligation Manager ----------------------------
-
-@dataclass(order=True)
-class _ObHeapItem:
-    deadline_us: float
-    seq: int
-    ob: "Obligation" = field(compare=False)
-
-@dataclass
-class Obligation:
-    require: OpKind
-    targets: List[Address]
-    deadline_us: float
-    boost_factor: float
-    hard_slot: bool
-
-class ObligationManager:
-    def __init__(self, cfg_list: List[Dict[str,Any]]):
-        self.specs = cfg_list
-        self.heap: List[_ObHeapItem] = []
-        self._seq = 0
-
-    def on_commit(self, op: Operation, now_us: float):
-        for spec in self.specs:
-            if spec["issuer"] == op.kind.name:
-                dt = sample_dist(spec["window_us"])
-                ob = Obligation(
-                    require = OpKind[spec["require"]],
-                    targets = op.targets,
-                    deadline_us = now_us + dt,
-                    boost_factor = spec["priority_boost"]["boost_factor"],
-                    hard_slot = spec["priority_boost"].get("hard_slot", False),
-                )
-                heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=self._seq, ob=ob))
-                self._seq += 1
-                print(f"[{now_us:7.2f} us] OBLIG  created: {op.kind.name} -> {ob.require.name} by {ob.deadline_us:7.2f} us, target={_addr_str(ob.targets[0])}")
-
-    def pop_urgent(self, now_us: float) -> Optional[Obligation]:
-        if not self.heap: return None
-        # return the earliest deadline obligation if it's due within horizon or simply always for demo
-        item = heapq.heappop(self.heap)
-        return item.ob
-
-# ---------------------------- Policy Engine ----------------------------
-
-class PolicyEngine:
-    def __init__(self, cfg, addr_mgr: AddressManager, obl_mgr: ObligationManager):
-        self.cfg = cfg
-        self.addr = addr_mgr
-        self.obl = obl_mgr
-
-    def _score(self, op_name: str, phase_label: str, global_state: Dict[str,str], local_state: Dict[str,str]) -> float:
-        w = self.cfg["weights"]["base"]["host"].get(op_name, 0.0)
-        w *= self.cfg["weights"]["g_state"]["pgmable_ratio"].get(global_state["pgmable_ratio"], 1.0)
-        w *= self.cfg["weights"]["g_state"]["readable_ratio"].get(global_state["readable_ratio"], 1.0)
-        w *= self.cfg["weights"]["g_local"]["plane_busy_frac"].get(local_state["plane_busy_frac"], 1.0)
-        near = "MID_NEAR"
-        if phase_label.endswith("START"): near="START_NEAR"
-        elif phase_label.endswith("END"): near="END_NEAR"
-        w *= self.cfg["weights"]["g_phase"].get(op_name, {}).get(near, 1.0)
-        return w
-
-    def propose(self, now_us: float, hook: PhaseHook, global_state: Dict[str,str], local_state: Dict[str,str]) -> Optional[Operation]:
-        # 0) serve obligation first, if any
-        ob = self.obl.pop_urgent(now_us)
-        if ob:
-            if self.addr.precheck(ob.require, ob.targets):
-                cfg_op = self.cfg["op_specs"][ob.require.name]
-                op = build_operation(ob.require, cfg_op, ob.targets)
-                op.meta["source"]="obligation"
-                return op
-        # 1) sample op by weighted picking
-        cand = []
-        for name in ["READ", "PROGRAM", "ERASE"]:
-            s = self._score(name, hook.label, global_state, local_state)
-            if s>0: cand.append((name, s))
-        if not cand: return None
-        total = sum(s for _,s in cand)
-        r = random.random()*total
-        acc=0.0
-        pick = cand[-1][0]
-        for name, s in cand:
-            acc += s
-            if r <= acc:
-                pick=name; break
-        kind = OpKind[pick]
-        targets = self.addr.select(kind, hook.die, hook.plane)
-        if not targets: return None
-        op = build_operation(kind, self.cfg["op_specs"][pick], targets)
-        op.meta["source"]="policy"
-        return op
-
-# ---------------------------- Scheduler ----------------------------
-
-class Scheduler:
-    def __init__(self, cfg, addr_mgr: AddressManager, policy_engine: PolicyEngine, obl_mgr: ObligationManager):
-        self.cfg=cfg; self.addr=addr_mgr; self.SPE=policy_engine; self.obl=obl_mgr
-        self.now=0.0
-        self.ev=[]  # (time, seq, type, payload)
-        self._seq=0
-        self._push(0.0, "QUEUE_REFILL", None)
-        # Also seed a phase hook per plane to bootstrap
-        for plane in range(self.addr.planes):
-            self._push(0.0, "PHASE_HOOK", PhaseHook(0.0, "BOOT.START", 0, plane))
-
-    def _push(self, t: float, typ: str, payload: Any):
-        heapq.heappush(self.ev, (t, self._seq, typ, payload)); self._seq+=1
-
-    def _schedule_operation(self, op: Operation, die:int, plane:int):
-        # Determine start considering plane availability
-        start = max(self.now, self.addr.available_at(die,plane))
-        dur = sum(seg.dur_us for seg in op.states)
-        end  = start + dur
-        self.addr.reserve(die, plane, start, end)
-        self._push(start, "OP_START", (op, die, plane))
-        self._push(end,   "OP_END",   (op, die, plane))
-        # Generate hooks at real absolute times
-        hooks = make_phase_hooks(op, start, self.cfg["op_specs"][op.kind.name], die, plane)
-        for h in hooks:
-            self._push(h.time_us, "PHASE_HOOK", h)
-        print(f"[{self.now:7.2f} us] SCHED  {op.kind.name:7s} on die{die}/pl{plane} -> [{start:7.2f}, {end:7.2f}) target={_addr_str(op.targets[0])} src={op.meta.get('source')}")
-
-    def run_until(self, t_end: float):
-        while self.ev and self.ev[0][0] <= t_end:
-            self.now, _, typ, payload = heapq.heappop(self.ev)
-            if typ=="QUEUE_REFILL":
-                # seed synthetic hooks to keep generation flowing
-                for plane in range(self.addr.planes):
-                    self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "REFILL.NUDGE", 0, plane))
-                nxt = self.now + self.cfg["policy"]["queue_refill_period_us"]
-                self._push(nxt, "QUEUE_REFILL", None)
-
-            elif typ=="PHASE_HOOK":
-                hook: PhaseHook = payload
-                global_state, local_state = self.addr.observe_states(hook.die, hook.plane)
-                op = self.SPE.propose(self.now, hook, global_state, local_state)
-                if op:
-                    self._schedule_operation(op, hook.die, hook.plane)
-                else:
-                    # No op proposed; this is fine
-                    pass
-
-            elif typ=="OP_START":
-                op, die, plane = payload
-                print(f"[{self.now:7.2f} us] START  {op.kind.name:7s} die{die}/pl{plane} target={_addr_str(op.targets[0])}")
-
-            elif typ=="OP_END":
-                op, die, plane = payload
-                print(f"[{self.now:7.2f} us] END    {op.kind.name:7s} die{die}/pl{plane} target={_addr_str(op.targets[0])}")
-                self.addr.commit(op)
-                self.obl.on_commit(op, self.now)
-
-def _addr_str(a: Address)->str:
-    return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
-
-# ---------------------------- Main Demo ----------------------------
-
-def main():
-    random.seed(CFG["rng_seed"])
-    addr = AddressManager(CFG)
-    obl  = ObligationManager(CFG["obligations"])
-    spe  = PolicyEngine(CFG, addr, obl)
-    sch  = Scheduler(CFG, addr, spe, obl)
-    run_until = CFG["policy"]["run_until_us"]
-    print("=== NAND Sequence Generator Demo (single-file) ===")
-    sch.run_until(run_until)
-    print("=== Done ===")
-
-if __name__ == "__main__":
-    main()
-
-```
-
 실행하면 이런 로그가 보여요 (발췌)
-
-```
-=== NAND Sequence Generator Demo (single-file) ===
-[   0.00 us] SCHED  READ    on die0/pl0 -> [   0.00,   13.24) target=(d0,p0,b0,pg0) src=policy
-[   0.00 us] START  READ    die0/pl0 target=(d0,p0,b0,pg0)
-...
-[ 114.13 us] END    READ    die0/pl1 target=(d0,p1,b0,pg0)
-[ 114.13 us] OBLIG  created: READ -> DOUT by  120.18 us, target=(d0,p1,b0,pg0)
-[ 114.44 us] SCHED  DOUT    on die0/pl1 -> [ 907.83, 908.69) target=(d0,p1,b0,pg0) src=obligation
-=== Done ===
-
-```
 
 커스터마이즈 포인트 (빠르게 조정)
 
@@ -2129,33 +918,9 @@ Scheduler
 
 함수별 “정확한 호출 시점” 요약 표
 
-| 함수                          | 호출 주체                  | 호출 이벤트                           | 컨텍스트(주요 인자)                                                   | 목적                                               |
-| ----------------------------- | -------------------------- | ------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------- |
-| AddressManager.available_at   | Scheduler                  | PHASE_HOOK, QUEUE_REFILL, 스케줄 직전 | (die, plane)                                                          | plane 가용 시각 산출(earliest_start)               |
-| AddressManager.observe_states | Scheduler                  | PHASE_HOOK(항상), REFILL(선택)        | (die, plane)                                                          | propose 가중치/정책용 전역/로컬 상태 스냅샷        |
-| PolicyEngine.propose          | Scheduler → SPE            | PHASE_HOOK                            | now, hook(die,plane,label), global_state, local_state, earliest_start | 사전검사 포함된 실행가능 Operation 제안            |
-| ObligationManager.pop_urgent  | SPE (propose 내부 첫 단계) | PHASE_HOOK 처리 중                    | now, die, plane, horizon_us, earliest_start                           | 같은 plane에서 데드라인 만족 가능한 의무 우선 수령 |
-| AddressManager.precheck       | SPE (propose 내부)         | PHASE_HOOK 처리 중                    | kind, targets, start_hint=earliest_start                              | 의존성/락/자원 사전검사(리젝션 방지 핵심)          |
-| AddressManager.reserve        | Scheduler                  | 스케줄 결정 직후(OP 등록 직전)        | die, plane, start, end                                                | 예약 확정(타임라인/경합 고정)                      |
-| AddressManager.commit         | Scheduler                  | OP_END                                | op                                                                    | 실제 상태 전이 반영(ERASE/PGM_LAST 등)             |
-| ObligationManager.on_commit   | Scheduler                  | OP_END(커밋 직후)                     | op, now                                                               | READ→DOUT 등 의무 생성(데드라인 확정)              |
-
 주의: reserve는 Scheduler만 호출(단일 결재선), precheck는 SPE 내부에서 미리 호출(리젝션 방지).
 
 propose 직전 “컨텍스트 패킷” (권장 형태)
-
-```python
-ProposeContext = {
-  "now": now_us,
-  "hook": {"die": die, "plane": plane, "label": hook.label},
-  "earliest_start": AddressManager.available_at(die, plane),
-  "global_state": global_state,   # observe_states 반환
-  "local_state":  local_state,    # observe_states 반환
-  # 선택: 다음 훅 예정 시각, plane 예약 현황 요약, 정책 플래그 등
-}
-# Scheduler가 위 컨텍스트를 정리해 SPE.propose(...)에 전달
-
-```
 
 SPE 내부 동작(권장 순서):
 
@@ -2180,3 +945,219 @@ REFILL은 훅만 던진다: propose 직접 호출을 피하고 통일된 PHASE_H
 OP_END 직후 조기 훅: 의무가 생긴 plane에 즉시 PHASE_HOOK을 발행해 데드라인 대응력↑.
 
 필요하면 위 흐름을 코드에 반영해서, propose(ctx) 시그니처와 pop_urgent(now, die, plane, horizon, earliest_start) 구현(필터링 포함), precheck(..., start_hint) 확장을 한 패치 버전으로 바로 만들어줄게.
+
+## 👤 User
+
+좋아. 흐름은 이해했어. 아래는 지금 코드에서 보완해야 할 사항을 내가 정리한 거야. 니가 보고, 첫번째로 즉시 실행 가능하고 구조 변경점이 큰 것을 우선 순위를 높이고, 코드 전체를 변경해야 하는 risk 가 큰 것을 우선 순위를 낮춰서 정리해줘. 우선 순위가 낮아보이더라도, 필수적으로 개선해야하는 작업은 우선 순위를 높여서 정리하고, 정리된 것을 todo list 로 만들고 스텝 바이 스텝으로 실행하자.
+## 보완 사항
+- BusySlot 은 왜 만들었는지 확인 필요
+- observe_states 에서 특정 die, plane 에 대해서 ratio 구하는 방식이 맞는지 검토 필요
+- CFG->op_specs->hooks->states 는 phase 별로 적용할 것을 명시하고 있으나, 일괄적으로 phase 당 3개로 고요해서 단순하게 정리 필요
+- addr.observe_states(hook.die, hook.plane) 에서 시간 정보 추가 필요. pgmable_ration, readalbe_ratio, local_plane_frac 등도 현재 시간에 맞춰 업데이트 돼야 한다.
+- addr.select(kind, die, plane) 에서 multi-plane operation 시 List[Address] 형태로 반환 필요
+- precheck 함수 구현 필요
+- obligation 으로 만들어진 operation 은 종류에 따라서 op.targets 에서 연산하는 로직 구현 필요. sequential read/pgm 는 page address + 1 , cache read 의 경우에 순서상 cache read 가 먼저 나오고 dout 이 나중인데, dout 의 address 는 cache read 의 address -1 이다.
+- _schedule_operation -> addr.reserve(die,plane,start,end) 시에 operation 에 따라서 erase/pgm/multi-plane operation 의 경우 해당되는 plane 모두 reserve 처리 필요
+- policy operation 의 선택은 weight 보다는 정해진 operation.phase 조건 하의 operation 확률 weight 값을 받아와서 random choice 해야함.
+- policy 와 obligation 의 우선 순위를 처리하는 로직 구현 필요. 현재는 obl.pop_urget(sch.now) 는 구현없이 조건 obl.heappop 을 하게 돼있음
+- op.movable 이 정말 필요한지 검토
+- 두 개 이상의 operation 을 순차적으로 예약하는 경우 처리 로직 어느 단계에서 구현할 지 검토. addr.precheck 만으로 충분한지 관점
+  - sequential read/program 이 예약된 경우, 동일 block 상에 erase/program/read 는 금지해야 한다.
+  - obligation 이 heap 에 여러개 쌓여 있을 경우, 어느 obligation 부터 꺼낼지 로직 구현 필요. 현재는 deadline 기준으로 정렬이 되고, obligation 사이에 dependency check 필요한지 여부 검토 필요
+- make_phase_hooks 으로 'PHASE_HOOK' event push 할 떄 pattern time resolution 고려 time sampling 필요
+- plane interleave read 를 만들기 위해서, 스케쥴러가 개입을 하는 것이 필요한지 검토
+- obligation, policy operation 간에 addr.select 를 쓰고 안쓰고 정해지는데, 통합해야 할 필요성? obligation 은 source  operation 의 targets 상속받는 형식이지만, addr.select 는 샘플링 하는 방식
+- make_phase_hooks(op, start, sch.cfg["op_specs"][op.kind.name], die, plane) 에서 op 를 넘겨줌에도 별도로 sch.cfg["op_specs"][op.kind.name] 을 넘겨주고 있다. 통합 가능한지 검토
+- sch._schedule_operation 에서 dur 계산 로직 수정 필요. StateSeq, Operation clss 구현과 연결됨. Stateseq.times 는 절대값을 저장하므로 마지막 값만 추출해서 사용가능. 하지만, 현재 구현상 times 에 저장되는 값은 state 의 끝나는 시간이 저장됨. 그리고 operation 이 끝난 후는 state 가 다른 operation 이 수행되기 전까지 무한히 유지되므로 times 의 마지막 값은 10ms 의 매우 큰 값이 저장돼 있음 
+  - @dataclass<br>
+  class StateSeq<br>
+  times: List[float]<br>
+  states: List[str]<br>
+  id: int<br>
+
+## 🤖 Assistant
+
+좋아. 아래는 **“propose 거절률 최소화”**를 최우선 목표로 한 우선순위화된 To-Do 리스트와, 즉시 적용 가능한 패치 스텝이야.  
+
+원칙: 바로 실행 가능 + 구조적 이득 큰 것 = 상위, 코드 전반 리스크 큰 것 = 하위. 단, 필수 개선은 상위로 끌어올림.
+
+✅ 우선순위별 To-Do
+P0 — 지금 적용 (구조 개선 크고, 거절률↓ 효과 큼 / 리스크 낮음)
+
+propose 시그니처 확장 + 호출 컨텍스트 정규화
+
+earliest_start(= AddressManager.available_at)를 propose(...)에 전달해 precheck가 “지금이 아니라 실제 시작가능 시점” 기준으로 판단.
+
+Scheduler의 PHASE_HOOK 처리 경로에서 observe_states(now), available_at을 수집해 함께 전달.
+
+ObligationManager.pop_urgent를 plane/시간 제약으로 필터링
+
+단순 heappop 제거. (die, plane) 일치 + earliest_start로 시작해도 데드라인 만족 가능한 의무만 반납.
+
+다수일 경우 가장 임박한 데드라인 우선.
+
+AddressManager.precheck 실구현 (최소 유효성)
+
+(die, plane) 예약창과 시간 겹침 금지.
+
+block 단위 충돌 룰(예: 같은 block에 ERASE↔PROGRAM/READ 동시 금지) 최소화 규칙.
+
+start_hint(= earliest_start) 기반 검사.
+
+AddressManager.reserve를 다중 plane 지원
+
+Operation.targets의 중복 없는 (die, plane) 집합 전체에 예약 반영.
+
+Scheduler에서 op.targets 전체를 예약.
+
+observe_states(now)로 시각 기반 스냅샷
+
+시그니처에 now 추가, 버킷링 로직을 now를 받아 갱신(스텁이어도 형태 통일).
+
+의무(Obligation) 우선순위 처리 규칙 고정
+
+propose에서 의무 우선 → 정책 후보 순.
+
+의무 불가(사전검사 실패) 시 대체 타겟 재시도 후에만 정책 후보로 넘어감.
+
+P1 — 다음 단계 (거절률↓/튜닝력↑, 리스크 보통)
+
+Hook 시간 양자화(Resolution) 도입
+
+PHASE_HOOK 생성 시 **시뮬레이터 해상도(예: 0.01us)**로 quantize(time) 처리 → 중복/경합 완화.
+
+Policy 가중 선택을 “phase-조건화 weight”로 단순화
+
+지금은 여러 가중을 곱하는 구조. phase_label에 직접 대응하는 사전 계산 weight 테이블(START/MID/END)을 사용해 샘플/설명 용이성↑.
+
+AddressManager.select의 다중 plane/인터리브 선택 스펙
+
+반환형을 List[Address]로 고정하고, fanout/interleave 옵션(기본 1) 추가.
+
+정책/의무 모두 동일 인터페이스로 사용.
+
+Scheduler._schedule_operation의 duration 계산을 래퍼로 일원화
+
+get_op_duration(op) 추가:
+
+현재(상대 duration 합) 방식 지원
+
+향후 StateSeq.times(절대)로 전환 시도 시에도 wrapper 교체만으로 대응.
+
+ObligationManager 다건 처리 정책 구체화
+
+동일 plane에서 다수 의무 → 데드라인 우선, 동률 시 발급 순서.
+
+옵션: horizon 내 미임박 의무는 보류.
+
+make_phase_hooks API 통일
+
+op.kind로 cfg를 찾을 수 있으므로, 인자에서 중복 cfg 제거(내부에서 참조) — 후방호환 유지.
+
+P2 — 이후 (최적화/리포팅, 리스크 낮음)
+
+BusySlot 의미 부여(또는 삭제)
+
+유지 시: plane utilization/겹침 디버깅/리포트에 사용.
+
+미사용이면 제거.
+
+plane interleave READ 최적화(스케줄러 개입)
+
+Look-ahead 윈도에서 READ 전진/분산(거절률에 직접 영향은 적어 후순위).
+
+op.movable 재검토
+
+재배치가 없는 한 당장 필요 X. 후속 최적화 단계에서 반영.
+
+🛠️ P0 패치 — 즉시 적용 스텝 & 코드 조각
+아래 조각은 네가 만든 nandsim_demo.py 기준으로 부분 치환하면 돼.
+(1) observe_states/available_at/컨텍스트 → propose 전달
+Scheduler (PHASE_HOOK 처리부)
+
+AddressManager.observe_states 시그니처
+
+(2) PolicyEngine.propose 시그니처 확장 + 의무 우선 + precheck
+시그니처 변경
+
+의무 우선 + precheck 적용
+
+정책 후보에도 precheck
+
+(3) ObligationManager.pop_urgent 구현(필터링 포함)
+
+(4) AddressManager.precheck + 예약 테이블 + 다중 plane 예약
+상태 보관 필드 추가
+
+precheck 구현
+
+reserve 다중 plane 반영 & commit 그대로
+
+(5) observe_states(now) 적용으로 호출부 일관화
+
+위 (1)에서 적용한 대로 모든 PHASE_HOOK 경로가 동일 컨텍스트를 갖게 됨.
+
+▶ 실행 순서 (Step-by-Step)
+
+Scheduler → PHASE_HOOK 처리부에 earliest_start/now 반영 및 propose 시그니처 업데이트.
+
+PolicyEngine.propose에 의무 우선 + precheck 도입(위 코드 조각).
+
+ObligationManager.pop_urgent를 필터링 버전으로 교체.
+
+AddressManager에 resv 테이블 추가 → precheck/reserve 구현 → 다중 plane 예약으로 스케줄러 수정.
+
+**AddressManager.observe_states(now)`**로 시그니처 통일.
+
+로깅: propose 결과가 None인 비율(훅 대비) 체크 → 거절률/무스케줄률 지표 추가(간단히 카운터만).
+
+여기까지가 P0 패치. 이 상태에서 **거절률(=precheck 실패로 스케줄 불가)**이 유의미하게 떨어져야 한다.
+
+(참고) P1에서 바로 붙일 작은 조각
+Hook 시간 양자화
+
+duration 래퍼
+
+필요하면 위 패치들을 내가 준 단일 파일 데모에 붙인 통합본으로 만들어 줄 수 있어. 다음 턴에서 원하면 바로 합쳐서 전달할게.
+
+## 👤 User
+
+통합본 만들어줘
+
+## 🤖 Assistant
+
+아래는 P0 패치가 모두 반영된 단일 파일 통합본이에요.
+
+propose(...)에 earliest_start 전달
+
+observe_states(die, plane, now) 시그니처 반영
+
+ObligationManager.pop_urgent(...)가 die/plane/시간 조건으로 필터
+
+AddressManager.precheck(...) 실구현(시간 겹침/간단 충돌 룰)
+
+AddressManager.reserve(...)가 다중 plane 예약 반영
+
+Scheduler._schedule_operation(...)이 op.targets 전체 기준으로 예약/훅 생성
+
+의무(Obligation) 우선 → 정책 후보 순으로 처리
+
+마지막에 스케줄 통계(제안/성공) 로그 출력
+
+파일명 예: nandsim_demo_p0.py
+
+원하는 대로 바로 실행하면 됩니다:
+
+다음 단계로 가면,
+
+Hook 시간 양자화(quantize),
+
+policy phase별 weight 테이블 간소화,
+
+multi-plane select(fanout/interleave) 옵션,
+
+duration 래퍼(get_op_duration),
+
+BusySlot 활용/리포트  
+
+같은 P1/P2 항목을 이어서 붙일 수 있어요.

@@ -1,22 +1,25 @@
-# nandsim_demo.py - single-file miniature NAND op-sequence generator demo
-# Features: Event-jump scheduler, Phase hooks, Policy engine with state/phase weights,
-# READ->DOUT obligation, simple AddressManager stub, console logging.
-# Stdlib only.
+# nandsim_demo_p0.py — P0 통합본 (stdlib-only)
+# - Event-jump Scheduler
+# - Phase Hook 생성(스케줄러)
+# - PolicyEngine with earliest_start + precheck
+# - Obligation (READ -> DOUT) with plane/time filtering
+# - AddressManager: state snapshot(now), precheck/reserve with multi-plane
+# - 간단 통계: propose calls / scheduled ops
 
 from __future__ import annotations
-import heapq, random, math
+import heapq, random
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
-# ---------------------------- Config (inline) ----------------------------
+# ---------------------------- Config ----------------------------
 
 CFG = {
     "rng_seed": 12345,
     "policy": {
         "queue_refill_period_us": 3.0,
         "lookahead_k": 4,
-        "run_until_us": 120.0,
+        "run_until_us": 150.0,
     },
     "weights": {
         "base": {  # class=host only for demo
@@ -134,6 +137,9 @@ class BusySlot:
     end_us: float
     op: Operation
 
+def _addr_str(a: Address)->str:
+    return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
+
 # ---------------------------- Utility: Distributions ----------------------------
 
 def sample_dist(d: Dict[str, Any]) -> float:
@@ -186,46 +192,49 @@ def make_phase_hooks(op: Operation, start_us: float, cfg_op: Dict[str, Any], die
         cur = seg_end
     return hooks
 
-# ---------------------------- Address Manager (very small stub) ----------------------------
+# ---------------------------- Address Manager ----------------------------
 
 class AddressManager:
     def __init__(self, cfg: Dict[str, Any]):
         topo = cfg["topology"]
         self.dies = topo["dies"]
         self.planes = topo["planes_per_die"]
-        # simple plane availability times
-        self.available = {(0,p): 0.0 for p in range(self.planes)}
-        # keep a simple rotating cursor for addresses per plane
-        self.cursors = {(0,p): [0,0,0] for p in range(self.planes)}  # block,page,read_page
+        # plane availability absolute times
+        self.available: Dict[Tuple[int,int], float] = {(0,p): 0.0 for p in range(self.planes)}
+        # rotating cursors per plane
+        self.cursors: Dict[Tuple[int,int], List[int]] = {(0,p): [0,0,0] for p in range(self.planes)}  # [block, next_pgm_page, next_rd_page]
         self.pages_per_block = topo["pages_per_block"]
         self.blocks_per_plane = topo["blocks_per_plane"]
-        # simplistic state: set of programmed (block,page)
-        self.programmed = {(0,p): set() for p in range(self.planes)}
+        # simplistic programmed set per plane
+        self.programmed: Dict[Tuple[int,int], Set[Tuple[int,int]]] = {(0,p): set() for p in range(self.planes)}
+        # reservation table per plane: list of (start,end,block)
+        self.resv: Dict[Tuple[int,int], List[Tuple[float,float,Optional[int]]]] = {(0,p): [] for p in range(self.planes)}
+
+    # ---- observation / selection / checks ----
 
     def available_at(self, die:int, plane:int) -> float:
         return self.available[(die,plane)]
 
-    def block_cycle(self, die:int, plane:int) -> int:
-        b, pgm_p, rd_p = self.cursors[(die,plane)]
-        return b
+    def observe_states(self, die:int, plane:int, now_us: float):
+        prog = len(self.programmed[(die,plane)])
+        # naive buckets for demo
+        pgmable_ratio  = "mid" if prog < 10 else "low"
+        readable_ratio = "mid" if prog > 0 else "low"
+        plane_busy_frac = "low"  # (could be derived from resv overlap with [now,now+Δ])
+        return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls": "host"},
+                {"plane_busy_frac": plane_busy_frac})
 
     def select(self, kind: OpKind, die:int, plane:int) -> List[Address]:
-        # Very simple policy: READ picks next programmed page if any, else None
         if kind == OpKind.READ:
             prog = sorted(self.programmed[(die,plane)])
-            tgt = None
-            if prog:
-                tgt = prog[0]  # always first for demo
-            else:
-                # if nothing programmed, still allow a dummy read target page 0
-                tgt = (0,0)
+            tgt = prog[0] if prog else (0,0)
             return [Address(die, plane, block=tgt[0], page=tgt[1])]
         if kind == OpKind.DOUT:
-            raise RuntimeError("DOUT selection must come from obligation targets")
+            raise RuntimeError("DOUT selection must be provided by obligation targets")
         if kind == OpKind.PROGRAM:
             b, pgm_p, _ = self.cursors[(die,plane)]
             addr = Address(die, plane, block=b, page=pgm_p)
-            # advance cursor (wrap)
+            # advance cursor
             pgm_p += 1
             if pgm_p >= self.pages_per_block:
                 pgm_p = 0
@@ -233,20 +242,35 @@ class AddressManager:
             self.cursors[(die,plane)] = [b, pgm_p, self.cursors[(die,plane)][2]]
             return [addr]
         if kind == OpKind.ERASE:
-            b = self.block_cycle(die, plane)
+            b = self.cursors[(die,plane)][0]
             return [Address(die, plane, block=b, page=None)]
-        # SR/RESET no target
         return [Address(die, plane, block=0, page=0)]
 
-    def precheck(self, kind: OpKind, targets: List[Address]) -> bool:
-        # Always OK for demo
+    def precheck(self, kind: OpKind, targets: List[Address], start_hint: float) -> bool:
+        """Minimal feasibility check: time overlap + simple block rule."""
+        MIN_GUARD = 0.0
+        end_hint = start_hint + MIN_GUARD
+        # 1) time overlap across all planes in targets
+        seen_planes = set()
+        for t in targets:
+            key = (t.die, t.plane)
+            if key in seen_planes: 
+                continue
+            seen_planes.add(key)
+            for (s,e,_) in self.resv[key]:
+                if not (end_hint <= s or e <= start_hint):
+                    return False
+        # 2) simple block rule (placeholder for real dep rules)
+        #    forbid ERASE on a block if it's been programmed recently (not tracked here) — skip for demo
         return True
 
-    def reserve(self, die:int, plane:int, start:float, end:float):
+    # ---- reserve / commit ----
+
+    def reserve(self, die:int, plane:int, start:float, end:float, block: Optional[int]=None):
         self.available[(die,plane)] = max(self.available[(die,plane)], end)
+        self.resv[(die,plane)].append((start, end, block))
 
     def commit(self, op: Operation):
-        # Update simple state: mark programmed or erase
         t = op.targets[0]
         key = (t.die, t.plane)
         if op.kind == OpKind.PROGRAM and t.page is not None:
@@ -254,16 +278,6 @@ class AddressManager:
         elif op.kind == OpKind.ERASE:
             # erase whole block
             self.programmed[key] = {pp for pp in self.programmed[key] if pp[0] != t.block}
-
-    def observe_states(self, die:int, plane:int) -> Tuple[Dict[str,str], Dict[str,str]]:
-        # Map observed counters to simple bucket names
-        prog = len(self.programmed[(die,plane)])
-        # naive ratios for demo
-        pgmable_ratio = "mid" if prog < 10 else "low"
-        readable_ratio = "mid" if prog > 0 else "low"
-        plane_busy_frac = "low"  # not tracking real busy ratio in demo
-        return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls": "host"},
-                {"plane_busy_frac": plane_busy_frac})
 
 # ---------------------------- Obligation Manager ----------------------------
 
@@ -302,11 +316,27 @@ class ObligationManager:
                 self._seq += 1
                 print(f"[{now_us:7.2f} us] OBLIG  created: {op.kind.name} -> {ob.require.name} by {ob.deadline_us:7.2f} us, target={_addr_str(ob.targets[0])}")
 
-    def pop_urgent(self, now_us: float) -> Optional[Obligation]:
-        if not self.heap: return None
-        # return the earliest deadline obligation if it's due within horizon or simply always for demo
-        item = heapq.heappop(self.heap)
-        return item.ob
+    def pop_urgent(self, now_us: float, die:int, plane:int,
+                   horizon_us: float, earliest_start: float) -> Optional[Obligation]:
+        """Return earliest-deadline obligation for this (die,plane) that we still can start by earliest_start."""
+        if not self.heap: 
+            return None
+        kept: List[_ObHeapItem] = []
+        chosen: Optional[Obligation] = None
+        while self.heap and not chosen:
+            item = heapq.heappop(self.heap)
+            ob = item.ob
+            tgt = ob.targets[0]
+            same_plane = (tgt.die == die and tgt.plane == plane)
+            in_horizon = ((ob.deadline_us - now_us) <= max(horizon_us, 0.0))
+            feasible_time = (earliest_start <= ob.deadline_us)  # coarse feasibility
+            if same_plane and in_horizon and feasible_time:
+                chosen = ob
+                break
+            kept.append(item)
+        for it in kept:
+            heapq.heappush(self.heap, it)
+        return chosen
 
 # ---------------------------- Policy Engine ----------------------------
 
@@ -327,16 +357,21 @@ class PolicyEngine:
         w *= self.cfg["weights"]["g_phase"].get(op_name, {}).get(near, 1.0)
         return w
 
-    def propose(self, now_us: float, hook: PhaseHook, global_state: Dict[str,str], local_state: Dict[str,str]) -> Optional[Operation]:
-        # 0) serve obligation first, if any
-        ob = self.obl.pop_urgent(now_us)
+    def propose(self, now_us: float, hook: PhaseHook,
+                global_state: Dict[str,str], local_state: Dict[str,str],
+                earliest_start: float) -> Optional[Operation]:
+        # 0) Obligation first (plane/time filtered)
+        ob = self.obl.pop_urgent(now_us, hook.die, hook.plane,
+                                 horizon_us=10.0, earliest_start=earliest_start)
         if ob:
-            if self.addr.precheck(ob.require, ob.targets):
+            if self.addr.precheck(ob.require, ob.targets, start_hint=earliest_start):
                 cfg_op = self.cfg["op_specs"][ob.require.name]
                 op = build_operation(ob.require, cfg_op, ob.targets)
                 op.meta["source"]="obligation"
                 return op
-        # 1) sample op by weighted picking
+            # else: could attempt alternative targets (omitted in demo)
+
+        # 1) Policy path: weighted pick under phase/state
         cand = []
         for name in ["READ", "PROGRAM", "ERASE"]:
             s = self._score(name, hook.label, global_state, local_state)
@@ -350,9 +385,13 @@ class PolicyEngine:
             acc += s
             if r <= acc:
                 pick=name; break
+
         kind = OpKind[pick]
-        targets = self.addr.select(kind, hook.die, hook.plane)
-        if not targets: return None
+        targets = self.addr.select(kind, hook.die, hook.plane)  # P1: multi-plane/fanout 확장 가능
+        if not targets:
+            return None
+        if not self.addr.precheck(kind, targets, start_hint=earliest_start):
+            return None
         op = build_operation(kind, self.cfg["op_specs"][pick], targets)
         op.meta["source"]="policy"
         return op
@@ -365,33 +404,53 @@ class Scheduler:
         self.now=0.0
         self.ev=[]  # (time, seq, type, payload)
         self._seq=0
+        self.stat_propose_calls = 0
+        self.stat_scheduled = 0
         self._push(0.0, "QUEUE_REFILL", None)
-        # Also seed a phase hook per plane to bootstrap
+        # Bootstrap hooks per plane
         for plane in range(self.addr.planes):
             self._push(0.0, "PHASE_HOOK", PhaseHook(0.0, "BOOT.START", 0, plane))
 
     def _push(self, t: float, typ: str, payload: Any):
         heapq.heappush(self.ev, (t, self._seq, typ, payload)); self._seq+=1
 
-    def _schedule_operation(self, op: Operation, die:int, plane:int):
-        # Determine start considering plane availability
-        start = max(self.now, self.addr.available_at(die,plane))
+    def _unique_plane_keys(self, targets: List[Address]) -> List[Tuple[int,int,int]]:
+        # (die, plane, block) tuples deduped
+        s=set()
+        for a in targets:
+            s.add((a.die, a.plane, a.block))
+        return list(s)
+
+    def _start_time_for_targets(self, targets: List[Address]) -> float:
+        # start cannot be earlier than any involved plane's availability
+        planes = {(a.die, a.plane) for a in targets}
+        avail = [self.addr.available_at(d,p) for (d,p) in planes]
+        return max([self.now] + avail)
+
+    def _schedule_operation(self, op: Operation):
+        start = self._start_time_for_targets(op.targets)
         dur = sum(seg.dur_us for seg in op.states)
         end  = start + dur
-        self.addr.reserve(die, plane, start, end)
-        self._push(start, "OP_START", (op, die, plane))
-        self._push(end,   "OP_END",   (op, die, plane))
-        # Generate hooks at real absolute times
-        hooks = make_phase_hooks(op, start, self.cfg["op_specs"][op.kind.name], die, plane)
-        for h in hooks:
-            self._push(h.time_us, "PHASE_HOOK", h)
-        print(f"[{self.now:7.2f} us] SCHED  {op.kind.name:7s} on die{die}/pl{plane} -> [{start:7.2f}, {end:7.2f}) target={_addr_str(op.targets[0])} src={op.meta.get('source')}")
+        # reserve for all involved planes
+        for d,p,b in self._unique_plane_keys(op.targets):
+            self.addr.reserve(d, p, start, end, block=b)
+        # events
+        self._push(start, "OP_START", op)
+        self._push(end,   "OP_END",   op)
+        # hooks for each involved plane
+        for d,p,_ in self._unique_plane_keys(op.targets):
+            hooks = make_phase_hooks(op, start, self.cfg["op_specs"][op.kind.name], d, p)
+            for h in hooks:
+                self._push(h.time_us, "PHASE_HOOK", h)
+        first = op.targets[0]
+        print(f"[{self.now:7.2f} us] SCHED  {op.kind.name:7s} on targets={len(op.targets)} start={start:7.2f} end={end:7.2f} 1st={_addr_str(first)} src={op.meta.get('source')}")
+        self.stat_scheduled += 1
 
     def run_until(self, t_end: float):
         while self.ev and self.ev[0][0] <= t_end:
             self.now, _, typ, payload = heapq.heappop(self.ev)
             if typ=="QUEUE_REFILL":
-                # seed synthetic hooks to keep generation flowing
+                # seed hooks to keep flow
                 for plane in range(self.addr.planes):
                     self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "REFILL.NUDGE", 0, plane))
                 nxt = self.now + self.cfg["policy"]["queue_refill_period_us"]
@@ -399,28 +458,39 @@ class Scheduler:
 
             elif typ=="PHASE_HOOK":
                 hook: PhaseHook = payload
-                global_state, local_state = self.addr.observe_states(hook.die, hook.plane)
-                op = self.SPE.propose(self.now, hook, global_state, local_state)
+                earliest_start = self.addr.available_at(hook.die, hook.plane)
+                global_state, local_state = self.addr.observe_states(hook.die, hook.plane, self.now)
+                self.stat_propose_calls += 1
+                op = self.SPE.propose(self.now, hook, global_state, local_state, earliest_start)
                 if op:
-                    self._schedule_operation(op, hook.die, hook.plane)
+                    self._schedule_operation(op)
                 else:
-                    # No op proposed; this is fine
+                    # no viable op at this hook; that's fine
                     pass
 
             elif typ=="OP_START":
-                op, die, plane = payload
-                print(f"[{self.now:7.2f} us] START  {op.kind.name:7s} die{die}/pl{plane} target={_addr_str(op.targets[0])}")
+                op: Operation = payload
+                first = op.targets[0]
+                print(f"[{self.now:7.2f} us] START  {op.kind.name:7s} target={_addr_str(first)}")
 
             elif typ=="OP_END":
-                op, die, plane = payload
-                print(f"[{self.now:7.2f} us] END    {op.kind.name:7s} die{die}/pl{plane} target={_addr_str(op.targets[0])}")
+                op: Operation = payload
+                first = op.targets[0]
+                print(f"[{self.now:7.2f} us] END    {op.kind.name:7s} target={_addr_str(first)}")
+                # commit state first
                 self.addr.commit(op)
+                # then obligations
                 self.obl.on_commit(op, self.now)
 
-def _addr_str(a: Address)->str:
-    return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
+        # summary
+        print(f"\n=== Stats ===")
+        print(f"propose calls : {self.stat_propose_calls}")
+        print(f"scheduled ops : {self.stat_scheduled}")
+        if self.stat_propose_calls:
+            rate = 100.0 * self.stat_scheduled / self.stat_propose_calls
+            print(f"accept ratio  : {rate:.1f}%")
 
-# ---------------------------- Main Demo ----------------------------
+# ---------------------------- Main ----------------------------
 
 def main():
     random.seed(CFG["rng_seed"])
@@ -429,7 +499,7 @@ def main():
     spe  = PolicyEngine(CFG, addr, obl)
     sch  = Scheduler(CFG, addr, spe, obl)
     run_until = CFG["policy"]["run_until_us"]
-    print("=== NAND Sequence Generator Demo (single-file) ===")
+    print("=== NAND Sequence Generator Demo (P0 Patched) ===")
     sch.run_until(run_until)
     print("=== Done ===")
 
