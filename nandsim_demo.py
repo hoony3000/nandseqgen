@@ -1,8 +1,7 @@
-# nandsim_demo_p0.py — P0 통합본 (stdlib-only)
+# nandsim_demo_p0_phase.py — P0 통합본 + Phase-Conditional 분포
 # - Event-jump Scheduler
 # - Phase Hook 생성(스케줄러)
-# - PolicyEngine with earliest_start + precheck
-# - Obligation (READ -> DOUT) with plane/time filtering
+# - PolicyEngine: obligation 우선 → "OP.STATE(.POS)" 분포 → 가중(score) 백오프
 # - AddressManager: state snapshot(now), precheck/reserve with multi-plane
 # - 간단 통계: propose calls / scheduled ops
 
@@ -21,7 +20,7 @@ CFG = {
         "lookahead_k": 4,
         "run_until_us": 150.0,
     },
-    "weights": {
+    "weights": {  # (phase-conditional 없을 때 백오프용)
         "base": {  # class=host only for demo
             "host": {
                 "READ": 0.85,
@@ -46,6 +45,16 @@ CFG = {
         },
     },
     "mixture": {"classes": {"host": 1.0}},  # host-only for demo
+    # phase-conditional: 훅 컨텍스트(OP.STATE 또는 OP.STATE.POS) → 다음 op 분포
+    "phase_conditional": {
+        "READ.ISSUE":              {"READ": 0.00, "PROGRAM": 0.80, "ERASE": 0.20},
+        "READ.CORE_BUSY.START":    {"READ": 0.05, "PROGRAM": 0.85, "ERASE": 0.10},
+        "READ.CORE_BUSY.MID":      {"READ": 0.10, "PROGRAM": 0.70, "ERASE": 0.20},
+        "READ.DATA_OUT.START":     {"READ": 0.60, "PROGRAM": 0.25, "ERASE": 0.15},
+        "PROGRAM.ISSUE":           {"READ": 0.50, "PROGRAM": 0.25, "ERASE": 0.25},
+        "PROGRAM.CORE_BUSY.END":   {"READ": 0.60, "PROGRAM": 0.10, "ERASE": 0.30},
+        "DEFAULT":                 {"READ": 0.60, "PROGRAM": 0.30, "ERASE": 0.10},
+    },
     "op_specs": {
         "READ": {
             "states": [
@@ -140,7 +149,7 @@ class BusySlot:
 def _addr_str(a: Address)->str:
     return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
 
-# ---------------------------- Utility: Distributions ----------------------------
+# ---------------------------- Utility: Distributions & Phase Keys ----------------------------
 
 def sample_dist(d: Dict[str, Any]) -> float:
     k = d["kind"]
@@ -159,6 +168,28 @@ def sample_dist(d: Dict[str, Any]) -> float:
 def rand_jitter(ampl_us: float) -> float:
     if ampl_us<=0: return 0.0
     return random.uniform(-ampl_us, ampl_us)
+
+def parse_hook_key(label: str):
+    # e.g., "READ.CORE_BUSY.START" -> ("READ","CORE_BUSY","START")
+    parts = label.split(".")
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        return parts[0], parts[1], None
+    return None, None, None  # BOOT/REFILL 등
+
+def get_phase_dist(cfg: Dict[str,Any], hook_label: str):
+    op, state, pos = parse_hook_key(hook_label)
+    pc = cfg.get("phase_conditional", {})
+    candidates = []
+    if op and state and pos: candidates.append(f"{op}.{state}.{pos}")
+    if op and state:         candidates.append(f"{op}.{state}")
+    candidates.append("DEFAULT")
+    for key in candidates:
+        dist = pc.get(key)
+        if dist and sum(dist.values()) > 0:
+            return dist, key
+    return None, None
 
 # ---------------------------- OpSpec: build ops & hooks ----------------------------
 
@@ -220,7 +251,7 @@ class AddressManager:
         # naive buckets for demo
         pgmable_ratio  = "mid" if prog < 10 else "low"
         readable_ratio = "mid" if prog > 0 else "low"
-        plane_busy_frac = "low"  # (could be derived from resv overlap with [now,now+Δ])
+        plane_busy_frac = "high" if self.available_at(die,plane) > now_us else "low"
         return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls": "host"},
                 {"plane_busy_frac": plane_busy_frac})
 
@@ -260,8 +291,7 @@ class AddressManager:
             for (s,e,_) in self.resv[key]:
                 if not (end_hint <= s or e <= start_hint):
                     return False
-        # 2) simple block rule (placeholder for real dep rules)
-        #    forbid ERASE on a block if it's been programmed recently (not tracked here) — skip for demo
+        # 2) simple block rule (placeholder)
         return True
 
     # ---- reserve / commit ----
@@ -328,7 +358,7 @@ class ObligationManager:
             ob = item.ob
             tgt = ob.targets[0]
             same_plane = (tgt.die == die and tgt.plane == plane)
-            in_horizon = ((ob.deadline_us - now_us) <= max(horizon_us, 0.0))
+            in_horizon = ((ob.deadline_us - now_us) <= max(horizon_us, 0.0)) or ob.hard_slot
             feasible_time = (earliest_start <= ob.deadline_us)  # coarse feasibility
             if same_plane and in_horizon and feasible_time:
                 chosen = ob
@@ -357,6 +387,20 @@ class PolicyEngine:
         w *= self.cfg["weights"]["g_phase"].get(op_name, {}).get(near, 1.0)
         return w
 
+    def _roulette(self, dist: Dict[str, float], allow: set) -> Optional[str]:
+        items = [(name, p) for name, p in dist.items() if name in allow and p > 0.0]
+        if not items: 
+            return None
+        total = sum(p for _, p in items)
+        r = random.random() * total
+        acc = 0.0
+        pick = items[-1][0]
+        for name, p in items:
+            acc += p
+            if r <= acc:
+                pick = name; break
+        return pick
+
     def propose(self, now_us: float, hook: PhaseHook,
                 global_state: Dict[str,str], local_state: Dict[str,str],
                 earliest_start: float) -> Optional[Operation]:
@@ -368,10 +412,26 @@ class PolicyEngine:
                 cfg_op = self.cfg["op_specs"][ob.require.name]
                 op = build_operation(ob.require, cfg_op, ob.targets)
                 op.meta["source"]="obligation"
+                op.meta["phase_key_used"]="(obligation)"
                 return op
             # else: could attempt alternative targets (omitted in demo)
 
-        # 1) Policy path: weighted pick under phase/state
+        # 1) Phase-conditional distribution (OP.STATE.POS → OP.STATE → DEFAULT)
+        allow = set(self.cfg["op_specs"].keys()) - {"DOUT"}  # DOUT는 의무 기본
+        dist, used_key = get_phase_dist(self.cfg, hook.label)
+        if dist:
+            pick = self._roulette(dist, allow)
+            if pick:
+                kind = OpKind[pick]
+                targets = self.addr.select(kind, hook.die, hook.plane)
+                if targets and self.addr.precheck(kind, targets, start_hint=earliest_start):
+                    op = build_operation(kind, self.cfg["op_specs"][pick], targets)
+                    op.meta["source"]="policy.phase_conditional"
+                    op.meta["phase_key_used"]=used_key
+                    return op
+            # dist가 있어도 타깃/사전검사 실패 시 score 백오프 시도
+
+        # 2) Backoff: 기존 곱셈 가중(score) 방식
         cand = []
         for name in ["READ", "PROGRAM", "ERASE"]:
             s = self._score(name, hook.label, global_state, local_state)
@@ -387,13 +447,14 @@ class PolicyEngine:
                 pick=name; break
 
         kind = OpKind[pick]
-        targets = self.addr.select(kind, hook.die, hook.plane)  # P1: multi-plane/fanout 확장 가능
+        targets = self.addr.select(kind, hook.die, hook.plane)
         if not targets:
             return None
         if not self.addr.precheck(kind, targets, start_hint=earliest_start):
             return None
         op = build_operation(kind, self.cfg["op_specs"][pick], targets)
-        op.meta["source"]="policy"
+        op.meta["source"]="policy.score_backoff"
+        op.meta["phase_key_used"]="(score_backoff)"
         return op
 
 # ---------------------------- Scheduler ----------------------------
@@ -443,7 +504,7 @@ class Scheduler:
             for h in hooks:
                 self._push(h.time_us, "PHASE_HOOK", h)
         first = op.targets[0]
-        print(f"[{self.now:7.2f} us] SCHED  {op.kind.name:7s} on targets={len(op.targets)} start={start:7.2f} end={end:7.2f} 1st={_addr_str(first)} src={op.meta.get('source')}")
+        print(f"[{self.now:7.2f} us] SCHED  {op.kind.name:7s} on targets={len(op.targets)} start={start:7.2f} end={end:7.2f} 1st={_addr_str(first)} src={op.meta.get('source')} key={op.meta.get('phase_key_used')}")
         self.stat_scheduled += 1
 
     def run_until(self, t_end: float):
@@ -499,7 +560,7 @@ def main():
     spe  = PolicyEngine(CFG, addr, obl)
     sch  = Scheduler(CFG, addr, spe, obl)
     run_until = CFG["policy"]["run_until_us"]
-    print("=== NAND Sequence Generator Demo (P0 Patched) ===")
+    print("=== NAND Sequence Generator Demo (P0 + Phase-Conditional) ===")
     sch.run_until(run_until)
     print("=== Done ===")
 
