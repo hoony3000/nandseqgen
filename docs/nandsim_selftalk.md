@@ -94,14 +94,14 @@
   - 'QUEUE_REFILL' : None
   - 'OP_START' : op, die, plane
   - 'OP_END' : op, die, plane
-- obligation 은 obl.on_commit(op, self.now) 으로만 만들 수 있고, obl.pop_urgent 로만 반환 받을 수 있다. _ObHeapItem class 의 attribute
+- obligation 은 obl.on_commit(op, self.now) 으로만 만들 수 있고, obl.pop_urgent 로만 반환 받을 수 있다. _ObHeapItem class 의 attribute 에 저장됨. 후에 propose 내의 build_operation 에 의해서 Operation class 로 반환됨
 
 # obligation 에서 _schedule_operation 까지의 workflow 정리
 - sch.run_until : 'OP_END'
-- obl.on_commit(op, self.now)
+- obl.on_commit(op, sch.now)
   - Q : 왜 self.now 가 필요한가?
   - A : ...
-- self.heap 에 _ObHeapItem 의 형태로 push 됨 : heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=self._seq, ob=ob))
+- self.heap 에 _ObHeapItem 의 형태로 push 됨 : heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=self._seq, ob=ob))
 - sch.run_until : 'PHASE_HOOK'
 - SPE.propose(self.now, hook, global_state, local_state)
 - ob = self.obl.pop_urgent(now_us)
@@ -140,7 +140,10 @@
   times: List[float]<br>
   states: List[str]<br>
   id: int<br>
-- 여러 operation 을 순차적으로 예약하는 경우에, 어느 지점에서 구현할 것인지 가능한 옵션들 정리. Host 요청으로 처리할 경우 Obligation.
+- 두 개 이상의 operation 을 순차적으로 예약하는 경우 처리 로직 어느 단계에서 구현할 지 검토. addr.precheck 만으로 충분한지 관점
+  - sequential read/program 등. 이 때 동일 block 상에 read/program 은 금지해야 한다.
+  - obligation 이 순차적으로 예약된 경우 
 - plane interleave read 를 만들기 위해서, 스케쥴러가 개입을 하는 것이 필요한지 검토
 - precheck 함수 구현
 - priority 핸들링
+- payload 는 
