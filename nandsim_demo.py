@@ -11,7 +11,9 @@ import heapq, random
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
-from viz_tools import TimelineLogger, plot_gantt, plot_block_page_sequence_3d
+from viz_tools import TimelineLogger, plot_gantt, plot_gantt_by_die
+from viz_tools import plot_block_page_sequence_3d, plot_block_page_sequence_3d_by_die
+from viz_tools import validate_timeline, print_validation_report, violations_to_dataframe
 
 # --------------------------------------------------------------------------
 # Simulation resolution
@@ -944,28 +946,34 @@ class Scheduler:
 # --------------------------------------------------------------------------
 # Main
 def main():
-    random.seed(CFG["rng_seed"])
+# 1) 구성
     logger = TimelineLogger()
-    addr=AddressManager(CFG); excl=ExclusionManager(CFG)
-    obl=ObligationManager(CFG["obligations"])
-    spe=PolicyEngine(CFG, addr, obl, excl)
+    addr = AddressManager(CFG); excl = ExclusionManager(CFG)
+    obl  = ObligationManager(CFG["obligations"])
+    spe  = PolicyEngine(CFG, addr, obl, excl)
     sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger)
-    print("=== NAND Sequence Generator (P5: stats + admission + block/plane redefined) ===")
+
+    # 2) 실행
     sch.run_until(CFG["policy"]["run_until_us"])
-    print("=== Done ===")
-    # 2) DataFrame 취득
+
+    # 3) DataFrame
     df = logger.to_dataframe()
-    # 또는 df = sch.get_timeline_df()
-
-    # 3) Gantt (die 0, 기본 kinds = ERASE/PROGRAM/READ/DOUT/SR)
-    plot_gantt(df, die=0)
-
-    # 4) 3D block-page-order
-    #   - ERASE/PROGRAM/READ 중심으로 확인
-    plot_block_page_sequence_3d(df, die=0, kinds=("ERASE","PROGRAM","READ"), z_mode="per_block")
-
-    # 5) 필요 시 CSV로 저장
     df.to_csv("nand_timeline.csv", index=False)
 
+    # 4) 시각화
+    plot_gantt(df, die=0, title="Die 0 Gantt")
+    plot_gantt_by_die(df)  # 모든 die별로 개별 그림
+
+    plot_block_page_sequence_3d(df, die=0, kinds=("ERASE","PROGRAM","READ"),
+                                z_mode="per_block", draw_lines=True,
+                                title="Die 0 Block-Page-Order (per-block order)")
+    plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
+                                    z_mode="global_die", draw_lines=True)
+
+    # 5) 규칙 자동검증
+    report = validate_timeline(df, CFG)
+    print_validation_report(report, max_rows=30)
+    viol_df = violations_to_dataframe(report)
+    viol_df.to_csv("nand_violations.csv", index=False)
 if __name__=="__main__":
     main()
