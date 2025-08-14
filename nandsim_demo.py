@@ -11,6 +11,7 @@ import heapq, random
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
+from viz_tools import TimelineLogger, plot_gantt, plot_block_page_sequence_3d
 
 # --------------------------------------------------------------------------
 # Simulation resolution
@@ -287,6 +288,9 @@ def build_operation(kind: OpKind, cfg_op: Dict[str, Any], targets: List[Address]
 def get_op_duration(op: Operation) -> float:
     return sum(seg.dur_us for seg in op.states)
 
+def get_timeline_df(self):
+    return self.logger.to_dataframe()
+
 # --------------------------------------------------------------------------
 # Address & Bus Managers (with block/plane redefinition + state rails)
 class AddressManager:
@@ -473,8 +477,8 @@ class AddressManager:
                                 if self.addr_state_future[(die,bb)] >= 0:
                                     found=bb; break
                             if found is not None: b=found
-                        targets.append(Address(die,pl,b,None))
-                    return targets, plane_set, Scope.DIE_WIDE
+                    targets.append(Address(die, pl, b, 0))  # ERASE도 page=0
+                    return [Address(die, plane_set[0], plane_set[0], 0)], plane_set[:1], Scope.NONE  # SR도 page=0
 
                 elif kind==OpKind.SR:
                     return [Address(die, plane_set[0], plane_set[0], None)], plane_set[:1], Scope.NONE
@@ -837,10 +841,11 @@ def get_phase_selection_override(cfg: Dict[str,Any], hook_label: str, kind_name:
 def _addr_str(a: Address)->str: return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
 
 class Scheduler:
-    def __init__(self, cfg, addr: AddressManager, spe: PolicyEngine, obl: ObligationManager, excl: ExclusionManager):
+    def __init__(self, cfg, addr, spe, obl, excl, logger: Optional[TimelineLogger]=None):
         self.cfg=cfg; self.addr=addr; self.SPE=spe; self.obl=obl; self.excl=excl
         self.now=0.0; self.ev=[]; self._seq=0
         self.stat_propose_calls=0; self.stat_scheduled=0
+        self.logger = logger or TimelineLogger()
         self._push(0.0, "QUEUE_REFILL", None)
         for plane in range(self.addr.planes):
             self._push(0.0, "PHASE_HOOK", PhaseHook(0.0, "BOOT.START", 0, plane))
@@ -866,6 +871,8 @@ class Scheduler:
         self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
         self.excl.register(op, start)
         self.addr.register_future(op, start, end)
+        if self.logger is not None:
+            self.logger.log_op(op, start, end, label_for_read=self._label_for_read(op))
 
         # obligation assignment stats
         if "obligation" in op.meta:
@@ -938,13 +945,27 @@ class Scheduler:
 # Main
 def main():
     random.seed(CFG["rng_seed"])
+    logger = TimelineLogger()
     addr=AddressManager(CFG); excl=ExclusionManager(CFG)
     obl=ObligationManager(CFG["obligations"])
     spe=PolicyEngine(CFG, addr, obl, excl)
-    sch=Scheduler(CFG, addr, spe, obl, excl)
+    sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger)
     print("=== NAND Sequence Generator (P5: stats + admission + block/plane redefined) ===")
     sch.run_until(CFG["policy"]["run_until_us"])
     print("=== Done ===")
+    # 2) DataFrame 취득
+    df = logger.to_dataframe()
+    # 또는 df = sch.get_timeline_df()
+
+    # 3) Gantt (die 0, 기본 kinds = ERASE/PROGRAM/READ/DOUT/SR)
+    plot_gantt(df, die=0)
+
+    # 4) 3D block-page-order
+    #   - ERASE/PROGRAM/READ 중심으로 확인
+    plot_block_page_sequence_3d(df, die=0, kinds=("ERASE","PROGRAM","READ"), z_mode="per_block")
+
+    # 5) 필요 시 CSV로 저장
+    df.to_csv("nand_timeline.csv", index=False)
 
 if __name__=="__main__":
     main()
