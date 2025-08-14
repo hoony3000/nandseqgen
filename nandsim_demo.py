@@ -1,10 +1,10 @@
-# nandsim_p3_constraints.py
-# - SR op added (any phase)
-# - Phase-conditional distributions updated for CORE_BUSY rules
-# - DOUT: global freeze (no ops allowed) via runtime exclusions
-# - ExclusionManager: config-driven runtime blocking windows
-# - Alias-based READ labels in hooks: SIN_READ / MUL_READ
-# - Multi-plane planner + DIE_WIDE CORE_BUSY + Bus gating + Quantize
+# nandsim_p4_addrstate.py
+# - AddressManager v2: per-(die,plane,block) state with committed/future rails
+# - PROGRAM duplicates prevented via future reservation (register_future)
+# - READ visibility: only committed pages are readable
+# - Multi-plane planner updated to use future/committed rails
+# - Keeps P3 features: SR, phase constraints, DOUT global freeze, alias-based MUL/SIN, DIE_WIDE CORE_BUSY, Bus gating
+# Stdlib only.
 
 from __future__ import annotations
 import heapq, random
@@ -25,25 +25,21 @@ CFG = {
         "planner_max_tries": 8,
     },
     # phase-conditional: 훅(OP.STATE(.POS)) → 다음 op 분포
-    #  - CORE_BUSY 제약 반영
     "phase_conditional": {
-        # 기본 분포(일부 예시)
         "READ.ISSUE":                {"MUL_PROGRAM": 0.15, "SIN_PROGRAM": 0.10, "SIN_READ": 0.35, "MUL_READ": 0.25, "SIN_ERASE": 0.15, "SR": 0.00},
         "READ.CORE_BUSY.START":      {"MUL_READ": 0.50, "SIN_READ": 0.20, "SIN_PROGRAM": 0.10, "SIN_ERASE": 0.10, "SR": 0.10},
         "READ.DATA_OUT.START":       {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.15, "SIN_ERASE": 0.10, "SR": 0.05},
+
         "PROGRAM.ISSUE":             {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.15, "SIN_ERASE": 0.10, "SR": 0.05},
+        "PROGRAM.CORE_BUSY":         {"SR": 1.0},   # CORE_BUSY 동안 SR만 허용
         "PROGRAM.CORE_BUSY.END":     {"SIN_READ": 0.55, "MUL_READ": 0.25, "SIN_PROGRAM": 0.10, "SIN_ERASE": 0.05, "SR": 0.05},
+
         "ERASE.ISSUE":               {"SIN_PROGRAM": 0.40, "MUL_PROGRAM": 0.20, "SIN_READ": 0.25, "MUL_READ": 0.10, "SR": 0.05},
+        "ERASE.CORE_BUSY":           {"SR": 1.0},   # CORE_BUSY 동안 SR만 허용
         "ERASE.CORE_BUSY.END":       {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.10, "MUL_PROGRAM": 0.05, "SR": 0.15},
 
-        # === 규칙 반영: CORE_BUSY 중 허용/금지 ===
-        # PROGRAM/ERASE 의 CORE_BUSY 중에는 READ/PROGRAM/ERASE 모두 금지 → SR만 허용
-        "PROGRAM.CORE_BUSY":         {"SR": 1.0},
-        "ERASE.CORE_BUSY":           {"SR": 1.0},
-        # MUL_READ 의 CORE_BUSY 중에는 READ/PROGRAM/ERASE 모두 금지 → SR만 허용
-        "MUL_READ.CORE_BUSY":        {"SR": 1.0},
-        # SIN_READ 의 CORE_BUSY 중에는 SIN_READ/SR만 허용, MUL_READ/PROGRAM/ERASE 금지
-        "SIN_READ.CORE_BUSY":        {"SIN_READ": 0.6, "SR": 0.4},
+        "MUL_READ.CORE_BUSY":        {"SR": 1.0},   # 멀티리드 CORE_BUSY 동안 SR만 허용
+        "SIN_READ.CORE_BUSY":        {"SIN_READ": 0.6, "SR": 0.4},  # 단일리드 CORE_BUSY 동안 MUL/PGM/ERASE 금지
 
         "DEFAULT":                   {"SIN_READ": 0.55, "SIN_PROGRAM": 0.25, "SIN_ERASE": 0.10, "SR": 0.10},
     },
@@ -120,21 +116,15 @@ CFG = {
     # 런타임 배타 규칙(스케줄 시 윈도우 등록 → 제안 시 허용 검사)
     "constraints": {
         "exclusions": [
-            # PROGRAM CORE_BUSY 동안: READ/PROGRAM/ERASE 금지 (die 스코프)
             {"when": {"op": "PROGRAM", "states": ["CORE_BUSY"]}, "scope": "DIE",
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
-            # ERASE CORE_BUSY 동안: READ/PROGRAM/ERASE 금지 (die 스코프)
             {"when": {"op": "ERASE", "states": ["CORE_BUSY"]}, "scope": "DIE",
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
-            # MUL_READ CORE_BUSY 동안: READ/PROGRAM/ERASE 금지 (die 스코프)
             {"when": {"op": "READ", "alias": "MUL", "states": ["CORE_BUSY"]}, "scope": "DIE",
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
-            # SIN_READ CORE_BUSY 동안: MUL_READ/PROGRAM/ERASE 금지(READ 단일은 허용)
             {"when": {"op": "READ", "alias": "SIN", "states": ["CORE_BUSY"]}, "scope": "DIE",
-             "blocks": ["ALIAS:MUL_READ", "BASE:PROGRAM", "BASE:ERASE"]},
-            # DOUT 전체 구간 동안: 전역 ALL 금지
-            {"when": {"op": "DOUT", "states": ["*"]}, "scope": "GLOBAL",
-             "blocks": ["ANY"]},
+             "blocks": ["ALIAS:SIN_READ", "ALIAS:MUL_READ", "BASE:PROGRAM", "BASE:ERASE"]}, # SIN은 READ 허용(한정); runtime check에서 토큰매칭 처리
+            {"when": {"op": "DOUT", "states": ["*"]}, "scope": "GLOBAL", "blocks": ["ANY"]},
         ]
     },
 
@@ -148,7 +138,11 @@ CFG = {
     ],
 
     "topology": {"dies": 1, "planes_per_die": 4, "blocks_per_plane": 8, "pages_per_block": 16},
+
     "export": {"tu_us": 0.01, "nop_symbol": "NOP", "wait_as_nop": True, "drift_correction": True},
+
+    # AddressManager 초기 block 상태 (-1 = ERASED; -2 = initial)
+    "address_init_state": -1
 }
 
 # ---------------------------- Alias mapping ----------------------------
@@ -245,16 +239,36 @@ def get_op_duration(op: Operation) -> float:
 
 # ---------------------------- Address & Bus Managers ----------------------------
 class AddressManager:
+    """
+    v2 상태 모델:
+    - addr_state_committed[(d,p,b)] : int  # 마지막 커밋된 program page (-1=ERASED, -2=initial)
+    - addr_state_future[(d,p,b)]    : int  # 예약 반영된 미래 상태 (commit 이전에 갱신)
+    - programmed_committed[(d,p)] : Set[(block,page)]  # READ 가시성 소스
+    - write_head[(d,p)] : int  # program에 사용할 기본 block 후보
+    """
     def __init__(self, cfg: Dict[str, Any]):
         topo=cfg["topology"]; self.cfg=cfg
         self.dies=topo["dies"]; self.planes=topo["planes_per_die"]
         self.pages_per_block=topo["pages_per_block"]; self.blocks_per_plane=topo["blocks_per_plane"]
-        self.available={(0,p):0.0 for p in range(self.planes)}
-        self.cursors={(0,p):[0,0,0] for p in range(self.planes)}  # block, next_pgm, next_rd
-        self.programmed={(0,p):set() for p in range(self.planes)}  # (block,page)
-        self.resv={(0,p):[] for p in range(self.planes)}           # (start,end,block)
+        self.available={(0,p):0.0 for p in range(self.planes)}          # per-plane time availability
+        self.resv={(0,p):[] for p in range(self.planes)}                # (start,end,block)
         self.bus_resv: List[Tuple[float,float]] = []
 
+        init_state = int(cfg.get("address_init_state", -1))             # default ERASED
+        # state rails
+        self.addr_state_committed: Dict[Tuple[int,int,int], int] = {}
+        self.addr_state_future:    Dict[Tuple[int,int,int], int] = {}
+        self.programmed_committed: Dict[Tuple[int,int], Set[Tuple[int,int]]] = {(0,p): set() for p in range(self.planes)}
+        self.write_head: Dict[Tuple[int,int], int] = {}
+
+        for p in range(self.planes):
+            self.write_head[(0,p)] = 0
+            for b in range(self.blocks_per_plane):
+                key=(0,p,b)
+                self.addr_state_committed[key] = init_state
+                self.addr_state_future[key]    = init_state
+
+    # ---------- observation ----------
     def available_at(self, die:int, plane:int)->float: return self.available[(die,plane)]
 
     def earliest_start_for_scope(self, die:int, scope: Scope, plane_set: Optional[List[int]]=None)->float:
@@ -264,14 +278,24 @@ class AddressManager:
         return max(self.available[(die,p)] for p in planes)
 
     def observe_states(self, die:int, plane:int, now_us: float):
-        prog=len(self.programmed[(die,plane)])
-        pgmable_ratio="mid" if prog<10 else "low"
-        readable_ratio="mid" if prog>0 else "low"
+        # plane-level ratios for policy: pgmable/readable
+        pgmable_blocks=0; readable_blocks=0
+        for b in range(self.blocks_per_plane):
+            fut=self.addr_state_future[(die,plane,b)]
+            com=self.addr_state_committed[(die,plane,b)]
+            if fut < self.pages_per_block-1: pgmable_blocks += 1
+            if com >= 0: readable_blocks += 1
+        total=self.blocks_per_plane or 1
+        def bucket(x): 
+            r=x/total
+            return "low" if r<0.34 else ("mid" if r<0.67 else "high")
+        pgmable_ratio=bucket(pgmable_blocks)
+        readable_ratio=bucket(readable_blocks)
         plane_busy_frac="high" if self.available_at(die,plane)>now_us else "low"
         return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls":"host"},
                 {"plane_busy_frac": plane_busy_frac})
 
-    # bus segments (relative offsets)
+    # ---------- bus segments (relative offsets) ----------
     def bus_segments_for_op(self, op: Operation)->List[Tuple[float,float]]:
         segs=[]; t=0.0
         for s in op.states:
@@ -290,82 +314,163 @@ class AddressManager:
         for (off0,off1) in segs:
             self.bus_resv.append((quantize(start_time+off0), quantize(start_time+off1)))
 
-    # planner (non-greedy)
+    # ---------- helpers for PROGRAM planning ----------
+    def _next_page_in_block_future(self, die:int, plane:int, block:int)->int:
+        """returns next page to program in this block (>=0), or pages_per_block if full"""
+        last = self.addr_state_future[(die,plane,block)]
+        return (last + 1) if last < self.pages_per_block-1 else self.pages_per_block
+
+    def _find_block_for_page_future(self, die:int, plane:int, target_page:int)->Optional[int]:
+        """find a block whose next page equals target_page (i.e., future == target_page-1)"""
+        for b in range(self.blocks_per_plane):
+            if self._next_page_in_block_future(die, plane, b) == target_page:
+                return b
+        return None
+
+    def _first_erased_block(self, die:int, plane:int)->Optional[int]:
+        for b in range(self.blocks_per_plane):
+            if self.addr_state_future[(die,plane,b)] == -1:
+                return b
+        return None
+
+    # ---------- planner (non-greedy; uses future/committed rails) ----------
     def _random_plane_sets(self, fanout:int, tries:int, start_plane:int)->List[List[int]]:
-        P=list(range(self.planes)); out=[]; 
+        P=list(range(self.planes)); out=[]
         for _ in range(tries):
             cand=set(random.sample(P, min(fanout,len(P))))
             if start_plane not in cand and random.random()<0.6:
                 if len(cand)>0: cand.pop()
                 cand.add(start_plane)
-            if len(cand)==fanout: out.append(sorted(cand))
-        uniq=[]; seen=set()
-        for ps in out:
-            k=tuple(ps)
-            if k not in seen: uniq.append(ps); seen.add(k)
-        return uniq
+            if len(cand)==fanout:
+                key=tuple(sorted(cand))
+                if key not in out: out.append(key)
+        return [list(ps) for ps in dict.fromkeys(out)]
 
-    def _pages_present(self, die:int, plane:int)->Set[int]:
-        return {p for (_,p) in self.programmed[(die,plane)]}
+    def _committed_pages(self, die:int, plane:int)->Set[int]:
+        return {p for (b,p) in self.programmed_committed[(die,plane)]}
 
     def plan_multipane(self, kind: OpKind, die:int, start_plane:int, desired_fanout:int, interleave:bool)\
             -> Optional[Tuple[List[Address], List[int], Scope]]:
         if desired_fanout<1: desired_fanout=1
         tries=self.cfg["policy"]["planner_max_tries"]
+        # degrade loop: try fanout f from desired->1
         for f in range(desired_fanout, 0, -1):
             for plane_set in self._random_plane_sets(f, tries, start_plane):
                 if kind==OpKind.READ:
+                    # Intersection of committed pages across planes
                     commons=None
                     for pl in plane_set:
-                        pages=self._pages_present(die,pl)
+                        pages=self._committed_pages(die,pl)
                         commons=pages if commons is None else (commons & pages)
                         if not commons: break
-                    if not commons: continue
+                    if not commons: 
+                        continue
                     page=random.choice(sorted(list(commons)))
                     targets=[]
                     for pl in plane_set:
-                        blks=[b for (b,p) in self.programmed[(die,pl)] if p==page]
-                        blk=blks[0] if blks else 0
-                        targets.append(Address(die,pl,blk,page))
+                        # pick any block that contains (block,page)
+                        blks=[b for (b,p) in self.programmed_committed[(die,pl)] if p==page]
+                        if not blks: 
+                            targets=[]; break
+                        targets.append(Address(die,pl,blks[0],page))
+                    if not targets: 
+                        continue
                     scope=Scope.PLANE_SET
+                    return targets, plane_set, scope
 
                 elif kind==OpKind.PROGRAM:
-                    nxt=[]
+                    # try to align next page across planes.
+                    # candidate pages: (a) most common next-page of write_head blocks, (b) 0 if all have erased blocks
+                    nxts=[]
                     for pl in plane_set:
-                        b, pgm_p, _ = self.cursors[(die,pl)]
-                        nxt.append(pgm_p)
-                    if len(set(nxt))!=1: continue
-                    page=nxt[0]; targets=[]
-                    for pl in plane_set:
-                        b, pgm_p, _ = self.cursors[(die,pl)]
-                        targets.append(Address(die,pl,b,page))
+                        b_head=self.write_head[(die,pl)]
+                        nxt = self._next_page_in_block_future(die,pl,b_head)
+                        if nxt>=self.pages_per_block: nxt = None  # head block full
+                        nxts.append(nxt)
+                    candidates=[]
+                    # (a) mode among non-None
+                    vals=[x for x in nxts if x is not None]
+                    if vals:
+                        # simple mode by frequency
+                        freq={}
+                        for v in vals: freq[v]=freq.get(v,0)+1
+                        mode_val=max(freq.items(), key=lambda x:x[1])[0]
+                        candidates.append(mode_val)
+                    # (b) zero if all planes can find erased block
+                    if all(self._first_erased_block(die,pl) is not None for pl in plane_set):
+                        if 0 not in candidates: candidates.append(0)
+                    if not candidates: 
+                        continue
+
+                    chosen=None
+                    for page in candidates:
+                        tlist=[]
+                        ok=True
+                        for pl in plane_set:
+                            # if head matches target page, use it; else find any block with that next page
+                            b_head=self.write_head[(die,pl)]
+                            if self._next_page_in_block_future(die,pl,b_head)==page:
+                                b=b_head
+                            else:
+                                b=self._find_block_for_page_future(die,pl,page)
+                                if b is None:
+                                    ok=False; break
+                            tlist.append(Address(die,pl,b,page))
+                        if ok:
+                            chosen=(tlist, page); break
+                    if not chosen:
+                        continue
+                    targets, _ = chosen
                     scope=Scope.DIE_WIDE
+                    return targets, plane_set, scope
 
                 elif kind==OpKind.ERASE:
                     targets=[]
                     for pl in plane_set:
-                        b=self.cursors[(die,pl)][0]
+                        # erase write_head block preferentially if not erased
+                        b=self.write_head[(die,pl)]
+                        # pick a non-erased block if possible, else any block
+                        if self.addr_state_future[(die,pl,b)] == -1:
+                            # find some non-erased block
+                            found=None
+                            for bb in range(self.blocks_per_plane):
+                                if self.addr_state_future[(die,pl,bb)] >= 0: 
+                                    found=bb; break
+                            if found is not None: b=found
                         targets.append(Address(die,pl,b,None))
                     scope=Scope.DIE_WIDE
+                    return targets, plane_set, scope
 
                 elif kind==OpKind.SR:
-                    targets=[Address(die,start_plane,0,None)]
-                    scope=Scope.NONE
+                    return [Address(die,plane_set[0],0,None)], plane_set[:1], Scope.NONE
 
-                else:
-                    continue
-                return targets, plane_set, scope
         return None
 
+    # ---------- precheck / reserve / future registration / commit ----------
     def precheck_planescope(self, kind: OpKind, targets: List[Address], start_hint: float, scope: Scope)->bool:
         start_hint=quantize(start_hint); end_hint=start_hint
         die=targets[0].die
         if scope==Scope.DIE_WIDE: planes={(die,p) for p in range(self.planes)}
         elif scope==Scope.PLANE_SET: planes={(t.die,t.plane) for t in targets}
         else: planes={(targets[0].die, targets[0].plane)}
+        # time overlap
         for (d,p) in planes:
             for (s,e,_) in self.resv[(d,p)]:
-                if not (end_hint<=s or e<=start_hint): return False
+                if not (end_hint<=s or e<=start_hint): 
+                    return False
+        # address rules
+        for t in targets:
+            com=self.addr_state_committed[(t.die,t.plane,t.block)]
+            fut=self.addr_state_future[(t.die,t.plane,t.block)]
+            if kind==OpKind.PROGRAM:
+                if t.page is None: return False
+                # must be exactly next page in FUTURE rail
+                if t.page != fut + 1: return False
+                if t.page >= self.pages_per_block: return False
+            elif kind==OpKind.READ:
+                if t.page is None or com < 0 or t.page > com: return False
+            elif kind==OpKind.ERASE:
+                pass
         return True
 
     def reserve_planescope(self, op: Operation, start: float, end: float):
@@ -380,26 +485,51 @@ class AddressManager:
             self.available[(d,p)]=max(self.available[(d,p)], end)
             self.resv[(d,p)].append((start,end,None))
 
+    def register_future(self, op: Operation, start: float, end: float):
+        """예약 성공 직후 호출: future rail을 즉시 갱신하여 중복 PROGRAM 방지"""
+        for t in op.targets:
+            key=(t.die,t.plane,t.block)
+            if op.kind==OpKind.PROGRAM and t.page is not None:
+                # advance future
+                self.addr_state_future[key] = max(self.addr_state_future[key], t.page)
+                # update write head if block is full
+                nextp = self._next_page_in_block_future(t.die,t.plane,t.block)
+                if nextp >= self.pages_per_block:
+                    # move write head to an erased block if available
+                    er = self._first_erased_block(t.die,t.plane)
+                    if er is not None:
+                        self.write_head[(t.die,t.plane)] = er
+            elif op.kind==OpKind.ERASE:
+                # reset to ERASED
+                self.addr_state_future[key] = -1
+                # prefer erased block as write head
+                self.write_head[(t.die,t.plane)] = t.block
+
     def commit(self, op: Operation):
         for t in op.targets:
-            key=(t.die,t.plane)
+            key=(t.die,t.plane,t.block)
             if op.kind==OpKind.PROGRAM and t.page is not None:
-                self.programmed[key].add((t.block,t.page))
-                b, pgm_p, rd = self.cursors[(t.die,t.plane)]
-                pgm_p+=1
-                if pgm_p>=self.pages_per_block:
-                    pgm_p=0; b=(b+1)%self.blocks_per_plane
-                self.cursors[(t.die,t.plane)]=[b,pgm_p,rd]
+                self.addr_state_committed[key] = max(self.addr_state_committed[key], t.page)
+                self.programmed_committed[(t.die,t.plane)].add((t.block,t.page))
             elif op.kind==OpKind.ERASE:
-                self.programmed[key]={pp for pp in self.programmed[key] if pp[0]!=t.block}
+                self.addr_state_committed[key] = -1
+                # remove all committed pages of this block
+                self.programmed_committed[(t.die,t.plane)] = {
+                    pp for pp in self.programmed_committed[(t.die,t.plane)] if pp[0] != t.block
+                }
+        # invariant: committed <= future
+        # (lightweight check; can be turned into assert in debug)
+        # for k in self.addr_state_committed:
+        #     if self.addr_state_committed[k] > self.addr_state_future[k]:
+        #         raise RuntimeError("state rail violated")
 
 # ---------------------------- Exclusion Manager (runtime blocking) ----------------------------
 @dataclass
 class ExclWindow:
     start: float; end: float
-    scope: str              # "GLOBAL" or "DIE"
+    scope: str
     die: Optional[int]
-    tokens: Set[str]        # e.g., {"ANY"}, {"BASE:READ"}, {"ALIAS:MUL_READ"}
+    tokens: Set[str]        # {"ANY"}, {"BASE:READ"}, {"ALIAS:MUL_READ"} ...
 
 class ExclusionManager:
     def __init__(self, cfg: Dict[str,Any]):
@@ -431,12 +561,10 @@ class ExclusionManager:
         return False
 
     def allowed(self, op: Operation, start: float, end: float) -> bool:
-        # check global
         for w in self.global_windows:
             if not (end<=w.start or w.end<=start):
                 if any(self._token_blocks(tok, op) for tok in w.tokens):
                     return False
-        # check die
         die=op.targets[0].die
         for w in self.die_windows.get(die, []):
             if not (end<=w.start or w.end<=start):
@@ -449,8 +577,7 @@ class ExclusionManager:
         die = op.targets[0].die
         for r in rules:
             when=r["when"]; if_op=when.get("op")
-            if if_op != op.kind.name: 
-                # alias match for READ(SIN/MUL)
+            if if_op != op.kind.name:
                 if not (op.kind==OpKind.READ and if_op=="READ"): 
                     continue
             alias_need = when.get("alias")
@@ -543,7 +670,6 @@ class PolicyEngine:
 
     def _exclusion_ok(self, op: Operation, die:int, plane_set: List[int], start_hint: float) -> bool:
         scope = Scope[op.meta["scope"]]
-        # scope-aware earliest start (already computed outside; but ensure not earlier than plane availability)
         start = self.addr.earliest_start_for_scope(die, scope, plane_set)
         dur = get_op_duration(op); end=quantize(start+dur)
         return self.excl.allowed(op, start, end)
@@ -556,7 +682,6 @@ class PolicyEngine:
         if ob:
             cfg_op=self.cfg["op_specs"][ob.require.name]; op=build_operation(ob.require, cfg_op, ob.targets)
             op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=sorted({a.plane for a in ob.targets}); op.meta["arity"]=len(op.meta["plane_list"])
-            # gating check: plane, bus, exclusion
             scope=Scope[op.meta["scope"]]; plane_set=op.meta["plane_list"]
             start_hint=self.addr.earliest_start_for_scope(die, scope, plane_set)
             if self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope)\
@@ -564,7 +689,7 @@ class PolicyEngine:
                and self._exclusion_ok(op, die, plane_set, start_hint):
                 op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"; return op
 
-        # 1) phase-conditional (alias 키 허용 + SR 포함)
+        # 1) phase-conditional (alias + SR)
         allow=set(list(OP_ALIAS.keys())+["READ","PROGRAM","ERASE","SR"])
         dist, used_key = get_phase_dist(self.cfg, hook.label)
         if dist:
@@ -572,7 +697,6 @@ class PolicyEngine:
             if pick:
                 base, alias_const = resolve_alias(pick)
                 kind=OpKind[base]
-                # SR은 단일 플레인
                 if kind==OpKind.SR:
                     plan=self.addr.plan_multipane(kind, die, hook_plane, 1, True)
                 else:
@@ -592,7 +716,7 @@ class PolicyEngine:
                         op.meta["source"]="policy.phase_conditional"; op.meta["phase_key_used"]=used_key; return op
             # 실패 시 백오프
 
-        # 2) backoff (READ/PROGRAM/ERASE/SR)
+        # 2) backoff
         cand=[]
         for name in ["READ","PROGRAM","ERASE","SR"]:
             s=self._score(name, hook.label, g, l)
@@ -647,15 +771,16 @@ class Scheduler:
 
     def _schedule_operation(self, op: Operation):
         start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
-        # plane scope reserve + bus reserve + exclusion windows register
+        # plane scope reserve + bus reserve + exclusion windows register + future update
         self.addr.reserve_planescope(op, start, end)
         self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
         self.excl.register(op, start)
+        self.addr.register_future(op, start, end)
 
         # events
         self._push(start, "OP_START", op); self._push(end, "OP_END", op)
 
-        # phase hooks (라벨: READ는 SIN_READ/MUL_READ)
+        # phase hooks (READ는 SIN_READ/MUL_READ 라벨로)
         label_op=self._label_for_read(op)
         for t in op.targets:
             cur=start
@@ -703,7 +828,6 @@ class Scheduler:
         print(f"scheduled ops : {self.stat_scheduled}")
         if self.stat_propose_calls:
             print(f"accept ratio  : {100.0*self.stat_scheduled/self.stat_propose_calls:.1f}%")
-        print(f"(note) runtime exclusions: GLOBAL={len(self.excl.global_windows)}, DIE={sum(len(v) for v in self.excl.die_windows.values())}")
 
 # ---------------------------- Selection overrides ----------------------------
 def get_phase_selection_override(cfg: Dict[str,Any], hook_label: str, kind_name: str):
@@ -726,7 +850,7 @@ def main():
     obl=ObligationManager(CFG["obligations"])
     spe=PolicyEngine(CFG, addr, obl, excl)
     sch=Scheduler(CFG, addr, spe, obl, excl)
-    print("=== NAND Sequence Generator (P3: SR + CORE_BUSY constraints + DOUT freeze) ===")
+    print("=== NAND Sequence Generator (P4: addr-state rails + no-dup PROGRAM + committed-only READ) ===")
     sch.run_until(CFG["policy"]["run_until_us"])
     print("=== Done ===")
 
