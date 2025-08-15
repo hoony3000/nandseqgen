@@ -4,6 +4,8 @@ include/
 lib/
 Lib/
 share/
-Scripts
+Scripts/
+.venv/
+.vscode/
 lib64
 pyvenv.cfg
