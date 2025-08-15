@@ -126,3 +126,27 @@
     -   계산된 값들을 `low`, `mid`, `high` 같은 버킷으로 변환하여 `PolicyEngine`에 전달합니다.
 
 이 전략을 통해 `PHASE_HOOK`이 발생하여 `SPE.propose()`가 호출되는 모든 시점에서, 시스템은 현재 실행 중인 작업의 정확한 내부 단계까지 고려한 최신 상태 정보를 바탕으로 다음 작업을 제안할 수 있게 됩니다. 이는 상태에 따른 확률 분포의 정확성을 크게 향상시킵니다.
+
+## 5. nandsim_demo.py v2: 고급 아키텍처 및 기능
+
+최신 `nandsim_demo.py`는 초기 버전에 비해 훨씬 정교하고 선언적인 시뮬레이션 프레임워크로 발전했습니다. 핵심 로직 대부분이 `CFG`라는 중앙 설정 객체를 통해 제어되며, 다음과 같은 고급 기능들이 추가되었습니다.
+
+### 5.1. Phase-Conditional Policy와 Admission Gating
+
+-   **Phase-Conditional Policy (`phase_conditional`)**: 작업 제안의 핵심 로직입니다. 더 이상 단순 가중치 기반 스코어링에 의존하지 않고, 현재 실행 중인 작업의 특정 단계(`op.state.pos`, 예: `READ.CORE_BUSY.START`)를 조건으로 하여 다음에 시도할 작업들의 확률 분포를 직접 정의합니다. 이를 통해 매우 구체적이고 현실적인 시나리오(예: "READ의 CORE_BUSY 중에는 다른 READ나 SR만 시도")를 모델링할 수 있습니다.
+-   **Admission Gating (`admission`)**: `PolicyEngine`이 제안한 작업을 즉시 스케줄링하지 않고, `now + delta_us`라는 짧은 미래의 시간 창 내에 시작할 수 있을 때만 수락하는 게이트 역할을 합니다. 이는 불필요한 탐색을 줄이고 시뮬레이션 성능을 향상시킵니다.
+
+### 5.2. 동적 제약 및 제외 규칙 (Constraints & ExclusionManager)
+
+-   **`constraints`**: `CFG`에 선언된 규칙 기반 제약 시스템입니다. 특정 작업(예: `PROGRAM`)의 특정 상태(`CORE_BUSY`)가 활성화될 때, 다른 종류의 작업들(예: `READ`, `ERASE`)을 특정 범위(`DIE`, `GLOBAL`)에서 일시적으로 금지하는 복잡한 하드웨어 규칙을 모델링합니다.
+-   **`ExclusionManager`**: `constraints` 규칙을 해석하여 시뮬레이션 타임라인에 "제외 기간(Exclusion Window)"을 등록하고, `PolicyEngine`이 새 작업을 제안할 때마다 해당 작업이 금지된 기간에 속하는지 여부를 검사하여 제안을 거부하는 역할을 합니다.
+
+### 5.3. AddressManager v2 및 Multi-Plane/Die-Wide 작업
+
+-   **Committed/Future 상태 분리**: `AddressManager`는 주소의 상태를 `addr_state_committed` (이미 완료된 작업 기준)와 `addr_state_future` (예약은 되었지만 아직 완료되지 않은 작업 기준)로 나누어 관리합니다. 이를 통해 `READ`는 `committed` 데이터를 읽고, `PROGRAM`은 `future` 상태를 기반으로 계획을 세우는 등 더 정확한 상태 추적이 가능해졌습니다.
+-   **Multi-Plane 계획 (`plan_multipane`)**: 단일 Plane 작업뿐만 아니라, 여러 Plane에 걸친 작업(Multi-Plane Operation)을 계획하고 실행합니다. `op_specs`에 정의된 `scope` (`PLANE_SET`, `DIE_WIDE`)에 따라 작업의 영향 범위를 결정합니다.
+-   **작업 별칭 (`OP_ALIAS`)**: 사용자가 정책을 쉽게 정의할 수 있도록 `SIN_READ` (Single-plane Read), `MUL_READ` (Multi-plane Read)와 같은 별칭을 사용합니다. `PolicyEngine`은 이 별칭을 해석하여 적절한 fanout으로 `plan_multipane`을 호출합니다.
+
+### 5.4. 자동 검증 및 시각화
+
+-   `main` 함수는 시뮬레이션 실행 후 `viz_tools`를 사용하여 다양한 결과를 시각화하고(Gantt 차트, 3D 작업 순서도), `validate_timeline` 함수를 호출하여 생성된 타임라인이 `CFG`에 정의된 모든 타이밍 및 제약 조건들을 준수하는지 자동으로 검증합니다. 이는 시퀀스 생성 로직의 정확성을 보장하는 중요한 안전장치입니다.
