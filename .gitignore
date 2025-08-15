@@ -7,5 +7,11 @@ share/
 Scripts/
 .venv/
 .vscode/
+figs/
 lib64
+* copy.py
 pyvenv.cfg
+run_*
+hash_*
+nand_timeline.csv
+nand_violations.csv

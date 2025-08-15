@@ -23,11 +23,52 @@ def quantize(t: float) -> float:
 
 # --------------------------------------------------------------------------
 # Config
+# --- Patches: RNG seed + fixed-duration enforcement for validate_timeline ---
+def _seed_rng_from_cfg(cfg):
+    import random
+    try:
+        seed = cfg.get("rng_seed", None)
+        if seed is not None:
+            random.seed(int(seed))
+            print(f"[INIT] random.seed({seed})")
+    except Exception as e:
+        print(f"[INIT] random.seed skipped: {e}")
+
+def _coerce_states_to_fixed(cfg):
+    """
+    Ensure all op_specs.states use fixed durations; if not, convert using representative stats.
+    - normal: use mean
+    - exp   : use 1/lambda as mean
+    """
+    converted = 0
+    for op, spec in cfg.get("op_specs", {}).items():
+        for st in spec.get("states", []):
+            dist = st.get("dist", {})
+            kind = dist.get("kind")
+            if kind != "fixed":
+                val = None
+                if kind == "normal":
+                    val = float(dist.get("mean", 0.0))
+                elif kind == "exp":
+                    lam = float(dist.get("lambda", 1.0))
+                    val = 1.0/lam if lam > 0 else 0.0
+                elif "value" in dist:
+                    val = float(dist["value"])
+                else:
+                    try:
+                        val = float(dist.get("mean", 0.0))
+                    except Exception:
+                        val = 0.0
+                st["dist"] = {"kind":"fixed", "value": float(val)}
+                converted += 1
+    if converted:
+        print(f"[INIT] coerced {converted} state dists to fixed for validation")
+
 CFG = {
     "rng_seed": 12345,
     "policy": {
         "queue_refill_period_us": 3.0,
-        "run_until_us": 180.0,
+        "run_until_us": 2000.0,
         "planner_max_tries": 8,
     },
 
@@ -101,8 +142,8 @@ CFG = {
             "page_equal_required": True,
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
-                {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "normal", "mean": 8.0, "std": 1.5, "min": 2.0}},
-                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "normal", "mean": 2.0, "std": 0.4, "min": 0.5}},
+                {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 8.0}},
+                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "fixed", "value": 2.0}},
             ],
         },
         "PROGRAM": {
@@ -110,7 +151,7 @@ CFG = {
             "page_equal_required": True,
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
-                {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "normal", "mean": 20.0, "std": 3.0, "min": 8.0}},
+                {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 20.0}},
             ],
         },
         "ERASE": {
@@ -118,7 +159,7 @@ CFG = {
             "page_equal_required": False,
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
-                {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "normal", "mean": 40.0, "std": 5.0, "min": 15.0}},
+                {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 40.0}},
             ],
         },
         "DOUT": {
@@ -126,7 +167,7 @@ CFG = {
             "page_equal_required": True,
             "states": [
                 {"name": "ISSUE",     "bus": False, "dist": {"kind": "fixed",  "value": 0.2}},
-                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "normal", "mean": 1.0, "std": 0.2, "min": 0.2}},
+                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "fixed", "value": 1.0}},
             ],
         },
         "SR": {
@@ -173,10 +214,10 @@ CFG = {
 
     # Topology (redefined): plane = block % planes
     "topology": {
-        "dies": 1,
+        "dies": 2,
         "planes": 4,
         "blocks": 32,           # total blocks per die (not per plane)
-        "pages_per_block": 16,
+        "pages_per_block": 40,
     },
 
     "export": {"tu_us": 0.01, "nop_symbol": "NOP", "wait_as_nop": True, "drift_correction": True},
@@ -402,11 +443,18 @@ class AddressManager:
 
     # ---- planner (non-greedy; degrade fanout; READ=committed, PROGRAM=future) ----
     def _random_plane_sets(self, fanout:int, tries:int, start_plane:int)->List[List[int]]:
+        """시드에 의해 완전히 결정되는 난수 흐름만 사용. 구조적 결정 규칙은 제거.
+        - 후보군은 random.sample, random.random 만을 사용해 생성
+        - start_plane 강제 포함 여부도 random.random으로 제어
+        """
         P=list(range(self.planes)); out=[]
         for _ in range(tries):
             cand=set(random.sample(P, min(fanout,len(P))))
             if start_plane not in cand and random.random()<0.6:
-                if len(cand)>0: cand.pop()
+                # 무작위로 하나 제거하여 start_plane를 포함시키는 순수 난수 기반 규칙
+                if len(cand)>0:
+                    rem=random.choice(sorted(cand))
+                    cand.remove(rem)
                 cand.add(start_plane)
             if len(cand)==fanout:
                 key=tuple(sorted(cand))
@@ -863,8 +911,15 @@ class Scheduler:
         return quantize(max(self.now, t_planes))
 
     def _label_for_read(self, op: Operation)->str:
-        if op.kind!=OpKind.READ: return op.kind.name
-        return "MUL_READ" if op.meta.get("arity",1)>1 else "SIN_READ"
+        # Generalized: return alias-like full label for multi/single plane
+        arity = op.meta.get("arity", 1)
+        if op.kind == OpKind.READ:
+            return "MUL_READ" if arity>1 else "SIN_READ"
+        if op.kind == OpKind.PROGRAM:
+            return "MUL_PROGRAM" if arity>1 else "SIN_PROGRAM"
+        if op.kind == OpKind.ERASE:
+            return "MUL_ERASE" if arity>1 else "SIN_ERASE"
+        return op.kind.name
 
     def _schedule_operation(self, op: Operation):
         start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
@@ -873,6 +928,9 @@ class Scheduler:
         self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
         self.excl.register(op, start)
         self.addr.register_future(op, start, end)
+        # assign deterministic op uid (per scheduled op)
+        if "uid" not in op.meta:
+            op.meta["uid"] = self.stat_scheduled + 1
         if self.logger is not None:
             self.logger.log_op(op, start, end, label_for_read=self._label_for_read(op))
 
@@ -946,7 +1004,9 @@ class Scheduler:
 # --------------------------------------------------------------------------
 # Main
 def main():
-# 1) 구성
+    # 1) 구성
+    _seed_rng_from_cfg(CFG)
+    _coerce_states_to_fixed(CFG)
     logger = TimelineLogger()
     addr = AddressManager(CFG); excl = ExclusionManager(CFG)
     obl  = ObligationManager(CFG["obligations"])
@@ -960,20 +1020,17 @@ def main():
     df = logger.to_dataframe()
     df.to_csv("nand_timeline.csv", index=False)
 
-    # 4) 시각화
-    plot_gantt(df, die=0, title="Die 0 Gantt")
-    plot_gantt_by_die(df)  # 모든 die별로 개별 그림
-
-    plot_block_page_sequence_3d(df, die=0, kinds=("ERASE","PROGRAM","READ"),
-                                z_mode="per_block", draw_lines=True,
-                                title="Die 0 Block-Page-Order (per-block order)")
-    plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
-                                    z_mode="global_die", draw_lines=True)
-
-    # 5) 규칙 자동검증
+    # 4) 규칙 자동검증
     report = validate_timeline(df, CFG)
     print_validation_report(report, max_rows=30)
     viol_df = violations_to_dataframe(report)
     viol_df.to_csv("nand_violations.csv", index=False)
+
+    # 5) 시각화
+    plot_gantt_by_die(df)  # 모든 die별로 개별 그림
+
+    plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
+                                    z_mode="global_die", draw_lines=True)
+
 if __name__=="__main__":
     main()

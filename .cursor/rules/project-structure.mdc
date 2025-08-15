@@ -1,0 +1,45 @@
+---
+alwaysApply: true
+description: "프로젝트 구조, 핵심 파일, 구성요소, 안전한 탐색 가이드"
+---
+## NandSeqGen 프로젝트 구조 가이드
+
+- **주요 실행/데모**
+  - [main.py](mdc:main.py)
+  - [nandsim_demo.py](mdc:nandsim_demo.py)
+
+- **핵심 모듈**
+  - [gen_seq.py](mdc:gen_seq.py)
+  - [viz_tools.py](mdc:viz_tools.py)
+  - [addrman.py](mdc:addrman.py)
+
+- **설정/규칙**
+  - [config.yaml](mdc:config.yaml)
+  - [operations.yaml](mdc:operations.yaml)
+  - [rules.yaml](mdc:rules.yaml)
+
+- **산출물/데이터(생성될 수 있음)**
+  - [nand_timeline.csv](mdc:nand_timeline.csv)
+  - [nand_violations.csv](mdc:nand_violations.csv)
+  - [output.txt](mdc:output.txt)
+
+- **테스트**
+  - [test_main.py](mdc:test_main.py)
+
+- **문서**
+  - [README.md](mdc:README.md)
+  - [PRD.md](mdc:PRD.md)
+  - 예시: [docs/pro_250814_1.md](mdc:docs/pro_250814_1.md)
+
+### 탐색 팁
+- **시퀀스 생성/검증/가시화** 단어로 의미 기반 탐색을 우선 사용합니다.
+- 로직을 변경하기 전에는 관련 **YAML 설정**([config.yaml](mdc:config.yaml), [operations.yaml](mdc:operations.yaml), [rules.yaml](mdc:rules.yaml))을 먼저 확인합니다.
+- 가시화 관련 변경은 가능하면 [viz_tools.py](mdc:viz_tools.py) 안에서 처리하고, 계산/도메인 로직과 분리합니다.
+- 큰 파일(예: [nandsim_demo.py](mdc:nandsim_demo.py))에서 수정 범위가 커질 경우, 함수 단위로 역할을 분리해 **작은 편집 단위**로 진행합니다.
+
+### 코드 편집 원칙
+- 기존 **인덴트 스타일과 폭**을 그대로 유지합니다(탭/스페이스 혼용 금지).
+- 관련 없는 리포매팅이나 대규모 리팩터링은 피하고, **최소 변경**을 지향합니다.
+- 공용 API에는 타입 힌트를 권장하고, **가드절**과 명확한 에러 처리를 우선합니다.
+- 데이터/파일 I/O는 경로/인코딩을 명시하며, 재현 가능성을 고려합니다.
+- 새로운 의존성을 추가할 경우 [requirements.txt](mdc:requirements.txt)를 업데이트합니다.

@@ -1,0 +1,39 @@
+---
+globs: *.py
+description: "Python 코드 스타일, 타입, 예외, I/O, 테스트 가이드"
+---
+## Python 코드 스타일 가이드
+
+- **타입 힌트**: 외부에 노출되는 함수/메서드는 인자와 반환 타입을 명시합니다.
+  - 예시:
+    ```python
+    from pathlib import Path
+    from typing import Iterable, List
+
+    def load_lines(file_path: Path) -> List[str]:
+        return file_path.read_text(encoding="utf-8").splitlines()
+    ```
+
+- **네이밍**: 의미 중심의 풀네임을 사용하고, 축약을 피합니다.
+
+- **제어 흐름**: 가드절로 예외/엣지케이스를 먼저 처리하고, 깊은 중첩을 피합니다.
+
+- **예외 처리**: 광범위한 `except Exception:` 대신 **구체적 예외**를 다루고, 불필요한 삼키기 금지.
+  - `try` 범위를 최소화하고, 로깅 후 재전파가 합리적이면 `raise` 합니다.
+
+- **로깅**: `print` 대신 `logging` 사용을 권장합니다.
+  - 예시:
+    ```python
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.info("message")
+    ```
+
+- **파일 I/O**: `pathlib.Path` 사용, `encoding="utf-8"`와 필요한 경우 `newline=""`를 명시합니다.
+
+- **YAML/CSV**: YAML은 안전한 로더 사용(`yaml.safe_load`), CSV는 일관된 dialect를 사용합니다.
+
+- **함수 크기**: 가급적 30~50줄 이하로 유지하고, 복잡도는 보조 함수로 분리합니다.
+
+- **테스트**: 새 기능/버그 수정 시, 최소 단위 테스트를 [test_main.py](mdc:test_main.py) 또는 별도 테스트 파일에 추가합니다.

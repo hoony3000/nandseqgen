@@ -52,8 +52,8 @@ class TimelineLogger:
 
     def log_op(self, op, start_us: float, end_us: float, label_for_read: Optional[str] = None):
         label = op.kind.name
-        if label_for_read and op.kind.name == "READ":
-            label = label_for_read  # SIN_READ / MUL_READ
+        if label_for_read:
+            label = label_for_read  # READ:MUL_/SIN_, PROGRAM/ERASE도 MUL_/SIN_ 반영
         for t in op.targets:
             page = t.page if (t.page is not None) else 0  # ERASE/SR도 page=0로 강제
             self.rows.append({
@@ -63,9 +63,11 @@ class TimelineLogger:
                 "plane":    int(t.plane),
                 "block":    int(t.block),
                 "page":     int(page),
-                "kind":     label,          # alias-aware
+                "kind":     label,          # alias-aware (SIN_/MUL_ for multi/single)
                 "base_kind": op.kind.name,  # ERASE/PROGRAM/READ/DOUT/SR/...
                 "source":   op.meta.get("source"),
+                "op_uid":   int(op.meta.get("uid", -1)),
+                "arity":    int(op.meta.get("arity", 1)),
             })
 
     def to_dataframe(self) -> pd.DataFrame:
@@ -263,6 +265,10 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
     if df.empty:
         return {"issues": [], "counts": {}}
 
+    # epsilon to avoid false positives from float rounding (touching edges)
+    tu = float(cfg.get("export", {}).get("tu_us", 0.01))  # simulation time unit
+    eps = max(1e-9, tu * 1e-3)  # 0.1% of TU or at least 1e-9 us
+
     # 1~3. 블록 상태를 이벤트 순회로 재구성 (commit은 end_us에 일어남)
     state = {}  # (die,block) -> {"last": int, "committed": set()}
     events = []
@@ -324,11 +330,15 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
         for _, r in dout_rows.iterrows():
             a0, a1 = float(r["start_us"]), float(r["end_us"])
             # 다른 모든 op와 겹침 검사
-            ov = others[(others["start_us"] < a1) & (a0 < others["end_us"])]
+            ov = others[(others["start_us"] < (a1 - eps)) & ((a0 + eps) < others["end_us"])]
             for __, rr in ov.iterrows():
+                t0 = max(a0, float(rr["start_us"]))
+                t1 = min(a1, float(rr["end_us"]))
+                if (t1 - t0) <= eps:
+                    continue
                 issues.append(ValidationIssue(
-                    kind="DOUT_OVERLAP", die=None, block=None, page=None,
-                    t0=min(a0, float(rr["start_us"])), t1=max(a1, float(rr["end_us"])),
+                    kind="DOUT_OVERLAP", die=int(r["die"]), block=int(r["block"]), page=int(r["page"]),
+                    t0=t0, t1=t1,
                     detail=f"DOUT overlaps with {rr['base_kind']} (die={rr['die']}, block={rr['block']})"
                 ))
 
@@ -354,12 +364,22 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
         # 같은 die의 READ/PROGRAM/ERASE 전 구간과 겹침 검사
         ov = all_rpe[(all_rpe["die"]==d) &
                      (all_rpe.index != r.name) &
-                     (all_rpe["start_us"] < s1) & (s0 < all_rpe["end_us"])]
+                     (all_rpe["start_us"] < (s1 - eps)) & ((s0 + eps) < all_rpe["end_us"])]
         for __, rr in ov.iterrows():
+            # 동일 스케줄링으로부터 나온 행(op_uid 동일)은 겹침 무시
+            if int(rr.get("op_uid", -2)) == int(r.get("op_uid", -1)):
+                continue
+            t0 = max(s0, float(rr["start_us"]))
+            t1 = min(s1, float(rr["end_us"]))
+            if (t1 - t0) <= eps:
+                continue
+            # 멀티/싱글 풀 라벨 표기(READ는 kind, 그 외는 base_kind 기준으로 출력)
+            lhs = r.get("kind") if r["base_kind"]=="READ" else r["base_kind"]
+            rhs = rr.get("kind") if rr["base_kind"]=="READ" else rr["base_kind"]
             issues.append(ValidationIssue(
-                kind="CORE_BUSY_DIEWIDE_OVERLAP", die=d, block=None, page=None,
-                t0=max(s0, float(rr["start_us"])), t1=min(s1, float(rr["end_us"])),
-                detail=f"{r['base_kind']}.CORE_BUSY overlaps with {rr['base_kind']} on die {d}"
+                kind="CORE_BUSY_DIEWIDE_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
+                t0=t0, t1=t1,
+                detail=f"{lhs}.CORE_BUSY overlaps with {rhs} on die {d}"
             ))
 
     # MUL_READ CORE_BUSY: 같은 die에서 READ/PROGRAM/ERASE 금지
@@ -371,12 +391,19 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
         d = int(r["die"])
         ov = all_rpe[(all_rpe["die"]==d) &
                      (all_rpe.index != r.name) &
-                     (all_rpe["start_us"] < s1) & (s0 < all_rpe["end_us"])]
+                     (all_rpe["start_us"] < (s1 - eps)) & ((s0 + eps) < all_rpe["end_us"])]
         for __, rr in ov.iterrows():
+            if int(rr.get("op_uid", -2)) == int(r.get("op_uid", -1)):
+                continue
+            t0 = max(s0, float(rr["start_us"]))
+            t1 = min(s1, float(rr["end_us"]))
+            if (t1 - t0) <= eps:
+                continue
+            rhs = rr.get("kind") if rr["base_kind"]=="READ" else rr["base_kind"]
             issues.append(ValidationIssue(
-                kind="MUL_READ_CORE_BUSY_OVERLAP", die=d, block=None, page=None,
-                t0=max(s0, float(rr["start_us"])), t1=min(s1, float(rr["end_us"])),
-                detail=f"MUL_READ.CORE_BUSY overlaps with {rr['base_kind']} on die {d}"
+                kind="MUL_READ_CORE_BUSY_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
+                t0=t0, t1=t1,
+                detail=f"MUL_READ.CORE_BUSY overlaps with {rhs} on die {d}"
             ))
 
     # SIN_READ CORE_BUSY: 같은 die에서 MUL_READ/PROGRAM/ERASE 금지 (SIN_READ는 허용)
@@ -389,12 +416,19 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
         d = int(r["die"])
         ov = ban_for_sin[(ban_for_sin["die"]==d) &
                          (ban_for_sin.index != r.name) &
-                         (ban_for_sin["start_us"] < s1) & (s0 < ban_for_sin["end_us"])]
+                         (ban_for_sin["start_us"] < (s1 - eps)) & ((s0 + eps) < ban_for_sin["end_us"])]
         for __, rr in ov.iterrows():
+            if int(rr.get("op_uid", -2)) == int(r.get("op_uid", -1)):
+                continue
+            t0 = max(s0, float(rr["start_us"]))
+            t1 = min(s1, float(rr["end_us"]))
+            if (t1 - t0) <= eps:
+                continue
+            rhs = rr.get("kind") if rr["base_kind"]=="READ" else rr["base_kind"]
             issues.append(ValidationIssue(
-                kind="SIN_READ_CORE_BUSY_OVERLAP", die=d, block=None, page=None,
-                t0=max(s0, float(rr["start_us"])), t1=min(s1, float(rr["end_us"])),
-                detail=f"SIN_READ.CORE_BUSY overlaps with {rr['kind']} on die {d}"
+                kind="SIN_READ_CORE_BUSY_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
+                t0=t0, t1=t1,
+                detail=f"SIN_READ.CORE_BUSY overlaps with {rhs} on die {d}"
             ))
 
     # counts
