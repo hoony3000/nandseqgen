@@ -1,16 +1,15 @@
-# nandsim_p5_allinone.py
-# - P5: Stats + Admission gating + Block/Plane redefinition
-# - AddressManager v2: committed/future rails (no-dup PROGRAM; READ uses committed visibility)
-# - Block/Plane: plane = block % planes; topology: {dies, planes, blocks, pages_per_block}
-# - Policy admission gating (near-future only; phase/op tunable; obligations bypass)
-# - Obligation stats: created/assigned/fulfilled/fulfilled_in_time/expired
-# - Multi-plane alias (SIN_*/MUL_*), DIE_WIDE CORE_BUSY, Bus gating, SR, constraints incl. DOUT freeze
+# nandsim_p6_candidate_start_fix.py
+# - P6: candidate_start 기반 검사 + schedule 직전 fail-safe
+# - Admission/exclusion 설계와 정합성 유지(near-future만 수용, 미래예약 폭주 억제 강화)
+# - Latch/DOUT 중 SR 예약 금지 케이스를 bus/excl에서 일관되게 차단
 
 from __future__ import annotations
 import heapq, random
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
+from collections import defaultdict
+import csv
 from viz_tools import TimelineLogger, plot_gantt, plot_gantt_by_die
 from viz_tools import plot_block_page_sequence_3d, plot_block_page_sequence_3d_by_die
 from viz_tools import validate_timeline, print_validation_report, violations_to_dataframe
@@ -31,6 +30,12 @@ def _seed_rng_from_cfg(cfg):
         if seed is not None:
             random.seed(int(seed))
             print(f"[INIT] random.seed({seed})")
+            try:
+                import numpy as np  # optional
+                np.random.seed(int(seed))
+                print(f"[INIT] numpy.random.seed({seed})")
+            except Exception:
+                pass
     except Exception as e:
         print(f"[INIT] random.seed skipped: {e}")
 
@@ -64,24 +69,37 @@ def _coerce_states_to_fixed(cfg):
     if converted:
         print(f"[INIT] coerced {converted} state dists to fixed for validation")
 
+def _validate_phase_conditional_cfg(cfg):
+    """
+    Ensure each phase_conditional distribution sums to 1.0 (within epsilon) and has no negative weights.
+    This is a pre-run guard to avoid unstable sampling behavior.
+    """
+    pc = cfg.get("phase_conditional", {})
+    eps = 1e-6
+    for key, dist in pc.items():
+        if not isinstance(dist, dict):
+            continue
+        # OP.PHASE.POS 형태 금지 (키 2개 이상의 점 포함 금지)
+        if key.count(".") >= 2 and key != "DEFAULT":
+            raise ValueError(f"phase_conditional key not supported (use OP.PHASE only): {key}")
+        vals = list(dist.values())
+        if any((float(v) < 0.0) for v in vals):
+            raise ValueError(f"phase_conditional[{key}] contains negative weight(s)")
+        s = float(sum(float(v) for v in vals))
+        if abs(s - 1.0) > eps:
+            raise ValueError(f"phase_conditional[{key}] sum={s} != 1.0")
+
 CFG = {
     "rng_seed": 12345,
     "policy": {
-        "queue_refill_period_us": 3.0,
-        "run_until_us": 2000.0,
+        "queue_refill_period_us": 50.0,
+        "run_until_us": 10000.0,
         "planner_max_tries": 8,
     },
 
     # Admission gating (near-future only to prevent policy explosion)
     "admission": {
         "default_delta_us": 0.30,
-        "phase_overrides": {
-            "CORE_BUSY": 0.05,
-            "ISSUE":     0.10,
-            "DATA_OUT":  0.05,
-            "BOOT":      0.30,
-            "NUDGE":     0.10,  # from REFILL.NUDGE hooks
-        },
         "op_overrides": {
             "SR": 0.30
         },
@@ -90,22 +108,10 @@ CFG = {
 
     # Phase-conditional proposal (alias keys allowed)
     "phase_conditional": {
-        "READ.ISSUE":                {"MUL_PROGRAM": 0.15, "SIN_PROGRAM": 0.10, "SIN_READ": 0.35, "MUL_READ": 0.25, "SIN_ERASE": 0.15, "SR": 0.00},
-        "READ.CORE_BUSY.START":      {"MUL_READ": 0.50, "SIN_READ": 0.20, "SIN_PROGRAM": 0.10, "SIN_ERASE": 0.10, "SR": 0.10},
-        "READ.DATA_OUT.START":       {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.15, "SIN_ERASE": 0.10, "SR": 0.05},
-
-        "PROGRAM.ISSUE":             {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.15, "SIN_ERASE": 0.10, "SR": 0.05},
-        "PROGRAM.CORE_BUSY":         {"SR": 1.0},   # during PROGRAM core-busy: only SR
-        "PROGRAM.CORE_BUSY.END":     {"SIN_READ": 0.55, "MUL_READ": 0.25, "SIN_PROGRAM": 0.10, "SIN_ERASE": 0.05, "SR": 0.05},
-
-        "ERASE.ISSUE":               {"SIN_PROGRAM": 0.40, "MUL_PROGRAM": 0.20, "SIN_READ": 0.25, "MUL_READ": 0.10, "SR": 0.05},
-        "ERASE.CORE_BUSY":           {"SR": 1.0},   # during ERASE core-busy: only SR
-        "ERASE.CORE_BUSY.END":       {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.10, "MUL_PROGRAM": 0.05, "SR": 0.15},
-
-        "MUL_READ.CORE_BUSY":        {"SR": 1.0},   # during MUL_READ core-busy: only SR
-        "SIN_READ.CORE_BUSY":        {"SIN_READ": 0.6, "SR": 0.4},  # during SIN_READ core-busy: allow SIN_READ or SR; forbid MUL/PGM/ERASE
-
-        "DEFAULT":                   {"SIN_READ": 0.55, "SIN_PROGRAM": 0.25, "SIN_ERASE": 0.10, "SR": 0.10},
+        "READ.ISSUE":           {"MUL_PROGRAM": 0.15, "SIN_PROGRAM": 0.10, "SIN_READ": 0.35, "MUL_READ": 0.25, "SIN_ERASE": 0.15},
+        "PROGRAM.ISSUE":        {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.15, "SIN_ERASE": 0.10, "SR": 0.05},
+        "ERASE.ISSUE":          {"SIN_PROGRAM": 0.40, "MUL_PROGRAM": 0.20, "SIN_READ": 0.25, "MUL_READ": 0.10, "SR": 0.05},
+        "DEFAULT":              {"SIN_READ": 0.55, "SIN_PROGRAM": 0.25, "SIN_ERASE": 0.10, "SR": 0.10}
     },
 
     # Backoff scoring weights (used if phase_conditional fails)
@@ -143,7 +149,7 @@ CFG = {
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
                 {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 8.0}},
-                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "fixed", "value": 2.0}},
+                {"name": "DATA_OUT",  "bus": False, "dist": {"kind": "fixed", "value": 2.0}},
             ],
         },
         "PROGRAM": {
@@ -166,8 +172,8 @@ CFG = {
             "scope": "NONE",
             "page_equal_required": True,
             "states": [
-                {"name": "ISSUE",     "bus": False, "dist": {"kind": "fixed",  "value": 0.2}},
-                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "fixed", "value": 1.0}},
+                {"name": "ISSUE",     "bus": True, "dist": {"kind": "fixed",  "value": 0.2}},
+                {"name": "DATA_OUT",  "bus": True, "dist": {"kind": "fixed", "value": 1.0}},
             ],
         },
         "SR": {
@@ -207,7 +213,8 @@ CFG = {
         {
             "issuer": "READ",
             "require": "DOUT",
-            "window_us": {"kind": "normal", "mean": 6.0, "std": 1.5, "min": 1.0},
+            # "window_us": {"kind": "normal", "mean": 6.0, "std": 1.5, "min": 3.0},
+            "window_us": {"kind": "fixed", "value": 20.0},
             "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True},
         }
     ],
@@ -270,6 +277,71 @@ class Operation:
     meta: Dict[str,Any] = field(default_factory=dict)
 
 # --------------------------------------------------------------------------
+# Rejection logging (per-attempt structured log + aggregated stats)
+@dataclass
+class RejectEvent:
+    now_us: float
+    die: int
+    plane: int
+    hook: str
+    stage: str                 # 'obligation' | 'phase_conditional' | 'backoff'
+    attempted: Optional[str]   # 'READ'/'PROGRAM'/... or None
+    alias: Optional[str]       # 'SIN_READ'/'MUL_READ'/... or None
+    fanout: Optional[int]
+    plane_set: Optional[str]   # e.g. "[0,2]" stringified
+    reason: str                # 'admission'/'plan_none'/...
+    detail: str                # free-form short note
+    earliest_start: Optional[float] = None
+    admission_delta: Optional[float] = None
+
+class RejectionLogger:
+    def __init__(self):
+        self.rows: List[RejectEvent] = []
+        # nested counts: stage -> reason -> count
+        self.stats = defaultdict(lambda: defaultdict(int))
+        # stage-wise attempts/accepts
+        self.stage_attempts = defaultdict(int)
+        self.stage_accepts  = defaultdict(int)
+
+    def log_attempt(self, stage: str):
+        self.stage_attempts[stage] += 1
+
+    def log_accept(self, stage: str):
+        self.stage_accepts[stage] += 1
+
+    def log_reject(self, ev: RejectEvent):
+        self.rows.append(ev)
+        self.stats[ev.stage][ev.reason] += 1
+
+    def to_csv(self, path: str = "reject_log.csv"):
+        if not self.rows:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[ "now_us","die","plane","hook","stage","attempted","alias",
+                             "fanout","plane_set","reason","detail",
+                             "earliest_start","admission_delta" ]
+            )
+            w.writeheader()
+            for r in self.rows:
+                w.writerow({
+                    "now_us": r.now_us,
+                    "die": r.die,
+                    "plane": r.plane,
+                    "hook": r.hook,
+                    "stage": r.stage,
+                    "attempted": r.attempted,
+                    "alias": r.alias,
+                    "fanout": r.fanout,
+                    "plane_set": r.plane_set,
+                    "reason": r.reason,
+                    "detail": r.detail,
+                    "earliest_start": r.earliest_start,
+                    "admission_delta": r.admission_delta,
+                })
+
+# --------------------------------------------------------------------------
 # Utils
 def sample_dist(d: Dict[str, Any]) -> float:
     k = d["kind"]
@@ -290,7 +362,7 @@ def get_phase_dist(cfg: Dict[str,Any], hook_label: str):
     op, state, pos = parse_hook_key(hook_label)
     pc = cfg.get("phase_conditional", {})
     keys=[]
-    if op and state and pos: keys.append(f"{op}.{state}.{pos}")
+    # POS granularity removed by plan; only OP.STATE and DEFAULT are considered
     if op and state:         keys.append(f"{op}.{state}")
     keys.append("DEFAULT")
     for key in keys:
@@ -312,10 +384,7 @@ def resolve_alias(name: str) -> Tuple[str, Optional[Tuple[str,int]]]:
     return name, None
 
 def get_admission_delta(cfg: Dict[str,Any], hook_label: str, op_kind_name: str) -> float:
-    _, state, _ = parse_hook_key(hook_label)
     adm = cfg.get("admission", {})
-    if state and state in adm.get("phase_overrides", {}):
-        return float(adm["phase_overrides"][state])
     if op_kind_name in adm.get("op_overrides", {}):
         return float(adm["op_overrides"][op_kind_name])
     return float(adm.get("default_delta_us", 0.3))
@@ -330,9 +399,6 @@ def build_operation(kind: OpKind, cfg_op: Dict[str, Any], targets: List[Address]
 
 def get_op_duration(op: Operation) -> float:
     return sum(seg.dur_us for seg in op.states)
-
-def get_timeline_df(self):
-    return self.logger.to_dataframe()
 
 # --------------------------------------------------------------------------
 # Address & Bus Managers (with block/plane redefinition + state rails)
@@ -385,14 +451,21 @@ class AddressManager:
             planes=[plane_set[0]] if plane_set else [0]
         return max(self.available[(die,p)] for p in planes)
 
+    def candidate_start_for_scope(self, now_us: float, die:int, scope: Scope, plane_set: Optional[List[int]]=None)->float:
+        """실제 스케줄러가 사용할 시작 후보시각 = max(now, earliest_start_for_scope)."""
+        t_planes = self.earliest_start_for_scope(die, scope, plane_set)
+        return quantize(max(now_us, t_planes))
+
     def observe_states(self, die:int, plane:int, now_us: float):
         pgmable_blocks=0; readable_blocks=0
+        cnt=0
         for b in self.iter_blocks_of_plane(plane):
+            cnt += 1
             fut=self.addr_state_future[(die,b)]
             com=self.addr_state_committed[(die,b)]
             if fut < self.pages_per_block-1: pgmable_blocks += 1
             if com >= 0: readable_blocks += 1
-        total=max(1, len(list(self.iter_blocks_of_plane(plane))))
+        total=max(1, cnt)
         def bucket(x):
             r=x/total
             return "low" if r<0.34 else ("mid" if r<0.67 else "high")
@@ -443,15 +516,12 @@ class AddressManager:
 
     # ---- planner (non-greedy; degrade fanout; READ=committed, PROGRAM=future) ----
     def _random_plane_sets(self, fanout:int, tries:int, start_plane:int)->List[List[int]]:
-        """시드에 의해 완전히 결정되는 난수 흐름만 사용. 구조적 결정 규칙은 제거.
-        - 후보군은 random.sample, random.random 만을 사용해 생성
-        - start_plane 강제 포함 여부도 random.random으로 제어
-        """
+        """난수 기반 plane-set 후보 생성 (재현성은 random.seed에 따름)"""
         P=list(range(self.planes)); out=[]
         for _ in range(tries):
             cand=set(random.sample(P, min(fanout,len(P))))
             if start_plane not in cand and random.random()<0.6:
-                # 무작위로 하나 제거하여 start_plane를 포함시키는 순수 난수 기반 규칙
+                # 무작위로 하나 제거하여 start_plane 포함
                 if len(cand)>0:
                     rem=random.choice(sorted(cand))
                     cand.remove(rem)
@@ -484,7 +554,7 @@ class AddressManager:
                     return targets, plane_set, Scope.PLANE_SET
 
                 elif kind==OpKind.PROGRAM:
-                    # Choose candidate pages: mode of next pages across write heads; or 0 if erased exists
+                    # candidate page: mode of next pages across write heads; or 0 if fresh erased exists
                     nxts=[]
                     for pl in plane_set:
                         b_head=self.write_head[(die,pl)]
@@ -519,19 +589,19 @@ class AddressManager:
                 elif kind==OpKind.ERASE:
                     targets=[]
                     for pl in plane_set:
-                        b=self.write_head[(die,pl)]
-                        if self.addr_state_future[(die,b)] == -1:
-                            # pick a non-erased block on this plane if possible
-                            found=None
-                            for bb in self.iter_blocks_of_plane(pl):
-                                if self.addr_state_future[(die,bb)] >= 0:
-                                    found=bb; break
-                            if found is not None: b=found
-                    targets.append(Address(die, pl, b, 0))  # ERASE도 page=0
-                    return [Address(die, plane_set[0], plane_set[0], 0)], plane_set[:1], Scope.NONE  # SR도 page=0
+                        # prefer a non-erased block on this plane; fallback to write_head
+                        chosen_b=None
+                        for bb in self.iter_blocks_of_plane(pl):
+                            if self.addr_state_future[(die,bb)] >= 0:
+                                chosen_b=bb; break
+                        if chosen_b is None:
+                            chosen_b=self.write_head[(die,pl)]
+                        targets.append(Address(die, pl, chosen_b, 0))  # page=0 for logging
+                    return targets, plane_set, Scope.DIE_WIDE
 
                 elif kind==OpKind.SR:
-                    return [Address(die, plane_set[0], plane_set[0], None)], plane_set[:1], Scope.NONE
+                    # page=0 for uniform address shape
+                    return [Address(die, plane_set[0], plane_set[0], 0)], plane_set[:1], Scope.NONE
 
         return None
 
@@ -672,6 +742,56 @@ class ExclusionManager:
                     self.die_windows.setdefault(die,[]).append(w)
 
 # --------------------------------------------------------------------------
+# Latch Manager: READ.end_us ~ DOUT.end_us 동안 (die,plane) 래치 보존 락
+@dataclass
+class _Latch:
+    start_us: float
+    end_us: Optional[float]  # None -> open until DOUT end
+
+class LatchManager:
+    def __init__(self):
+        # (die, plane) -> _Latch
+        self._locks: Dict[Tuple[int,int], _Latch] = {}
+
+    def plan_lock_after_read(self, targets: List[Address], read_end_us: float):
+        for t in targets:
+            self._locks[(t.die, t.plane)] = _Latch(start_us=read_end_us, end_us=None)
+
+    def release_on_dout_end(self, targets: List[Address], now_us: float):
+        for t in targets:
+            key=(t.die, t.plane)
+            if key in self._locks:
+                del self._locks[key]
+
+    def _is_locked_at(self, die:int, plane:int, t0:float) -> bool:
+        lock = self._locks.get((die,plane))
+        if not lock: return False
+        if t0 < lock.start_us: return False
+        if lock.end_us is None: return True
+        return t0 < lock.end_us
+
+    def allowed(self, op: Operation, start_hint: float) -> bool:
+        # DOUT/SR allowed (does not corrupt latch)
+        if op.kind in (OpKind.DOUT, OpKind.SR):
+            return True
+        if op.kind not in (OpKind.READ, OpKind.PROGRAM, OpKind.ERASE):
+            return True
+
+        die = op.targets[0].die
+        scope = op.meta.get("scope", "PLANE_SET")
+
+        if scope == "DIE_WIDE":
+            for (d,p), _ in self._locks.items():
+                if d == die and self._is_locked_at(d, p, start_hint):
+                    return False
+            return True
+        else:
+            for t in op.targets:
+                if self._is_locked_at(t.die, t.plane, start_hint):
+                    return False
+            return True
+
+# --------------------------------------------------------------------------
 # Obligation Manager (with stats)
 @dataclass(order=True)
 class _ObHeapItem:
@@ -699,19 +819,44 @@ class ObligationManager:
         # READ completion -> create DOUT obligation(s)
         for spec in self.specs:
             if spec["issuer"] == op.kind.name:
-                self._seq += 1
+                # Bootstrap 체인으로 미리 생성된 DOUT과 중복 생성 방지 가드
+                if op.meta.get("source") == "bootstrap" or op.meta.get("skip_dout_creation"):
+                    continue
+
                 dt = sample_dist(spec["window_us"])
-                ob = Obligation(
-                    id=self._seq,
-                    require = OpKind[spec["require"]],
-                    targets = op.targets,  # plane-set op as one obligation
-                    deadline_us = quantize(now_us + dt),
-                    hard_slot = spec["priority_boost"].get("hard_slot", False),
-                )
-                heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=ob.id, ob=ob))
-                self.stats["created"] += 1
-                first=op.targets[0]
-                print(f"[{now_us:7.2f} us] OBLIG  created: {op.kind.name} -> {ob.require.name} by {ob.deadline_us:7.2f} us, target(d{first.die},p{first.plane})")
+                base_deadline = quantize(now_us + dt)
+                hard_slot = spec.get("priority_boost", {}).get("hard_slot", False)
+                plane_stagger = spec.get("priority_boost", {}).get("plane_stagger_us", 0.2)
+
+                # 멀티플레인 READ의 경우 plane 순서대로 DOUT을 분산 생성
+                if op.kind == OpKind.READ and len(op.targets) > 1:
+                    sorted_targets = sorted(op.targets, key=lambda a: a.plane)
+                    for idx, t in enumerate(sorted_targets):
+                        self._seq += 1
+                        ob = Obligation(
+                            id=self._seq,
+                            require=OpKind[spec["require"]],
+                            targets=[t],
+                            deadline_us=quantize(base_deadline + idx * plane_stagger),
+                            hard_slot=hard_slot,
+                        )
+                        heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=ob.id, ob=ob))
+                        self.stats["created"] += 1
+                        print(f"[{now_us:7.2f} us] OBLIG  created: READ -> {ob.require.name} by {ob.deadline_us:7.2f} us, target(d{t.die},p{t.plane})")
+                else:
+                    # 단일 plane 또는 비-READ 발행자의 경우 기존 방식 유지
+                    self._seq += 1
+                    ob = Obligation(
+                        id=self._seq,
+                        require=OpKind[spec["require"]],
+                        targets=op.targets,
+                        deadline_us=base_deadline,
+                        hard_slot=hard_slot,
+                    )
+                    heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=ob.id, ob=ob))
+                    self.stats["created"] += 1
+                    first = op.targets[0]
+                    print(f"[{now_us:7.2f} us] OBLIG  created: {op.kind.name} -> {ob.require.name} by {ob.deadline_us:7.2f} us, target(d{first.die},p{first.plane})")
 
     def pop_urgent(self, now_us: float, die:int, plane:int, horizon_us: float, earliest_start: float) -> Optional[Obligation]:
         if not self.heap: return None
@@ -740,6 +885,8 @@ class ObligationManager:
         self.stats["fulfilled"] += 1
         if now <= ob.deadline_us:
             self.stats["fulfilled_in_time"] += 1
+        else:
+            print(f"not_fulfilled: {ob.require.name} by {now:7.2f} us, deadline={ob.deadline_us:7.2f} us, target(d{ob.targets[0].die},p{ob.targets[0].plane})")
 
     def expire_due(self, now: float):
         kept=[]
@@ -749,11 +896,30 @@ class ObligationManager:
         self.stats["expired"] += expired
 
 # --------------------------------------------------------------------------
-# Policy Engine (phase-conditional + admission gating + backoff)
+# Policy Engine (phase-conditional + admission gating + backoff + latch check)
 class PolicyEngine:
-    def __init__(self, cfg, addr: AddressManager, obl: ObligationManager, excl: ExclusionManager):
+    def _reject(self, now_us: float, hook: PhaseHook, stage: str, reason: str,
+                attempted: Optional[str], alias: Optional[str],
+                fanout: Optional[int], plane_set: Optional[List[int]],
+                earliest_start: Optional[float], admission_delta: Optional[float],
+                detail: str = ""):
+        if self.rejlog is None:
+            return
+        self.rejlog.log_reject(RejectEvent(
+            now_us=now_us, die=hook.die, plane=hook.plane, hook=hook.label,
+            stage=stage, attempted=attempted, alias=alias, fanout=fanout,
+            plane_set=(str(sorted(plane_set)) if plane_set is not None else None),
+            reason=reason, detail=detail,
+            earliest_start=earliest_start, admission_delta=admission_delta
+        ))
+
+    def __init__(self, cfg, addr: AddressManager, obl: ObligationManager, excl: ExclusionManager,
+                 rejlog: Optional[RejectionLogger] = None,
+                 latch: Optional[LatchManager] = None):
         self.cfg=cfg; self.addr=addr; self.obl=obl; self.excl=excl
         self.stats={"alias_degrade":0}
+        self.rejlog = rejlog or RejectionLogger()
+        self.latch = latch or LatchManager()
 
     def _score(self, op_name: str, phase_label: str, g: Dict[str,str], l: Dict[str,str]) -> float:
         w=self.cfg["weights"]["base"]["host"].get(op_name,0.0)
@@ -774,11 +940,10 @@ class PolicyEngine:
             elif mode=="ge": fanout=max(fanout,val)
         return max(1,fanout), interleave
 
-    def _exclusion_ok(self, op: Operation, die:int, plane_set: List[int], start_hint: float) -> bool:
-        scope = Scope[op.meta["scope"]]
-        start = self.addr.earliest_start_for_scope(die, scope, plane_set)
-        dur = get_op_duration(op); end=quantize(start+dur)
-        return self.excl.allowed(op, start, end)
+    def _exclusion_ok(self, op: Operation, start_hint: float) -> bool:
+        dur = get_op_duration(op)
+        end = quantize(start_hint + dur)
+        return self.excl.allowed(op, start_hint, end)
 
     def _admission_ok(self, now_us: float, hook_label: str, kind_name: str, start_hint: float, deadline: Optional[float]=None) -> bool:
         adm = self.cfg.get("admission", {})
@@ -790,7 +955,9 @@ class PolicyEngine:
     def propose(self, now_us: float, hook: PhaseHook, g: Dict[str,str], l: Dict[str,str], earliest_start: float) -> Optional[Operation]:
         die, hook_plane = hook.die, hook.plane
 
-        # 0) obligations first (with optional admission bypass)
+        # 0) obligations first
+        stage = "obligation"
+        self.rejlog.log_attempt(stage)
         ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=10.0, earliest_start=earliest_start)
         if ob:
             cfg_op=self.cfg["op_specs"][ob.require.name]
@@ -798,78 +965,83 @@ class PolicyEngine:
             op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=sorted({a.plane for a in ob.targets}); op.meta["arity"]=len(op.meta["plane_list"])
             op.meta["obligation"]=ob
             scope=Scope[op.meta["scope"]]; plane_set=op.meta["plane_list"]
-            start_hint=self.addr.earliest_start_for_scope(die, scope, plane_set)
-            # admission bypass?
+            start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+
             bypass = self.cfg.get("admission",{}).get("obligation_bypass",True)
+            admission_delta = (None if bypass else get_admission_delta(self.cfg, hook.label, ob.require.name))
             admission_ok = True if bypass else self._admission_ok(now_us, hook.label, ob.require.name, start_hint, ob.deadline_us)
-            if admission_ok and \
-               self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope) and \
-               self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)) and \
-               self._exclusion_ok(op, die, plane_set, start_hint):
+
+            if not admission_ok:
+                self._reject(now_us, hook, stage, "admission", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "deadline_window")
+            elif not self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope):
+                self._reject(now_us, hook, stage, "precheck", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "addr/precheck")
+            elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
+                self._reject(now_us, hook, stage, "bus", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "bus_conflict")
+            elif not self.latch.allowed(op, start_hint):
+                self._reject(now_us, hook, stage, "latch", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "read->dout plane latched")
+            elif not self._exclusion_ok(op, start_hint):
+                self._reject(now_us, hook, stage, "excl", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "exclusion_window")
+            else:
+                # ACCEPT
+                self.rejlog.log_accept(stage)
                 op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"
                 return op
-            # else: fallthrough to policy
+        else:
+            # no obligation
+            self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_obligation")
 
-        # 1) phase-conditional (alias keys allowed + SR)
+        # 1) phase-conditional
+        stage = "phase_conditional"
+        self.rejlog.log_attempt(stage)
         allow=set(list(OP_ALIAS.keys())+["READ","PROGRAM","ERASE","SR"])
         dist, used_key = get_phase_dist(self.cfg, hook.label)
-        if dist:
+        if not dist:
+            self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_dist_for_hook")
+        else:
             pick=roulette_pick(dist, allow)
-            if pick:
+            if not pick:
+                self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "roulette_zero_weight")
+            else:
                 base, alias_const = resolve_alias(pick)
                 kind=OpKind[base]
-                # plan
                 if kind==OpKind.SR:
                     plan=self.addr.plan_multipane(kind, die, hook_plane, 1, True)
+                    fanout=1; alias_used="SR"
                 else:
                     fanout, interleave=self._fanout_from_alias(base, alias_const, hook.label)
                     plan=self.addr.plan_multipane(kind, die, hook_plane, fanout, interleave)
+                    alias_used=pick
                     if not plan and fanout>1:
                         self.stats["alias_degrade"]+=1
                         plan=self.addr.plan_multipane(kind, die, hook_plane, 1, interleave)
-                if plan:
+                        if plan: fanout=1
+                if not plan:
+                    self._reject(now_us, hook, stage, "plan_none", base, alias_used, fanout, None, earliest_start, None, "no_targets")
+                else:
                     targets, plane_set, scope=plan
                     cfg_op=self.cfg["op_specs"][base]; op=build_operation(kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=pick
-                    start_hint=self.addr.earliest_start_for_scope(die, scope, plane_set)
-                    # admission gating: near-future only
-                    if not self._admission_ok(now_us, hook.label, base, start_hint):
-                        return None
-                    if self.addr.precheck_planescope(kind, targets, start_hint, scope) and \
-                       self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)) and \
-                       self._exclusion_ok(op, die, plane_set, start_hint):
-                        op.meta["source"]="policy.phase_conditional"; op.meta["phase_key_used"]=used_key; return op
-            # else fallthrough to backoff
+                    start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+                    adm_ok=self._admission_ok(now_us, hook.label, base, start_hint)
+                    adm_delta=get_admission_delta(self.cfg, hook.label, base)
+                    if not adm_ok:
+                        self._reject(now_us, hook, stage, "admission", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "near_future_gate")
+                    elif not self.addr.precheck_planescope(kind, targets, start_hint, scope):
+                        self._reject(now_us, hook, stage, "precheck", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "addr/precheck")
+                    elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
+                        self._reject(now_us, hook, stage, "bus", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "bus_conflict")
+                    elif not self.latch.allowed(op, start_hint):
+                        self._reject(now_us, hook, stage, "latch", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "read->dout plane latched")
+                    elif not self._exclusion_ok(op, start_hint):
+                        self._reject(now_us, hook, stage, "excl", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "exclusion_window")
+                    else:
+                        # ACCEPT
+                        self.rejlog.log_accept(stage)
+                        op.meta["source"]="policy.phase_conditional"; op.meta["phase_key_used"]=used_key
+                        return op
 
-        # 2) backoff (READ/PROGRAM/ERASE/SR)
-        cand=[]
-        for name in ["READ","PROGRAM","ERASE","SR"]:
-            s=self._score(name, hook.label, g, l)
-            if s>0: cand.append((name,s))
-        if not cand: return None
-        tot=sum(s for _,s in cand); r=random.random()*tot; acc=0.0; pick=cand[-1][0]
-        for name,s in cand:
-            acc+=s
-            if r<=acc: pick=name; break
-        kind=OpKind[pick]
-        if kind==OpKind.SR:
-            plan=self.addr.plan_multipane(kind, die, hook_plane, 1, True)
-        else:
-            fanout, interleave=get_phase_selection_override(self.cfg, hook.label, pick)
-            plan=self.addr.plan_multipane(kind, die, hook_plane, fanout, interleave)
-        if not plan: return None
-        targets, plane_set, scope=plan
-        cfg_op=self.cfg["op_specs"][pick]; op=build_operation(kind, cfg_op, targets)
-        op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set)
-        start_hint=self.addr.earliest_start_for_scope(die, scope, plane_set)
-        # admission gating
-        if not self._admission_ok(now_us, hook.label, pick, start_hint):
-            return None
-        if not (self.addr.precheck_planescope(kind, targets, start_hint, scope) and \
-                self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)) and \
-                self._exclusion_ok(op, die, plane_set, start_hint)):
-            return None
-        op.meta["source"]="policy.score_backoff"; op.meta["phase_key_used"]="(score_backoff)"; return op
+        # backoff 단계 제거됨 (충돌 정합성 해소 계획에 따라 비활성화)
+        return None
 
 # --------------------------------------------------------------------------
 # Selection overrides
@@ -887,15 +1059,17 @@ def get_phase_selection_override(cfg: Dict[str,Any], hook_label: str, kind_name:
     return int(dflt.get("fanout",1)), bool(dflt.get("interleave",True))
 
 # --------------------------------------------------------------------------
-# Scheduler
 def _addr_str(a: Address)->str: return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
 
 class Scheduler:
-    def __init__(self, cfg, addr, spe, obl, excl, logger: Optional[TimelineLogger]=None):
+    def __init__(self, cfg, addr:AddressManager, spe:PolicyEngine, obl:ObligationManager,
+                 excl:ExclusionManager, logger: Optional[TimelineLogger]=None,
+                 latch: Optional[LatchManager]=None):
         self.cfg=cfg; self.addr=addr; self.SPE=spe; self.obl=obl; self.excl=excl
         self.now=0.0; self.ev=[]; self._seq=0
         self.stat_propose_calls=0; self.stat_scheduled=0
         self.logger = logger or TimelineLogger()
+        self.latch = latch or LatchManager()
         self._push(0.0, "QUEUE_REFILL", None)
         for plane in range(self.addr.planes):
             self._push(0.0, "PHASE_HOOK", PhaseHook(0.0, "BOOT.START", 0, plane))
@@ -911,7 +1085,6 @@ class Scheduler:
         return quantize(max(self.now, t_planes))
 
     def _label_for_read(self, op: Operation)->str:
-        # Generalized: return alias-like full label for multi/single plane
         arity = op.meta.get("arity", 1)
         if op.kind == OpKind.READ:
             return "MUL_READ" if arity>1 else "SIN_READ"
@@ -923,11 +1096,29 @@ class Scheduler:
 
     def _schedule_operation(self, op: Operation):
         start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
+
+        # ---- fail-safe: schedule 직전 마지막 충돌 점검 ----
+        segs = self.addr.bus_segments_for_op(op)
+        if not self.addr.bus_precheck(start, segs):
+            print(f"[WARN] BUS conflict at schedule-time: {op.kind.name} start={start:.2f} end={end:.2f}")
+            return
+        if not self.latch.allowed(op, start):
+            print(f"[WARN] LATCH conflict at schedule-time: {op.kind.name} start={start:.2f} end={end:.2f}")
+            return
+        if not self.excl.allowed(op, start, end):
+            print(f"[WARN] EXCLUSION conflict at schedule-time: {op.kind.name} start={start:.2f} end={end:.2f}")
+            return
+        # -----------------------------------------------
+
         # reserve plane scope + bus + register exclusions + future update
         self.addr.reserve_planescope(op, start, end)
         self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
         self.excl.register(op, start)
         self.addr.register_future(op, start, end)
+        # latch: if READ, plan lock from READ.end_us until DOUT ends
+        if op.kind == OpKind.READ:
+            self.latch.plan_lock_after_read(op.targets, end)
+
         # assign deterministic op uid (per scheduled op)
         if "uid" not in op.meta:
             op.meta["uid"] = self.stat_scheduled + 1
@@ -941,7 +1132,7 @@ class Scheduler:
         # push events
         self._push(start, "OP_START", op); self._push(end, "OP_END", op)
 
-        # hooks (READ → SIN_READ/MUL_READ label)
+        # hooks
         label_op=self._label_for_read(op)
         for t in op.targets:
             cur=start
@@ -972,7 +1163,8 @@ class Scheduler:
 
             elif typ=="PHASE_HOOK":
                 hook: PhaseHook = payload
-                earliest_start=self.addr.available_at(hook.die, hook.plane)
+                # 의무 선택의 타당성 판단을 위해 now를 고려
+                earliest_start = max(self.now, self.addr.available_at(hook.die, hook.plane))
                 g,l=self.addr.observe_states(hook.die, hook.plane, self.now)
                 self.stat_propose_calls+=1
                 op=self.SPE.propose(self.now, hook, g, l, earliest_start)
@@ -986,6 +1178,9 @@ class Scheduler:
                 op: Operation=payload; first=op.targets[0]
                 print(f"[{self.now:7.2f} us] END    {op.kind.name:7s} arity={op.meta.get('arity')} target={_addr_str(first)}")
                 self.addr.commit(op)
+                # DOUT 종료 시 래치 해제
+                if op.kind == OpKind.DOUT:
+                    self.latch.release_on_dout_end(op.targets, self.now)
                 # obligation fulfillment stats
                 if "obligation" in op.meta:
                     self.obl.mark_fulfilled(op.meta["obligation"], self.now)
@@ -1007,11 +1202,14 @@ def main():
     # 1) 구성
     _seed_rng_from_cfg(CFG)
     _coerce_states_to_fixed(CFG)
+    _validate_phase_conditional_cfg(CFG)
     logger = TimelineLogger()
+    rejlog = RejectionLogger()
     addr = AddressManager(CFG); excl = ExclusionManager(CFG)
     obl  = ObligationManager(CFG["obligations"])
-    spe  = PolicyEngine(CFG, addr, obl, excl)
-    sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger)
+    latch = LatchManager()
+    spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch)
+    sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger, latch=latch)
 
     # 2) 실행
     sch.run_until(CFG["policy"]["run_until_us"])
@@ -1026,11 +1224,24 @@ def main():
     viol_df = violations_to_dataframe(report)
     viol_df.to_csv("nand_violations.csv", index=False)
 
+    # 4.5) Rejection log
+    try:
+        rejlog.to_csv("reject_log.csv")
+        print("\n=== Rejection Summary (by stage/reason) ===")
+        for stage, d in rejlog.stats.items():
+            total = sum(d.values())
+            acc   = rejlog.stage_accepts.get(stage, 0)
+            att   = rejlog.stage_attempts.get(stage, 0)
+            print(f"- {stage:18s}: attempts={att} accepts={acc} rejects={total}")
+            for reason, cnt in sorted(d.items(), key=lambda x: -x[1])[:8]:
+                print(f"    {reason:14s}: {cnt}")
+    except Exception as e:
+        print(f"[REJLOG] skipped: {e}")
+
     # 5) 시각화
     plot_gantt_by_die(df)  # 모든 die별로 개별 그림
-
     plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
-                                    z_mode="global_die", draw_lines=True)
+                                       z_mode="global_die", draw_lines=True)
 
 if __name__=="__main__":
     main()
