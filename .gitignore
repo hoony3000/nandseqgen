@@ -13,6 +13,9 @@ lib64
 pyvenv.cfg
 run_*
 hash_*
-nand_timeline.csv
-nand_violations.csv
-reject_log.csv
+nand_*.csv
+reject_*.csv
+stage_stats.csv
+obligation*.csv
+run*.log
+output.txt

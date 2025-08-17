@@ -218,3 +218,101 @@
   - `PolicyEngine._score` 에서 가중치 적용: `weights.g_state.*`(pgmable/readable) × `weights.g_local.plane_busy_frac.*`.
 - **die 차원**:
   - 인터페이스는 die/plane 인자를 받지만, 현재 이벤트/스케줄은 단일 die(0)에서 생성된다. 따라서 계산은 실질적으로 die 0의 각 plane 레벨에서 수행된다(설계상 다중 die 확장 가능).
+
+---
+
+## 16) pop_urgent에서 obligation 선택 로직
+
+- 입력/우선순위:
+  - 입력: `now_us`, `die`, `plane`, `horizon_us`, `earliest_start`
+  - 힙 정렬: `deadline_us` 1순위, 동일 시 `seq` 2순위(`_ObHeapItem(deadline_us, seq, ob)`)
+
+- 선택 조건(AND):
+  - `same_die`: `ob.targets[0].die == die`
+  - `same_plane`: `plane ∈ {a.plane for a in ob.targets}`
+  - `in_horizon`: `(ob.deadline_us - now_us) ≤ max(horizon_us, 0)` 또는 `hard_slot == True`
+  - `feasible`: `earliest_start ≤ ob.deadline_us`
+
+- 절차:
+  1) 현재 힙의 최상단(가장 이른 `deadline_us`)부터 항목을 꺼내 위 조건을 검사
+  2) 조건 만족 시 해당 `obligation`을 선택(CHOOSE)하고 루프 종료
+  3) 조건 불만족 시 임시 목록(kept)에 보관(SKIP) 후 다음 항목 검사
+  4) 루프 종료 후 kept 항목 전부를 다시 힙에 되돌려 push
+  5) 반환값: 선택된 `obligation`(없으면 `None`)
+
+- 시간/정밀도 처리:
+  - 비교 전 `now_us`, `earliest_start`는 시뮬레이션 해상도로 `quantize` 되어 비교된다
+
+- 생성 시점 특성(멀티플레인 READ→DOUT):
+  - 멀티플레인 READ 완료 시, 각 plane별 DOUT 의무는 `plane_stagger_us` 만큼 `deadline_us`를 계단식으로 늘려 생성되므로, 힙에서 plane 오름차순으로 자연스러운 순차 선택이 유도된다
+
+- 선택 이후:
+  - 스케줄 승인 시 `mark_assigned(ob)` → 완료 시 `mark_fulfilled(ob, now)` 로 통계가 집계된다(힙에서는 선택 시점에 제거됨)
+
+---
+
+## 17) none_available 발생 경로(의미와 원인)
+
+none_available은 유효성 게이트(precheck/bus/latch/excl) 실패가 아니라, “해당 훅 시점에 선택할 후보가 없음”을 의미한다. 따라서 계획(populate)과 유효성(validity)이 옳더라도, 훅 타이밍/plane 매칭/가시 창(horizon) 등의 이유로 정상적으로 발생할 수 있다.
+
+- 의무 단계(`stage = obligation`)에서의 원인:
+  - 힙 비어 있음: `ObligationManager.heap`에 의무가 없음
+  - plane 불일치: 현재 훅 `hook_plane`이 `ob.targets`의 plane 집합에 포함되지 않아 `same_plane=False`
+  - 시간창 미충족: `(deadline_us - now_us) > horizon_us`이고 `hard_slot=False` → `in_horizon=False`
+  - 실행 불가능: `earliest_start > deadline_us` → `feasible=False`
+  - (다중 die 환경) die 불일치: `same_die=False`
+
+- 정책 단계(`stage = phase_conditional`)에서의 원인:
+  - 분포 없음: `get_phase_dist(hook.label)`이 훅에 대한 분포를 찾지 못함
+  - 가중 0: 필터링 이후 전체 가중치가 0이 되어 `roulette_pick`이 후보를 뽑지 못함
+  - 타깃 없음: `plan_multipane`이 타깃을 만들지 못함
+    - READ: 각 plane의 커밋 페이지 교집합이 비어 있음
+    - PROGRAM: 선택 page에 대해 일부 plane에서 가능한 블록을 찾지 못함(최빈값/0 후보 모두 실패)
+    - ERASE: 비소거 블록 찾기 실패(이론상 드뭄), 또는 내부 정책 상 다른 이유로 None
+    - alias 강등(degrade) 후에도 단일화 실패
+
+참고:
+- 위 원인들은 유효성 게이트(`precheck_planescope`/`bus_precheck`/`LatchManager.allowed`/`_exclusion_ok`) 이전 단계에서 발생하며, 해당 게이트 실패 시에는 각각 `precheck`/`bus`/`latch`/`excl`로 사유가 기록된다(§3 참조).
+- 부트스트랩이 멀티플레인 체인으로 계획되더라도, 훅은 plane 단위로 도착하므로 다른 plane에 속한 의무는 그 훅에서는 “없음”(none_available)으로 기록될 수 있다. 이는 정상 동작이며, 매칭되는 plane의 훅에서 소비된다.
+
+---
+
+## 18) Bootstrap
+
+- 목적
+  - 초기 상태에서 READ/PROGRAM/ERASE/DOUT 경로를 강제 워밍업해 의무 생성·소모 경로를 검증
+  - Exit 이후 정책(phase-conditional)으로 자연스럽게 전환되도록 안전한 backlog 구성
+
+- 생성 과정
+  - 함수: `populate_bootstrap_obligations(cfg, addr, obl)`
+  - 페이지 수: `k = floor(pages_per_block × clamp(pgm_ratio, 0..max_ratio))`
+  - 스트라이프 순회: 모든 plane을 한 묶음으로 하는 block stripes 단위 순서대로 진행
+  - p=0에서 ERASE(die-wide) 생성 → 이후 p마다 PROGRAM(die-wide) → READ(multi-plane) → DOUT(plane별) 의무 생성
+  - 마감 산정: `deadline_window_us` + `stage_gap_us`/`stagger_us` + 의존성 여유(eps: PROGRAM 2.0us, READ 2.0us, order 0.2us 상수화)
+  - DOUT 분산: `dout_stagger_n`(× DOUT_nominal) 또는 `stagger_us` 중 큰 값으로 plane별 deadline 계단화
+  - 메타: `source="bootstrap"`, READ 의무는 `skip_dout_creation=True`로 on_commit 중복 방지
+  - 로깅: 생성 이벤트는 `obligation_creations.csv`로 저장(Stripe/Page/Plane 등 포함)
+
+- 실행 옵션들
+  - CFG.bootstrap
+    - `enabled: bool`(on/off)
+    - `pgm_ratio: float`, `max_ratio: float`
+    - `deadline_window_us: float`, `stage_gap_us: float`, `stagger_us: float`
+    - `hard_slot: bool`(의무 하드 슬롯)
+    - `dout_stagger_n: float`(0이면 미사용)
+    - `disable_timeline_logging: bool`(부트스트랩 동안 타임라인 로깅 비활성)
+    - `split_timeline_logging: bool` + `bootstrap_timeline_path`, `policy_timeline_path`(분리 저장)
+  - 러닝타임 산식(코드 반영):
+    - `run_until_base = policy.run_until_us`
+    - `run_until_bootstrap = quantize(last_deadline_boot + num_bootstrap_obligations × policy.run_until_bootstrap_margin_per_ob_us)`
+    - `run_until_tot = run_until_base + run_until_bootstrap`
+    - 기본 `policy.run_until_bootstrap_margin_per_ob_us = 3.0`
+  - 정책 가드: 부트스트랩 의무가 남아 있는 동안 `PolicyEngine.propose`는 정책 제안을 스킵(안전 전환)
+
+- pitballs
+  - 러닝타임 부족: `run_until_us`만 사용하면 drain 전 종료될 수 있음 → 위 산식으로 `run_until_tot` 보장
+  - 충돌 밀집: DOUT/READ가 빽빽하면 `DOUT_OVERLAP` 검출 증가 → `dout_stagger_n`/`stagger_us`/`stage_gap_us`로 완화
+  - 과도한 `pgm_ratio`: 힙/CSV가 매우 커지고 실행시간 증가 → `max_ratio`로 상한, 단계적 실험 권장
+  - Admission 간섭: 의무는 `obligation_bypass=True` 유지(near-future 게이트로 막히지 않도록)
+  - 로깅/시각화: `disable_timeline_logging=True`면 단일 df가 비어 플롯 오류 가능 → `split_timeline_logging=True`로 부트스트랩/정책 분리 저장·시각화 권장
+  - 제약 구성: DOUT 전역 배제창 제거 시 버스/래치만으로도 충분하나, 워크로드에 따라 `soft_defer/bus` 증가 가능 → 스태거/간격 조정 필요

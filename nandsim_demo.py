@@ -95,6 +95,11 @@ CFG = {
         "queue_refill_period_us": 50.0,
         "run_until_us": 10000.0,
         "planner_max_tries": 8,
+        "global_nudge_period_us": 20.0,
+        "easing_hookscreen": {"enable": True, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 2},
+        # bootstrap 러닝타임 여유 = last_deadline_boot + margin_per_ob * num_bootstrap_obligations
+        "run_until_bootstrap_margin_per_ob_us": 3.0,
+        "enable_phase_conditional": True,
     },
 
     # Admission gating (near-future only to prevent policy explosion)
@@ -203,8 +208,7 @@ CFG = {
             {"when": {"op": "READ", "alias": "SIN", "states": ["CORE_BUSY"]}, "scope": "DIE",
              "blocks": ["ALIAS:MUL_READ", "BASE:PROGRAM", "BASE:ERASE"]},
 
-            # DOUT: freeze all ops globally across its full duration
-            {"when": {"op": "DOUT", "states": ["*"]}, "scope": "GLOBAL", "blocks": ["ANY"]},
+            # DOUT 전역 배제창 제거: 버스/래치 검사만으로 충분
         ]
     },
 
@@ -215,7 +219,7 @@ CFG = {
             "require": "DOUT",
             # "window_us": {"kind": "normal", "mean": 6.0, "std": 1.5, "min": 3.0},
             "window_us": {"kind": "fixed", "value": 20.0},
-            "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True},
+            "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True, "plane_stagger_us": 0.2},
         }
     ],
 
@@ -231,6 +235,22 @@ CFG = {
 
     # Address initial state: -1=ERASED, -2=initial(not erased)
     "address_init_state": -1,
+
+    # Bootstrap (disabled by default)
+    "bootstrap": {
+        "enabled": False,
+        "pgm_ratio": 0.2,
+        "deadline_window_us": 50.0,
+        "stage_gap_us": 0.2,
+        "stagger_us": 0.5,
+        "hard_slot": True,
+        "max_ratio": 0.5,
+        "dout_stagger_n": 0.0,
+        "disable_timeline_logging": False,
+        "split_timeline_logging": False,
+        "bootstrap_timeline_path": "nand_timeline_bootstrap.csv",
+        "policy_timeline_path": "nand_timeline_policy.csv"
+    },
 }
 
 # --------------------------------------------------------------------------
@@ -293,6 +313,7 @@ class RejectEvent:
     detail: str                # free-form short note
     earliest_start: Optional[float] = None
     admission_delta: Optional[float] = None
+    ob_id: Optional[int] = None
 
 class RejectionLogger:
     def __init__(self):
@@ -321,7 +342,7 @@ class RejectionLogger:
                 f,
                 fieldnames=[ "now_us","die","plane","hook","stage","attempted","alias",
                              "fanout","plane_set","reason","detail",
-                             "earliest_start","admission_delta" ]
+                             "earliest_start","admission_delta","ob_id" ]
             )
             w.writeheader()
             for r in self.rows:
@@ -339,8 +360,131 @@ class RejectionLogger:
                     "detail": r.detail,
                     "earliest_start": r.earliest_start,
                     "admission_delta": r.admission_delta,
+                    "ob_id": r.ob_id,
                 })
 
+    def to_summary_csv(self, path: str = "reject_summary.csv", top_n: int = 10):
+        if not self.rows:
+            return
+        # stage/reason counts
+        stage_reason = []
+        for stage, d in self.stats.items():
+            for reason, cnt in d.items():
+                stage_reason.append((stage, reason, cnt))
+        stage_reason.sort(key=lambda x: -x[2])
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["stage", "reason", "count"]) 
+            for stage, reason, cnt in stage_reason[:top_n]:
+                w.writerow([stage, reason, cnt])
+        # attempts/accepts dump
+        with open("stage_stats.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["stage", "attempts", "accepts"]) 
+            stages = set(list(self.stage_attempts.keys()) + list(self.stage_accepts.keys()))
+            for st in sorted(stages):
+                w.writerow([st, self.stage_attempts.get(st, 0), self.stage_accepts.get(st, 0)])
+
+    def to_obligation_skips_csv(self, path: str = "obligation_skips.csv"):
+        if not self.rows:
+            return
+        # filter only obligation-stage soft_defer*
+        filtered = [r for r in self.rows if (r.stage == "obligation" and isinstance(r.reason, str) and r.reason.startswith("soft_defer/"))]
+        if not filtered:
+            # still create an empty header file for review convenience
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["now_us","die","plane","hook","reason","attempted","alias","fanout","plane_set","earliest_start","admission_delta","detail","ob_id"])
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["now_us","die","plane","hook","reason","attempted","alias","fanout","plane_set","earliest_start","admission_delta","detail","ob_id"])
+            for r in filtered:
+                w.writerow([
+                    r.now_us,
+                    r.die,
+                    r.plane,
+                    r.hook,
+                    r.reason,
+                    r.attempted,
+                    r.alias,
+                    r.fanout,
+                    r.plane_set,
+                    r.earliest_start,
+                    r.admission_delta,
+                    r.detail,
+                    r.ob_id,
+                ])
+
+# --------------------------------------------------------------------------
+# Obligation creation logger
+@dataclass
+class CreateEvent:
+    id: int
+    require: str
+    source: Optional[str]
+    die: int
+    planes: List[int]
+    blocks: List[int]
+    pages: List[int]
+    deadline_us: float
+    hard_slot: bool
+    arity: int
+    context: str
+    stripe: Optional[int] = None
+    page_index: Optional[int] = None
+    created_at_us: Optional[float] = None
+
+class CreationLogger:
+    def __init__(self):
+        self.rows: List[CreateEvent] = []
+
+    def log(self, ob: "Obligation", context: str, stripe: Optional[int]=None, page_index: Optional[int]=None, created_at_us: Optional[float]=None):
+        planes = sorted({t.plane for t in ob.targets})
+        blocks = sorted({t.block for t in ob.targets})
+        pages  = sorted({t.page for t in ob.targets if t.page is not None})
+        die = ob.targets[0].die if ob.targets else -1
+        ev = CreateEvent(
+            id=ob.id,
+            require=ob.require.name,
+            source=getattr(ob, "source", None),
+            die=die,
+            planes=planes,
+            blocks=blocks,
+            pages=pages,
+            deadline_us=ob.deadline_us,
+            hard_slot=ob.hard_slot,
+            arity=len(planes),
+            context=context,
+            stripe=stripe,
+            page_index=page_index,
+            created_at_us=created_at_us,
+        )
+        self.rows.append(ev)
+
+    def to_csv(self, path: str = "obligation_creations.csv"):
+        if not self.rows:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["id","require","source","die","planes","blocks","pages","deadline_us","hard_slot","arity","context","stripe","page_index","created_at_us"])
+            for r in self.rows:
+                w.writerow([
+                    r.id,
+                    r.require,
+                    r.source,
+                    r.die,
+                    ":".join(map(str,r.planes)),
+                    ":".join(map(str,r.blocks)),
+                    ":".join(map(str,r.pages)),
+                    r.deadline_us,
+                    int(r.hard_slot),
+                    r.arity,
+                    r.context,
+                    r.stripe,
+                    r.page_index,
+                    r.created_at_us,
+                ])
 # --------------------------------------------------------------------------
 # Utils
 def sample_dist(d: Dict[str, Any]) -> float:
@@ -399,6 +543,16 @@ def build_operation(kind: OpKind, cfg_op: Dict[str, Any], targets: List[Address]
 
 def get_op_duration(op: Operation) -> float:
     return sum(seg.dur_us for seg in op.states)
+
+def get_kind_nominal_duration(cfg: Dict[str,Any], kind_name: str) -> float:
+    """Sum of nominal state durations for an op kind from cfg.op_specs (assumes fixed)."""
+    spec = cfg.get("op_specs", {}).get(kind_name, {})
+    total = 0.0
+    for st in spec.get("states", []):
+        dist = st.get("dist", {})
+        # _coerce_states_to_fixed ensures fixed value is present
+        total += float(dist.get("value", 0.0))
+    return total
 
 # --------------------------------------------------------------------------
 # Address & Bus Managers (with block/plane redefinition + state rails)
@@ -615,19 +769,33 @@ class AddressManager:
         else: planes={(targets[0].die, targets[0].plane)}
         for (d,p) in planes:
             for (s,e,_) in self.resv[(d,p)]:
-                if not (end_hint<=s or e<=start_hint): return False
+                if not (end_hint<=s or e<=start_hint):
+                    print(f"[PRECCHK] time_overlap d={d} p={p} start={start_hint:.2f} overlaps=({s:.2f},{e:.2f}) scope={scope.name}")
+                    return False
         # address/plane consistency + rules
         for t in targets:
-            if t.plane != (t.block % self.planes): return False  # consistency
+            if t.plane != (t.block % self.planes):
+                print(f"[PRECCHK] plane_consistency die={t.die} plane={t.plane} block={t.block} expected={t.block % self.planes}")
+                return False
             com=self.addr_state_committed[(t.die,t.block)]
             fut=self.addr_state_future[(t.die,t.block)]
             if kind==OpKind.PROGRAM:
-                if t.page is None: return False
-                if t.page != fut + 1: return False
-                if t.page >= self.pages_per_block: return False
+                if t.page is None:
+                    print(f"[PRECCHK] program_page_none die={t.die} block={t.block}")
+                    return False
+                if t.page != fut + 1:
+                    print(f"[PRECCHK] program_seq die={t.die} block={t.block} want={fut+1} got={t.page} fut={fut} com={com}")
+                    return False
+                if t.page >= self.pages_per_block:
+                    print(f"[PRECCHK] program_oob die={t.die} block={t.block} page={t.page} pages_per_block={self.pages_per_block}")
+                    return False
             elif kind==OpKind.READ:
-                if t.page is None: return False
-                if (t.block, t.page) not in self.programmed_committed[(t.die,)]: return False
+                if t.page is None:
+                    print(f"[PRECCHK] read_page_none die={t.die} block={t.block}")
+                    return False
+                if (t.block, t.page) not in self.programmed_committed[(t.die,)]:
+                    print(f"[PRECCHK] read_not_committed die={t.die} block={t.block} page={t.page} com={com}")
+                    return False
             elif kind==OpKind.ERASE:
                 pass
         return True
@@ -806,14 +974,150 @@ class Obligation:
     targets: List[Address]
     deadline_us: float
     hard_slot: bool
+    # bootstrap/flags
+    source: Optional[str] = None
+    skip_dout_creation: bool = False
 
 class ObligationManager:
-    def __init__(self, cfg_list: List[Dict[str,Any]]):
+    def __init__(self, cfg_list: List[Dict[str,Any]], cfg_root: Optional[Dict[str,Any]] = None):
         self.specs = cfg_list
+        self.cfg_root = cfg_root
         self.heap: List[_ObHeapItem] = []
         self._seq = 0
         self.assigned: Dict[int, Obligation] = {}
-        self.stats = {"created":0, "assigned":0, "fulfilled":0, "fulfilled_in_time":0, "expired":0}
+        self.stats = {
+            "created":0,
+            "assigned":0,
+            "fulfilled":0,
+            "fulfilled_in_time":0,
+            "expired":0,
+            # pop_urgent diagnostics
+            "pop_calls":0,
+            "pop_examined":0,
+            "pop_kept":0,
+            "pop_chosen":0,
+            "pop_returned":0,
+            # chosen but rejected in propose (consumed)
+            "dropped":0,
+            # extensions/requeues
+            "extended_cycles":0,
+            "extended_total":0,
+            "requeued":0,
+        }
+        self.debug = False
+        self._last_audit_lost = 0
+        self.assert_on_inversion = bool((cfg_root or {}).get("policy", {}).get("audit_assert_on_inversion", False))
+        # audit to file support
+        self.audit_file_path: Optional[str] = None
+        self._audit_file_initialized: bool = False
+
+    def set_audit_file(self, path: str):
+        """Enable audit CSV writing; overwrites the file with header."""
+        self.audit_file_path = path
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["time_us","where","created","fulfilled","live","heap","assigned","lost"]) 
+            self._audit_file_initialized = True
+        except Exception:
+            self.audit_file_path = None
+            self._audit_file_initialized = False
+
+    def _page_index_of_ob(self, ob: Obligation) -> int:
+        try:
+            if ob.require in (OpKind.PROGRAM, OpKind.READ):
+                # multi-plane, same page index
+                pages = [t.page for t in ob.targets if t.page is not None]
+                return int(pages[0]) if pages else -1
+            elif ob.require in (OpKind.ERASE, OpKind.DOUT):
+                return int(ob.targets[0].page or 0)
+        except Exception:
+            return -1
+        return -1
+
+    def _log_inversion_check(self, ob: Obligation, where: str):
+        # backwards-compat single-group check routed to full audit
+        self.audit_order_all(where)
+
+    def audit_order_all(self, where: str):
+        # group by (require, die, source)
+        groups: Dict[Tuple[str,int,Optional[str]], List[Tuple[int,int,float]]] = {}
+        for it in self.heap:
+            o = it.ob
+            key = (o.require.name, o.targets[0].die, getattr(o, "source", None))
+            groups.setdefault(key, []).append((o.id, self._page_index_of_ob(o), o.deadline_us))
+        any_inv = False
+        for (req_name, die, src), items in groups.items():
+            items_sorted = sorted(items, key=lambda x: (x[1], x[2]))
+            inv = []
+            for i in range(len(items_sorted)):
+                for j in range(i+1, len(items_sorted)):
+                    id_i, p_i, dl_i = items_sorted[i]
+                    id_j, p_j, dl_j = items_sorted[j]
+                    if p_i < p_j and dl_i > dl_j:
+                        inv.append(((id_i, p_i, dl_i), (id_j, p_j, dl_j)))
+            if self.debug:
+                print(f"[OBLIGAUD] order_check where={where} require={req_name} die={die} src={src} pages_deadlines={[(p, round(d,2)) for _,p,d in items_sorted]}")
+                if inv:
+                    print(f"[OBLIGAUD] INVERSION DETECTED where={where} require={req_name} die={die} src={src} inv={inv}")
+            if inv:
+                any_inv = True
+        if any_inv and self.assert_on_inversion:
+            raise AssertionError(f"Obligation deadline inversion detected at {where}")
+
+    def audit(self, now_us: float, where: str):
+        total_created = self.stats.get("created", 0)
+        total_fulfilled = self.stats.get("fulfilled", 0)
+        in_heap = len(self.heap)
+        in_assigned = len(self.assigned)
+        live = in_heap + in_assigned
+        lost = total_created - (total_fulfilled + live)
+        if self.debug:
+            print(f"[OBLIGAUD] {now_us:7.2f} at={where:>18s} created={total_created} fulfilled={total_fulfilled} live={live} (heap={in_heap},assigned={in_assigned}) lost={lost}")
+        # highlight when lost changes
+        if lost != self._last_audit_lost and self.debug:
+            print(f"[OBLIGAUD] LOST_CHANGED from {self._last_audit_lost} -> {lost} at {where}")
+        self._last_audit_lost = lost
+        # write CSV row if enabled
+        if self.audit_file_path:
+            try:
+                if not self._audit_file_initialized:
+                    # best-effort header (should be set via set_audit_file)
+                    with open(self.audit_file_path, "w", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        w.writerow(["time_us","where","created","fulfilled","live","heap","assigned","lost"]) 
+                    self._audit_file_initialized = True
+                with open(self.audit_file_path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow([now_us, where, total_created, total_fulfilled, live, in_heap, in_assigned, lost])
+            except Exception:
+                pass
+
+    def _rebuild_heap(self):
+        items = self.heap
+        self.heap = []
+        for it in items:
+            heapq.heappush(self.heap, _ObHeapItem(deadline_us=it.ob.deadline_us, seq=it.ob.id, ob=it.ob))
+
+    def requeue(self, ob: Obligation, delta_us: float = 0.2):
+        prev = ob.deadline_us
+        ob.deadline_us = quantize(ob.deadline_us + max(0.0, delta_us))
+        heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=ob.id, ob=ob))
+        self.stats["requeued"] += 1
+        if self.debug:
+            print(f"[OBLIGDBG] requeue: id={ob.id} prev_deadline={prev:.2f} new_deadline={ob.deadline_us:.2f}")
+            self.audit(ob.deadline_us, "requeue")
+            self._log_inversion_check(ob, "requeue")
+
+    def has_pending(self, source: Optional[str] = None) -> bool:
+        if not self.heap:
+            return False
+        if source is None:
+            return True
+        for item in self.heap:
+            if getattr(item.ob, "source", None) == source:
+                return True
+        return False
 
     def on_commit(self, op: Operation, now_us: float):
         # READ completion -> create DOUT obligation(s)
@@ -827,6 +1131,11 @@ class ObligationManager:
                 base_deadline = quantize(now_us + dt)
                 hard_slot = spec.get("priority_boost", {}).get("hard_slot", False)
                 plane_stagger = spec.get("priority_boost", {}).get("plane_stagger_us", 0.2)
+                # optional: amplify stagger by DOUT duration multiplier N
+                n_mult = float(spec.get("priority_boost", {}).get("plane_stagger_by_dout_n", 0.0))
+                if n_mult and n_mult > 0.0:
+                    dout_dur = get_kind_nominal_duration(self.cfg_root, "DOUT") if hasattr(self, "cfg_root") else 0.0
+                    plane_stagger = max(plane_stagger, n_mult * dout_dur)
 
                 # 멀티플레인 READ의 경우 plane 순서대로 DOUT을 분산 생성
                 if op.kind == OpKind.READ and len(op.targets) > 1:
@@ -858,27 +1167,49 @@ class ObligationManager:
                     first = op.targets[0]
                     print(f"[{now_us:7.2f} us] OBLIG  created: {op.kind.name} -> {ob.require.name} by {ob.deadline_us:7.2f} us, target(d{first.die},p{first.plane})")
 
-    def pop_urgent(self, now_us: float, die:int, plane:int, horizon_us: float, earliest_start: float) -> Optional[Obligation]:
-        if not self.heap: return None
+    def pop_urgent(self, now_us: float, die:int, plane:int, horizon_us: float, earliest_start: float, easing: bool = False) -> Optional[Obligation]:
+        if not self.heap:
+            return None
         kept: List[_ObHeapItem] = []
         chosen: Optional[Obligation] = None
         now_us=quantize(now_us); earliest_start=quantize(earliest_start)
+        self.stats["pop_calls"] += 1
+        if self.debug:
+            print(f"[OBLIGDBG] pop_urgent: heap_size={len(self.heap)} now={now_us:.2f} die={die} plane={plane} horizon={horizon_us:.2f} earliest_start={earliest_start:.2f}")
         while self.heap and not chosen:
             item = heapq.heappop(self.heap)
             ob=item.ob
+            self.stats["pop_examined"] += 1
             plane_list={a.plane for a in ob.targets}
-            same_die=(ob.targets[0].die==die); same_plane=(plane in plane_list)
+            same_die=(ob.targets[0].die==die)
+            same_plane=(plane in plane_list)
             in_horizon=((ob.deadline_us - now_us) <= max(horizon_us, 0.0)) or ob.hard_slot
             feasible=(earliest_start <= ob.deadline_us)
-            if same_die and same_plane and in_horizon and feasible:
+            cond = (same_die and in_horizon and feasible and (same_plane or easing))
+            if cond:
+                if self.debug:
+                    print(f"[OBLIGDBG] pop_urgent: CHOOSE id={ob.id} req={ob.require.name} src={getattr(ob,'source',None)} deadline={ob.deadline_us:.2f} conds sd={same_die} sp={same_plane} hz={in_horizon} fs={feasible}")
+                self.stats["pop_chosen"] += 1
                 chosen=ob; break
             kept.append(item)
+            self.stats["pop_kept"] += 1
+            if self.debug:
+                print(f"[OBLIGDBG] pop_urgent: SKIP  id={ob.id} req={ob.require.name} src={getattr(ob,'source',None)} deadline={ob.deadline_us:.2f} conds sd={same_die} sp={same_plane} hz={in_horizon} fs={feasible}")
         for it in kept: heapq.heappush(self.heap, it)
+        self.stats["pop_returned"] += len(kept)
+        if self.debug:
+            succ = self.stats["pop_chosen"]
+            calls = self.stats["pop_calls"]
+            rate = (succ / calls) if calls else 0.0
+            print(f"[OBLIGDBG] pop_urgent: heap_size_after={len(self.heap)} chosen={(chosen.id if chosen else None)} kept={len(kept)} returned={len(kept)} pop_succ_rate={rate:.3f} (chosen={succ}/calls={calls})")
         return chosen
 
     def mark_assigned(self, ob: Obligation):
         self.assigned[ob.id] = ob
         self.stats["assigned"] += 1
+        if self.debug:
+            print(f"[OBLIGDBG] mark_assigned: id={ob.id} require={ob.require.name} deadline={ob.deadline_us:.2f} src={getattr(ob,'source',None)} heap_size={len(self.heap)} assigned={len(self.assigned)}")
+            self.audit(ob.deadline_us, "mark_assigned")
 
     def mark_fulfilled(self, ob: Obligation, now: float):
         self.assigned.pop(ob.id, None)
@@ -887,13 +1218,28 @@ class ObligationManager:
             self.stats["fulfilled_in_time"] += 1
         else:
             print(f"not_fulfilled: {ob.require.name} by {now:7.2f} us, deadline={ob.deadline_us:7.2f} us, target(d{ob.targets[0].die},p{ob.targets[0].plane})")
+        if self.debug:
+            print(f"[OBLIGDBG] mark_fulfilled: id={ob.id} at={now:.2f} heap_size={len(self.heap)} assigned={len(self.assigned)}")
+            self.audit(now, "mark_fulfilled")
 
     def expire_due(self, now: float):
-        kept=[]
-        expired=0
-        while self.heap and self.heap[0].deadline_us <= now:
-            heapq.heappop(self.heap); expired+=1
-        self.stats["expired"] += expired
+        if not self.heap:
+            return
+        earliest = self.heap[0].deadline_us
+        if earliest <= now:
+            # extend all deadlines uniformly to preserve relative order
+            delta = quantize(now - earliest + 0.2)
+            for it in self.heap:
+                it.ob.deadline_us = quantize(it.ob.deadline_us + delta)
+            self._rebuild_heap()
+            self.stats["extended_cycles"] += 1
+            self.stats["extended_total"] += len(self.heap)
+            if self.debug:
+                print(f"[OBLIGDBG] extend_all: delta={delta:.2f} heap_size={len(self.heap)} new_earliest={self.heap[0].deadline_us:.2f}")
+                self.audit(now, "expire_due")
+                # choose one representative ob to check ordering per kind
+                rep = self.heap[0].ob
+                self._log_inversion_check(rep, "expire_due")
 
 # --------------------------------------------------------------------------
 # Policy Engine (phase-conditional + admission gating + backoff + latch check)
@@ -905,12 +1251,22 @@ class PolicyEngine:
                 detail: str = ""):
         if self.rejlog is None:
             return
+        ob_id = None
+        if stage == "obligation":
+            # attach obligation id when available
+            try:
+                ob = getattr(self, 'current_obligation', None)
+                if ob is not None:
+                    ob_id = getattr(ob, 'id', None)
+            except Exception:
+                ob_id = None
         self.rejlog.log_reject(RejectEvent(
             now_us=now_us, die=hook.die, plane=hook.plane, hook=hook.label,
             stage=stage, attempted=attempted, alias=alias, fanout=fanout,
             plane_set=(str(sorted(plane_set)) if plane_set is not None else None),
             reason=reason, detail=detail,
-            earliest_start=earliest_start, admission_delta=admission_delta
+            earliest_start=earliest_start, admission_delta=admission_delta,
+            ob_id=ob_id
         ))
 
     def __init__(self, cfg, addr: AddressManager, obl: ObligationManager, excl: ExclusionManager,
@@ -958,41 +1314,93 @@ class PolicyEngine:
         # 0) obligations first
         stage = "obligation"
         self.rejlog.log_attempt(stage)
-        ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=10.0, earliest_start=earliest_start)
+        # easing flag wired
+        ease_cfg = self.cfg.get("policy", {}).get("easing_hookscreen", {})
+        easing_enabled = bool(ease_cfg.get("enable", False))
+        horizon = float(ease_cfg.get("horizon_us", 10.0)) if easing_enabled else 10.0
+        # easing: use die-wide earliest for pop feasibility to avoid hook_plane bottleneck
+        pop_earliest = self.addr.candidate_start_for_scope(now_us, die, Scope.DIE_WIDE, list(range(self.addr.planes))) if easing_enabled else earliest_start
+        ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=horizon, earliest_start=pop_earliest, easing=easing_enabled)
         if ob:
             cfg_op=self.cfg["op_specs"][ob.require.name]
             op=build_operation(ob.require, cfg_op, ob.targets)
             op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=sorted({a.plane for a in ob.targets}); op.meta["arity"]=len(op.meta["plane_list"])
             op.meta["obligation"]=ob
+            if getattr(ob, "source", None):
+                op.meta["source"] = ob.source
+            if getattr(ob, "skip_dout_creation", False):
+                op.meta["skip_dout_creation"] = True
             scope=Scope[op.meta["scope"]]; plane_set=op.meta["plane_list"]
+            # easing: if same_plane mismatch, recompute earliest_start on plane_set instead of hook_plane only
             start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
 
-            bypass = self.cfg.get("admission",{}).get("obligation_bypass",True)
-            admission_delta = (None if bypass else get_admission_delta(self.cfg, hook.label, ob.require.name))
-            admission_ok = True if bypass else self._admission_ok(now_us, hook.label, ob.require.name, start_hint, ob.deadline_us)
-
-            if not admission_ok:
-                self._reject(now_us, hook, stage, "admission", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "deadline_window")
-            elif not self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope):
-                self._reject(now_us, hook, stage, "precheck", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "addr/precheck")
-            elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
-                self._reject(now_us, hook, stage, "bus", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "bus_conflict")
-            elif not self.latch.allowed(op, start_hint):
-                self._reject(now_us, hook, stage, "latch", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "read->dout plane latched")
-            elif not self._exclusion_ok(op, start_hint):
-                self._reject(now_us, hook, stage, "excl", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "exclusion_window")
+            # feasibility after re-calculation: if miss, SOFT-DEFER (requeue), no drop
+            # expose current obligation for logging context (e.g., ob_id)
+            self.current_obligation = ob
+            if start_hint > ob.deadline_us:
+                self._reject(now_us, hook, stage, "soft_defer/feasible", ob.require.name, None, len(plane_set), plane_set, start_hint, None, "deadline_miss_after_recalc")
+                if self.obl.debug:
+                    print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=feasible(deadline_miss) start_hint={start_hint:.2f} deadline={ob.deadline_us:.2f}")
+                # push back to heap with small epsilon to avoid hot-loop
+                self.obl.requeue(ob)
+                # audit now to capture potential loss
+                self.obl.audit(now_us, "soft_defer/feasible")
+                ob = None
+                # fallthrough to phase-conditional
             else:
-                # ACCEPT
-                self.rejlog.log_accept(stage)
-                op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"
-                return op
+                bypass = self.cfg.get("admission",{}).get("obligation_bypass",True)
+                admission_delta = (None if bypass else get_admission_delta(self.cfg, hook.label, ob.require.name))
+                admission_ok = True if bypass else self._admission_ok(now_us, hook.label, ob.require.name, start_hint, ob.deadline_us)
+                if not admission_ok:
+                    self._reject(now_us, hook, stage, "soft_defer/admission", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "deadline_window")
+                    if self.obl.debug:
+                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=admission start_hint={start_hint:.2f} deadline={ob.deadline_us:.2f}")
+                    self.obl.requeue(ob)
+                    self.obl.audit(now_us, "soft_defer/admission")
+                elif not self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope):
+                    self._reject(now_us, hook, stage, "soft_defer/precheck", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "addr/precheck")
+                    if self.obl.debug:
+                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=precheck start_hint={start_hint:.2f} scope={scope.name} planes={plane_set}")
+                    self.obl.requeue(ob)
+                    self.obl.audit(now_us, "soft_defer/precheck")
+                elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
+                    self._reject(now_us, hook, stage, "soft_defer/bus", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "bus_conflict")
+                    if self.obl.debug:
+                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=bus start_hint={start_hint:.2f} planes={plane_set}")
+                    self.obl.requeue(ob)
+                    self.obl.audit(now_us, "soft_defer/bus")
+                elif not self.latch.allowed(op, start_hint):
+                    self._reject(now_us, hook, stage, "soft_defer/latch", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "read->dout plane latched")
+                    if self.obl.debug:
+                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=latch start_hint={start_hint:.2f} planes={plane_set}")
+                    self.obl.requeue(ob)
+                    self.obl.audit(now_us, "soft_defer/latch")
+                elif not self._exclusion_ok(op, start_hint):
+                    self._reject(now_us, hook, stage, "soft_defer/excl", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "exclusion_window")
+                    if self.obl.debug:
+                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=excl start_hint={start_hint:.2f} planes={plane_set}")
+                    self.obl.requeue(ob)
+                    self.obl.audit(now_us, "soft_defer/excl")
+                else:
+                    # ACCEPT
+                    self.rejlog.log_accept(stage)
+                    op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"
+                    return op
         else:
             # no obligation
             self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_obligation")
 
-        # 1) phase-conditional
+        # 1) phase-conditional (optional; can be disabled via CFG)
         stage = "phase_conditional"
         self.rejlog.log_attempt(stage)
+        # disable knob
+        if not self.cfg.get("policy", {}).get("enable_phase_conditional", True):
+            self._reject(now_us, hook, stage, "disabled", None, None, None, None, earliest_start, None, "disabled_by_cfg")
+            return None
+        # guard: while bootstrap obligations exist anywhere, skip policy proposals
+        if self.obl.has_pending(source="bootstrap"):
+            self._reject(now_us, hook, stage, "guard_bootstrap_pending", None, None, None, None, earliest_start, None, "bootstrap_pending_skip")
+            return None
         allow=set(list(OP_ALIAS.keys())+["READ","PROGRAM","ERASE","SR"])
         dist, used_key = get_phase_dist(self.cfg, hook.label)
         if not dist:
@@ -1015,12 +1423,26 @@ class PolicyEngine:
                         self.stats["alias_degrade"]+=1
                         plan=self.addr.plan_multipane(kind, die, hook_plane, 1, interleave)
                         if plan: fanout=1
+                # start_plane round-robin scan when easing enabled and no plan
+                if not plan and easing_enabled:
+                    scan = max(1, int(ease_cfg.get("startplane_scan", 1)))
+                    tried = 0
+                    p = (hook_plane + 1) % self.addr.planes
+                    while tried < self.addr.planes and tried < scan and not plan:
+                        if kind==OpKind.SR:
+                            plan=self.addr.plan_multipane(kind, die, p, 1, True)
+                            fanout=1
+                        else:
+                            plan=self.addr.plan_multipane(kind, die, p, fanout, interleave)
+                        tried += 1
+                        p = (p + 1) % self.addr.planes
                 if not plan:
                     self._reject(now_us, hook, stage, "plan_none", base, alias_used, fanout, None, earliest_start, None, "no_targets")
                 else:
                     targets, plane_set, scope=plan
                     cfg_op=self.cfg["op_specs"][base]; op=build_operation(kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=pick
+                    # earliest_start re-calc at candidate time for scope
                     start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
                     adm_ok=self._admission_ok(now_us, hook.label, base, start_hint)
                     adm_delta=get_admission_delta(self.cfg, hook.label, base)
@@ -1061,6 +1483,107 @@ def get_phase_selection_override(cfg: Dict[str,Any], hook_label: str, kind_name:
 # --------------------------------------------------------------------------
 def _addr_str(a: Address)->str: return f"(d{a.die},p{a.plane},b{a.block},pg{a.page})"
 
+def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl: ObligationManager):
+    bs = cfg.get("bootstrap", {})
+    if not bs or not bs.get("enabled", False):
+        return
+    ratio = float(bs.get("pgm_ratio", 0.0))
+    ratio = max(0.0, min(ratio, float(bs.get("max_ratio", 0.5))))
+    pages_per_block = addr.pages_per_block
+    k = int(min(max(int(pages_per_block * ratio), 0), max(pages_per_block - 1, 0)))
+    if k <= 0:
+        return
+    die = 0
+    planes = addr.planes
+    t_win = float(bs.get("deadline_window_us", 50.0))
+    gap = float(bs.get("stage_gap_us", 0.2))
+    # base stagger; can be overridden by DOUT N-multiple rule below when generating DOUT obligations
+    stagger = float(bs.get("stagger_us", 0.5))
+    hard_slot = bool(bs.get("hard_slot", True))
+    # nominal durations for dependency-aware deadlines
+    erase_nom = get_kind_nominal_duration(cfg, "ERASE")
+    prog_nom  = get_kind_nominal_duration(cfg, "PROGRAM")
+    erase_serial_span = planes * erase_nom  # DIE_WIDE → serial on die
+    # eps 상수화(슬림 스키마): 필요 시 코드 변경으로 조정
+    eps_prog = 2.0
+    eps_read = 2.0
+    order_eps = 0.2
+    # per-page step so that p increases in order and READ(p) < PROGRAM(p+1)
+    prog_step = prog_nom + max(eps_prog, eps_read + order_eps)
+    seq_id = obl._seq
+    # iterate all block stripes across planes so that every block is covered
+    stripes = (addr.blocks + planes - 1) // planes
+    # next stripe starts after the last deadline of previous stripe (strictly increasing)
+    stripe_base = quantize(addr.available_at(die, 0) + t_win)
+    # init creation logger
+    if not hasattr(obl, "creation_logger"):
+        obl.creation_logger = CreationLogger()
+    for s in range(stripes):
+        stripe_last_deadline = stripe_base
+        for p in range(k):
+            plane_targets = []
+            for pl in range(planes):
+                b_idx = pl + s * planes
+                if b_idx >= addr.blocks:
+                    continue
+                plane_targets.append(Address(die, pl, b_idx, p))
+            if not plane_targets:
+                continue
+            base = quantize(stripe_base + p * (3.0 * gap + stagger))
+            if p == 0:
+                # ERASE: multi-plane (all planes in this stripe)
+                seq_id += 1
+                ob_erase = Obligation(id=seq_id, require=OpKind.ERASE, targets=list(plane_targets),
+                                      deadline_us=quantize(base), hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
+                heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_erase.deadline_us, seq=ob_erase.id, ob=ob_erase))
+                obl.stats["created"] += 1
+                obl.creation_logger.log(ob_erase, context="bootstrap", stripe=s, page_index=p)
+                if obl.debug:
+                    dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.ERASE))
+                    print(f"[BOOTAUD] ERASE deadlines p=0: {dls}")
+                stripe_last_deadline = max(stripe_last_deadline, base)
+            # PROGRAM deadline: ensure page order by adding p * prog_step and respecting ERASE span
+            pgm_base = max(base + gap, base + erase_serial_span + max(eps_prog, order_eps))
+            prog_deadline = quantize(pgm_base + p * prog_step)
+            seq_id += 1
+            ob_pgm = Obligation(id=seq_id, require=OpKind.PROGRAM, targets=plane_targets,
+                                deadline_us=prog_deadline, hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
+            heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_pgm.deadline_us, seq=ob_pgm.id, ob=ob_pgm))
+            obl.stats["created"] += 1
+            obl.creation_logger.log(ob_pgm, context="bootstrap", stripe=s, page_index=p)
+            if obl.debug:
+                dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.PROGRAM))
+                print(f"[BOOTAUD] PROGRAM deadlines p={p}: {dls}")
+            stripe_last_deadline = max(stripe_last_deadline, prog_deadline)
+            # READ deadline: after PROGRAM(p) completes nominally
+            read_deadline = quantize(max(base + 2.0 * gap, prog_deadline + prog_nom + max(eps_read, order_eps)))
+            seq_id += 1
+            ob_read = Obligation(id=seq_id, require=OpKind.READ, targets=plane_targets,
+                                 deadline_us=read_deadline, hard_slot=hard_slot, source="bootstrap", skip_dout_creation=True)
+            heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_read.deadline_us, seq=ob_read.id, ob=ob_read))
+            obl.stats["created"] += 1
+            obl.creation_logger.log(ob_read, context="bootstrap", stripe=s, page_index=p)
+            if obl.debug:
+                dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.READ))
+                print(f"[BOOTAUD] READ deadlines p={p}: {dls}")
+            stripe_last_deadline = max(stripe_last_deadline, read_deadline)
+            # Pair (READ->DOUT) per page: DOUT after READ(p)
+            dout_nominal = get_kind_nominal_duration(cfg, "DOUT")
+            dout_mult = float(bs.get("dout_stagger_n", 0.0))
+            stagger_dout = max(stagger, dout_nominal * dout_mult) if dout_mult > 0.0 else stagger
+            base_dout_p = quantize(read_deadline + max(order_eps, 0.2))
+            for idx, t in enumerate(sorted(plane_targets, key=lambda a: a.plane)):
+                seq_id += 1
+                ob_dout = Obligation(id=seq_id, require=OpKind.DOUT, targets=[Address(t.die, t.plane, t.block, p)],
+                                     deadline_us=quantize(base_dout_p + idx * stagger_dout), hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
+                heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_dout.deadline_us, seq=ob_dout.id, ob=ob_dout))
+                obl.stats["created"] += 1
+                obl.creation_logger.log(ob_dout, context="bootstrap", stripe=s, page_index=p)
+                stripe_last_deadline = max(stripe_last_deadline, ob_dout.deadline_us)
+        # next stripe starts strictly after last deadline of this stripe
+        stripe_base = quantize(stripe_last_deadline + max(order_eps, 0.2))
+    obl._seq = seq_id
+
 class Scheduler:
     def __init__(self, cfg, addr:AddressManager, spe:PolicyEngine, obl:ObligationManager,
                  excl:ExclusionManager, logger: Optional[TimelineLogger]=None,
@@ -1073,6 +1596,15 @@ class Scheduler:
         self._push(0.0, "QUEUE_REFILL", None)
         for plane in range(self.addr.planes):
             self._push(0.0, "PHASE_HOOK", PhaseHook(0.0, "BOOT.START", 0, plane))
+        # optional global nudge
+        gp = self.cfg.get("policy", {}).get("global_nudge_period_us")
+        if gp:
+            self._push(gp, "GLOBAL_NUDGE", None)
+        # bootstrap watchdog
+        self._bootstrap_started=False
+        self._bootstrap_start_time=None
+        self._bootstrap_end_time=None
+        self._last_now=0.0
 
     def _push(self, t: float, typ: str, payload: Any):
         heapq.heappush(self.ev, (quantize(t), self._seq, typ, payload)); self._seq+=1
@@ -1123,7 +1655,48 @@ class Scheduler:
         if "uid" not in op.meta:
             op.meta["uid"] = self.stat_scheduled + 1
         if self.logger is not None:
-            self.logger.log_op(op, start, end, label_for_read=self._label_for_read(op))
+            bs_cfg = self.cfg.get("bootstrap", {})
+            disable_bootlog = bool(bs_cfg.get("disable_timeline_logging", False))
+            split_logging = bool(bs_cfg.get("split_timeline_logging", False))
+            in_bootstrap = (self._bootstrap_started and (self._bootstrap_end_time is None))
+            is_bootstrap_op = (op.meta.get("source") == "bootstrap")
+
+            if split_logging:
+                # 분리 로깅: 부트스트랩/정책 각각 별도 버퍼에 기록
+                if not hasattr(self, "_timeline_rows_bootstrap"):
+                    self._timeline_rows_bootstrap = []
+                if not hasattr(self, "_timeline_rows_policy"):
+                    self._timeline_rows_policy = []
+                # 실제 한 번만 구성하여 viz_tools 포맷과 동일 dict로 저장
+                def _row_dict():
+                    label = self._label_for_read(op)
+                    rows = []
+                    for t in op.targets:
+                        page = t.page if (t.page is not None) else 0
+                        rows.append({
+                            "start_us": float(start),
+                            "end_us":   float(end),
+                            "die":      int(t.die),
+                            "plane":    int(t.plane),
+                            "block":    int(t.block),
+                            "page":     int(page),
+                            "kind":     label,
+                            "base_kind": op.kind.name,
+                            "source":   op.meta.get("source"),
+                            "op_uid":   int(op.meta.get("uid", -1)),
+                            "arity":    int(op.meta.get("arity", 1)),
+                        })
+                    return rows
+                if in_bootstrap or is_bootstrap_op:
+                    self._timeline_rows_bootstrap.extend(_row_dict())
+                else:
+                    self._timeline_rows_policy.extend(_row_dict())
+            else:
+                # 단일 로깅: 부트스트랩 구간 로깅 비활성화 옵션 적용
+                if disable_bootlog and (in_bootstrap or is_bootstrap_op):
+                    pass
+                else:
+                    self.logger.log_op(op, start, end, label_for_read=self._label_for_read(op))
 
         # obligation assignment stats
         if "obligation" in op.meta:
@@ -1160,12 +1733,30 @@ class Scheduler:
                 for plane in range(self.addr.planes):
                     self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "REFILL.NUDGE", 0, plane))
                 self._push(self.now + self.cfg["policy"]["queue_refill_period_us"], "QUEUE_REFILL", None)
+            elif typ=="GLOBAL_NUDGE":
+                # trigger a global proposal tick on each plane (as a global trigger)
+                ease_cfg = self.cfg.get("policy", {}).get("easing_hookscreen", {})
+                iters = max(1, int(ease_cfg.get("global_obl_iters", 1)))
+                for _ in range(iters):
+                    for plane in range(self.addr.planes):
+                        self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "GLOBAL.NUDGE", 0, plane))
+                gp = self.cfg.get("policy", {}).get("global_nudge_period_us")
+                if gp:
+                    self._push(self.now + gp, "GLOBAL_NUDGE", None)
 
             elif typ=="PHASE_HOOK":
                 hook: PhaseHook = payload
                 # 의무 선택의 타당성 판단을 위해 now를 고려
                 earliest_start = max(self.now, self.addr.available_at(hook.die, hook.plane))
                 g,l=self.addr.observe_states(hook.die, hook.plane, self.now)
+                # bootstrap watchdog: first time pending detected / drain completion
+                if self.obl.has_pending("bootstrap"):
+                    if not self._bootstrap_started:
+                        self._bootstrap_started=True
+                        self._bootstrap_start_time=self.now
+                else:
+                    if self._bootstrap_started and self._bootstrap_end_time is None:
+                        self._bootstrap_end_time=self.now
                 self.stat_propose_calls+=1
                 op=self.SPE.propose(self.now, hook, g, l, earliest_start)
                 if op: self._schedule_operation(op)
@@ -1188,6 +1779,7 @@ class Scheduler:
 
         # final stats
         print(f"\n=== Stats ===")
+        print(f"run_until     : {t_end:.2f}")
         print(f"propose calls : {self.stat_propose_calls}")
         print(f"scheduled ops : {self.stat_scheduled}")
         if self.stat_propose_calls:
@@ -1195,6 +1787,9 @@ class Scheduler:
         s=self.obl.stats
         rate=(100.0*s["fulfilled_in_time"]/s["created"]) if s["created"] else 0.0
         print(f"obligations   : created={s['created']} assigned={s['assigned']} fulfilled={s['fulfilled']} in_time={s['fulfilled_in_time']} expired={s['expired']} success={rate:.1f}%")
+        if self._bootstrap_started:
+            dur = (self._bootstrap_end_time - self._bootstrap_start_time) if (self._bootstrap_end_time is not None and self._bootstrap_start_time is not None) else None
+            print(f"bootstrap     : started_at={self._bootstrap_start_time} ended_at={self._bootstrap_end_time} duration={dur}")
 
 # --------------------------------------------------------------------------
 # Main
@@ -1206,17 +1801,88 @@ def main():
     logger = TimelineLogger()
     rejlog = RejectionLogger()
     addr = AddressManager(CFG); excl = ExclusionManager(CFG)
-    obl  = ObligationManager(CFG["obligations"])
+    obl  = ObligationManager(CFG["obligations"], cfg_root=CFG)
     latch = LatchManager()
     spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch)
     sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger, latch=latch)
 
-    # 2) 실행
-    sch.run_until(CFG["policy"]["run_until_us"])
+    # 1.1) bootstrap, phase conditional 활성화 여부 설정
+    CFG["bootstrap"]["enabled"] = True
+    CFG["policy"]["enable_phase_conditional"] = True
+    CFG["bootstrap"]["disable_timeline_logging"] = False
+    CFG["bootstrap"]["split_timeline_logging"] = True
 
-    # 3) DataFrame
-    df = logger.to_dataframe()
-    df.to_csv("nand_timeline.csv", index=False)
+    # 1.2) topology 설정
+    CFG["topology"]["dies"] = 1
+    CFG["topology"]["planes"] = 4
+    CFG["topology"]["blocks"] = 32
+    CFG["topology"]["pages_per_block"] = 40
+    print(f"topology: {CFG['topology']}")
+
+    # 1.5) Bootstrap obligations (optional)
+    try:
+        populate_bootstrap_obligations(CFG, addr, obl)
+    except Exception as e:
+        print(f"[BOOTSTRAP] skipped: {e}")
+
+    # 2) 실행: bootstrap 전용 여유와 총 러닝타임 분리 계산
+    run_until_base = CFG["policy"]["run_until_us"]
+    run_until_boot = 0.0
+    try:
+        if CFG.get("bootstrap", {}).get("enabled", False) and hasattr(obl, "heap") and obl.heap:
+            # 부트스트랩 의무만 필터링
+            boot_items = [it for it in obl.heap if getattr(it.ob, "source", None) == "bootstrap"]
+            if boot_items:
+                last_deadline_boot = max((it.ob.deadline_us for it in boot_items), default=run_until_base)
+                num_bootstrap_ob = len(boot_items)
+                margin_per_ob = float(CFG.get("policy", {}).get("run_until_bootstrap_margin_per_ob_us", 3.0))
+                # 제안식: run_until_boot = last_deadline_boot + num_bootstrap_ob * margin_per_ob
+                run_until_boot = quantize(last_deadline_boot + num_bootstrap_ob * margin_per_ob)
+    except Exception:
+        run_until_boot = 0.0
+    # 총 런: run_until_tot = run_until_boot + run_until_base (사용자 제안식)
+    run_until_tot = quantize(run_until_base + run_until_boot)
+    sch.run_until(run_until_tot)
+
+    # 3) DataFrame (timeline)
+    bs_cfg = CFG.get("bootstrap", {})
+    split_logging = bool(bs_cfg.get("split_timeline_logging", False))
+    df_boot = None
+    df_pol = None
+    if split_logging and (hasattr(sch, "_timeline_rows_bootstrap") or hasattr(sch, "_timeline_rows_policy")):
+        # 분리 저장
+        try:
+            import pandas as _pd
+            df_boot = _pd.DataFrame(getattr(sch, "_timeline_rows_bootstrap", []))
+            df_pol  = _pd.DataFrame(getattr(sch, "_timeline_rows_policy", []))
+            # enrich function: add derived cols like TimelineLogger.to_dataframe
+            def _enrich(df_):
+                if df_.empty:
+                    return df_
+                df_ = df_.sort_values(["die", "block", "start_us", "end_us"]).reset_index(drop=True)
+                df_["seq_per_block"] = df_.groupby(["die", "block"]).cumcount() + 1
+                df_["seq_global_die"] = df_.groupby(["die"]).cumcount() + 1
+                df_["dur_us"] = df_["end_us"] - df_["start_us"]
+                return df_
+            df_boot = _enrich(df_boot)
+            df_pol  = _enrich(df_pol)
+            if not df_boot.empty:
+                df_boot.to_csv(bs_cfg.get("bootstrap_timeline_path", "nand_timeline_bootstrap.csv"), index=False)
+            if not df_pol.empty:
+                df_pol.to_csv(bs_cfg.get("policy_timeline_path", "nand_timeline_policy.csv"), index=False)
+            # 병합본도 기본 경로로 저장(있을 때)
+            df_all = _pd.concat([df_boot, df_pol], ignore_index=True) if ((df_boot is not None and not df_boot.empty) or (df_pol is not None and not df_pol.empty)) else _pd.DataFrame()
+            if not df_all.empty:
+                df_all = _enrich(df_all)
+            df = df_all
+            df.to_csv("nand_timeline.csv", index=False)
+        except Exception as e:
+            print(f"[TIMELINE] split save failed: {e}")
+            df = logger.to_dataframe()
+            df.to_csv("nand_timeline.csv", index=False)
+    else:
+        df = logger.to_dataframe()
+        df.to_csv("nand_timeline.csv", index=False)
 
     # 4) 규칙 자동검증
     report = validate_timeline(df, CFG)
@@ -1238,10 +1904,27 @@ def main():
     except Exception as e:
         print(f"[REJLOG] skipped: {e}")
 
+    # 4.6) Obligation creations CSV (if available)
+    try:
+        if hasattr(obl, "creation_logger"):
+            obl.creation_logger.to_csv("obligation_creations.csv")
+    except Exception as e:
+        print(f"[CREATIONS] skipped: {e}")
+
     # 5) 시각화
-    plot_gantt_by_die(df)  # 모든 die별로 개별 그림
-    plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
-                                       z_mode="global_die", draw_lines=True)
+    if split_logging and (df_boot is not None or df_pol is not None):
+        if df_boot is not None and not df_boot.empty:
+            plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
+            plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
+                                               z_mode="global_die", draw_lines=True)
+        if df_pol is not None and not df_pol.empty:
+            plot_gantt_by_die(df_pol, title="Policy Timeline")
+            plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
+                                               z_mode="global_die", draw_lines=True)
+    else:
+        plot_gantt_by_die(df)  # 모든 die별로 개별 그림
+        plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
+                                           z_mode="global_die", draw_lines=True)
 
 if __name__=="__main__":
     main()
