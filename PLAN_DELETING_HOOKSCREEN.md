@@ -38,11 +38,11 @@
 - 리스크: 미세한 시각 차이로 스케줄 순서 변화.
 - 완화책: quantize 동일 사용, fail-safe 사전/직전 점검 유지.
 
-4) 전역 트리거 보강(GLOBAL.NUDGE)
-- 변경: 주기적 `GLOBAL.NUDGE` 훅(다이/플레인 무관)을 추가하여, 의무/정책 제안의 전역 기회를 주기적으로 부여.
-- 이점: plane 훅 간격이 커도 전역 상태를 주기적으로 소거.
-- 리스크: 이벤트 수 증가.
-- 완화책: `queue_refill_period_us`와 별도 주기를 작게 유지하지 않고, 적정 주기(예: 2~3x REFILL)로 제한.
+4) 전역 트리거 일원화(QUEUE_REFILL)
+- 변경: `GLOBAL.NUDGE` 제거. 전역 주기 트리거를 `QUEUE_REFILL` 훅에서 처리하여, 모든 plane에 동시 `PHASE_HOOK`(REFILL.NUDGE)을 발행.
+- 이점: 경로 단순화(전역 트리거 1원화), 제어 변수 축소로 튜닝 용이.
+- 리스크: REFILL 주기 과도 설정 시 이벤트 밀도 증가.
+- 완화책: `policy.queue_refill_period_us`로 주기를 관리하고, 전역 강도는 `policy.easing_hookscreen.global_obl_iters`로 조절.
 
 5) 부트스트랩 기간 policy skip 유지 + 의무 드레이닝 가속
 - 변경: 부트스트랩 의무가 존재하면 policy 분기 skip(이미 구현) + pop_urgent 완화로 소비 가속.
@@ -73,7 +73,7 @@
 - pop_urgent: `same_plane` 완화(옵션), 선택 후 scope 기반 earliest 재산정.
 - policy: plan 실패 시 start_plane 라운드로빈 대안 N회.
 - propose: admission/feasible 판단 직전 scope 기반 재산정 사용.
-- 훅: `GLOBAL.NUDGE` 주기 훅 추가(옵션).
+- 훅: `QUEUE_REFILL` 주기 훅 유지(전역 트리거 포함).
 
 ---
 

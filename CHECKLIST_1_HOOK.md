@@ -3,7 +3,7 @@
 #### A. 플래그/CFG
 - [x] `policy.easing_hookscreen.enable` 추가 (기본 false)
 - [x] `policy.easing_hookscreen.startplane_scan` 추가 (기본 1)
-- [x] `queue_refill_period_us`와 별개로 `global_nudge_period_us`(옵션) 추가
+- [ ] `GLOBAL_NUDGE` 제거됨: 전역 트리거는 `QUEUE_REFILL` 훅에서 일원화
 - [x] `policy.easing_hookscreen.global_obl_iters` 추가(전역 훅 강도)
 
 #### B. Obligation(pop_urgent) 완화
@@ -21,10 +21,10 @@
 - [x] 재산정 값으로 `_admission_ok/feasible` 검사 수행
 - [x] schedule-time fail-safe 유지(bus/latch/excl)
 
-#### E. GLOBAL.NUDGE 훅(옵션)
-- [x] 주기적 전역 훅(`GLOBAL.NUDGE`) 생성 로직 추가(토글 가능)
+#### E. 전역 트리거 일원화
+- [x] `GLOBAL_NUDGE` 제거 → 전역 트리거는 `QUEUE_REFILL` 훅에서 처리
 - [x] 훅 핸들러에서 obligation→policy 순으로 propose 호출(현행 동일)
-- [x] 주기 상한 적용(REFILL의 2~3배 권장)
+- [x] 전역 트리거 강도는 `easing_hookscreen.global_obl_iters`로 조절
 
 #### F. 부트스트랩 기간 동작
 - [x] 부트스트랩 의무 존재 시 policy 분기 skip 유지(현행)

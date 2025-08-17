@@ -71,7 +71,7 @@
 - 단일 `hard_slot` 적용: READ/DOUT 별도 하드 슬롯 제거
 - 여유값 상수화: `program_after_erase_eps_us=2.0`, `read_after_program_eps_us=2.0`, `order_eps_us=0.2`
 - 러닝타임 자동 연장: Bootstrap 활성 시 `run_until_us = max(run_until_us, last_deadline + 7000us)`
-- 운영값(예시) 적용: `global_nudge_period_us=20.0`, `easing_hookscreen.enable=True`, `startplane_scan=2`, `horizon_us=0.30`, `global_obl_iters=2`
+- 운영값(예시) 적용: `queue_refill_period_us=50.0`, `easing_hookscreen.enable=True`, `startplane_scan=2`, `horizon_us=0.30`, `global_obl_iters=2` (전역 트리거는 QUEUE_REFILL로 일원화)
 - 로깅 축소: `ObligationManager.debug=False` 기본화
 
 ---

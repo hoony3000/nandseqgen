@@ -83,41 +83,47 @@ class TimelineLogger:
 # -------------------- Gantt --------------------
 
 def plot_gantt(df: pd.DataFrame,
-               die: int = 0,
+               die: Optional[int] = None,
                blocks: Optional[Sequence[int]] = None,
                kinds: Sequence[str] = ("ERASE","PROGRAM","READ","DOUT","SR"),
                linewidth: float = 6.0,
                figsize: Tuple[float,float] = (12, 4),
                title: Optional[str] = None):
     """
-    Gantt-like timeline: y=block, x=time(us), color=base_kind.
+    Gantt-like timeline: y=(die, block), x=time(us), color=base_kind.
     """
     if df.empty:
         print("[plot_gantt] empty dataframe"); return
-    d = df[df["die"] == die]
+    d = df if die is None else df[df["die"] == die]
     if blocks is not None:
         d = d[d["block"].isin(blocks)]
     d = d[d["base_kind"].isin(kinds)]
     if d.empty:
-        print(f"[plot_gantt] no rows for die={die} with given filters"); return
+        if die is None:
+            print("[plot_gantt] no rows with given filters"); return
+        else:
+            print(f"[plot_gantt] no rows for die={die} with given filters"); return
 
-    # order blocks by first activity
-    blocks_sorted = list(d.groupby("block")["start_us"].min().sort_values().index)
-    ymap = {b:i for i,b in enumerate(blocks_sorted)}
+    # order by (die, block) numerically (ascending)
+    pairs = sorted(d[["die","block"]].drop_duplicates().itertuples(index=False, name=None))
+    ymap = { (di, bl): i for i, (di, bl) in enumerate(pairs) }
 
     plt.figure(figsize=figsize)
     for _, r in d.iterrows():
-        y = ymap[r["block"]]
+        y = ymap[(int(r["die"]), int(r["block"]))]
         c = _color_for(r["base_kind"])
         plt.hlines(y, r["start_us"], r["end_us"], colors=c, linewidth=linewidth)
 
-    plt.yticks(list(ymap.values()), [f"blk{b}" for b in blocks_sorted])
+    plt.yticks(list(ymap.values()), [f"d{di}/blk{bl}" for (di, bl) in pairs])
     plt.xlabel("time (us)")
-    plt.ylabel("block")
+    plt.ylabel("die/block")
     if title:
         plt.title(title)
     else:
-        plt.title(f"Die {die} timeline (Gantt)")
+        if die is None:
+            plt.title("All dies timeline (Gantt)")
+        else:
+            plt.title(f"Die {die} timeline (Gantt)")
 
     handles = [mpatches.Patch(color=_color_for(k), label=k) for k in kinds]
     plt.legend(handles=handles, loc="upper right", frameon=False)
@@ -129,13 +135,17 @@ def plot_gantt_by_die(df: pd.DataFrame,
                       dies: Optional[Sequence[int]] = None,
                       **kwargs):
     """
-    Convenience: 각 die에 대해 별도의 Gantt를 그립니다(루프).
+    Convenience:
+      - dies가 None이면 모든 die를 한 Figure에 함께 그립니다(die=None 전달).
+      - dies가 명시되면, 각 die별로 개별 Figure를 그립니다(루프).
     kwargs는 plot_gantt에 그대로 전달됩니다.
     """
     if df.empty:
         print("[plot_gantt_by_die] empty dataframe"); return
-    all_dies = sorted(df["die"].unique()) if dies is None else dies
-    for d in all_dies:
+    if dies is None:
+        plot_gantt(df, die=None, **kwargs)
+        return
+    for d in dies:
         plot_gantt(df, die=d, **kwargs)
 
 # -------------------- 3D plot (block–page–order) --------------------

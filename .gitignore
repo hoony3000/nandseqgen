@@ -17,5 +17,6 @@ nand_*.csv
 reject_*.csv
 stage_stats.csv
 obligation*.csv
-run*.log
+*.log
 output.txt
+perf*.csv

@@ -4,7 +4,7 @@
 # - Latch/DOUT 중 SR 예약 금지 케이스를 bus/excl에서 일관되게 차단
 
 from __future__ import annotations
-import heapq, random
+import heapq, random, sys, os, time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
@@ -19,6 +19,35 @@ from viz_tools import validate_timeline, print_validation_report, violations_to_
 SIM_RES_US = 0.01
 def quantize(t: float) -> float:
     return round(t / SIM_RES_US) * SIM_RES_US
+
+# --------------------------------------------------------------------------
+# Simple Profiler
+class _Profiler:
+    def __init__(self):
+        self._totals = {}
+        self._counts = {}
+
+    def add(self, label: str, dt: float):
+        try:
+            self._totals[label] = self._totals.get(label, 0.0) + float(dt)
+            self._counts[label] = self._counts.get(label, 0) + 1
+        except Exception:
+            pass
+
+    def to_csv(self, path: str = "perf_profile.csv"):
+        try:
+            import csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["label", "total_sec", "count", "avg_ms"]) 
+                for k in sorted(self._totals.keys()):
+                    tot = self._totals[k]; cnt = self._counts.get(k, 0)
+                    avg_ms = (tot / max(cnt, 1)) * 1000.0
+                    w.writerow([k, round(tot, 6), cnt, round(avg_ms, 3)])
+        except Exception:
+            pass
+
+PROF = _Profiler()
 
 # --------------------------------------------------------------------------
 # Config
@@ -92,13 +121,17 @@ def _validate_phase_conditional_cfg(cfg):
 CFG = {
     "rng_seed": 12345,
     "policy": {
-        "queue_refill_period_us": 50.0,
-        "run_until_us": 10000.0,
+        "queue_refill_period_us": 5.0,
+        "run_until_us": 1000.0,
         "planner_max_tries": 8,
-        "global_nudge_period_us": 20.0,
-        "easing_hookscreen": {"enable": True, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 2},
+        # global_nudge 제거됨: 전역 트리거는 QUEUE_REFILL에서 일원화 처리
+        "easing_hookscreen": {"enable": True, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
+        # "easing_hookscreen": {"enable": False, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
+        # PHASE_HOOK 차단: op.kind 기준 훅 생성 비활성화(빈 리스트면 비활성화 없음)
+        # 예: ["DOUT", "SR"]
+        "phase_hook_disabled_kinds": ["SR"],
         # bootstrap 러닝타임 여유 = last_deadline_boot + margin_per_ob * num_bootstrap_obligations
-        "run_until_bootstrap_margin_per_ob_us": 3.0,
+        "run_until_bootstrap_margin_per_ob_us": 5.0,
         "enable_phase_conditional": True,
     },
 
@@ -121,7 +154,7 @@ CFG = {
 
     # Backoff scoring weights (used if phase_conditional fails)
     "weights": {
-        "base": {"host": {"READ": 0.70, "PROGRAM": 0.15, "ERASE": 0.05, "SR": 0.10, "RESET": 0.00, "DOUT": 0.00}},
+        "base": {"host": {"READ": 0.70, "PROGRAM": 0.15, "ERASE": 0.05, "DOUT": 0.00, "SR": 0.10}},
         "g_state": {"pgmable_ratio": {"low": 1.3, "mid": 1.0, "high": 0.8},
                     "readable_ratio": {"low": 1.3, "mid": 1.0, "high": 0.9}},
         "g_local": {"plane_busy_frac": {"low": 1.2, "mid": 1.0, "high": 0.9}},
@@ -231,7 +264,8 @@ CFG = {
         "pages_per_block": 40,
     },
 
-    "export": {"tu_us": 0.01, "nop_symbol": "NOP", "wait_as_nop": True, "drift_correction": True},
+    "export": {"tu_us": 0.01, "nop_symbol": "NOP", "wait_as_nop": True, "drift_correction": True,
+                "log_to_file": False, "log_path": "run.log", "log_tee": True},
 
     # Address initial state: -1=ERASED, -2=initial(not erased)
     "address_init_state": -1,
@@ -240,16 +274,20 @@ CFG = {
     "bootstrap": {
         "enabled": False,
         "pgm_ratio": 0.2,
-        "deadline_window_us": 50.0,
-        "stage_gap_us": 0.2,
-        "stagger_us": 0.5,
-        "hard_slot": True,
+        "stage_gap_us": 0.5,
+        "stagger_us": 0.2,
+        # "hard_slot": True,
+        "hard_slot": False,
         "max_ratio": 0.5,
-        "dout_stagger_n": 0.0,
+        "dout_stagger_n": 0,
         "disable_timeline_logging": False,
         "split_timeline_logging": False,
         "bootstrap_timeline_path": "nand_timeline_bootstrap.csv",
-        "policy_timeline_path": "nand_timeline_policy.csv"
+        "policy_timeline_path": "nand_timeline_policy.csv",
+        "reduce_phase_hooks": True,
+        "hook_margin_us": 1,
+        # READ 이후 DOUT으로 넘어가기 전 전역 간극(부트스트랩 전용)
+        # "dout_global_gap_us": 5.0
     },
 }
 
@@ -267,7 +305,7 @@ OP_ALIAS = {
 # --------------------------------------------------------------------------
 # Models
 class OpKind(Enum):
-    READ=auto(); DOUT=auto(); PROGRAM=auto(); ERASE=auto(); SR=auto(); RESET=auto()
+    READ=auto(); DOUT=auto(); PROGRAM=auto(); ERASE=auto(); SR=auto();
 
 class Scope(Enum):
     NONE=0; PLANE_SET=1; DIE_WIDE=2
@@ -569,21 +607,22 @@ class AddressManager:
         self.dies=topo["dies"]; self.planes=topo["planes"]
         self.blocks=topo["blocks"]; self.pages_per_block=topo["pages_per_block"]
 
-        self.available={(0,p):0.0 for p in range(self.planes)}  # per-plane availability time
-        self.resv={(0,p):[] for p in range(self.planes)}        # per-plane reservations: (start,end,block)
+        self.available={(die,p):0.0 for p in range(self.planes) for die in range(self.dies)}  # per-plane availability time
+        self.resv={(die,p):[] for p in range(self.planes) for die in range(self.dies)}        # per-plane reservations: (start,end,block)
         self.bus_resv: List[Tuple[float,float]] = []            # global bus reservations
 
-        init_state = int(cfg.get("address_init_state", -1))
+        init_state = int(cfg.get("address_init_state", -2))
         self.addr_state_committed: Dict[Tuple[int,int], int] = {}
         self.addr_state_future:    Dict[Tuple[int,int], int] = {}
-        self.programmed_committed: Dict[Tuple[int], Set[Tuple[int,int]]] = {(0,): set()}
+        self.programmed_committed: Dict[Tuple[int], Set[Tuple[int,int]]] = {(die,): set() for die in range(self.dies)}
         self.write_head: Dict[Tuple[int,int], int] = {}  # (die,plane)->block
 
-        for b in range(self.blocks):
-            self.addr_state_committed[(0,b)] = init_state
-            self.addr_state_future[(0,b)]    = init_state
-        for p in range(self.planes):
-            self.write_head[(0,p)] = p  # first block of that plane stripe
+        for die in range(self.dies):
+            for b in range(self.blocks):
+                self.addr_state_committed[(die,b)] = init_state
+                self.addr_state_future[(die,b)]    = init_state
+            for p in range(self.planes):
+                self.write_head[(die,p)] = p  # first block of that plane stripe
 
     # ---- helpers for plane/block mapping ----
     def plane_of(self, block:int) -> int:
@@ -1310,6 +1349,7 @@ class PolicyEngine:
 
     def propose(self, now_us: float, hook: PhaseHook, g: Dict[str,str], l: Dict[str,str], earliest_start: float) -> Optional[Operation]:
         die, hook_plane = hook.die, hook.plane
+        _t_propose = time.perf_counter()
 
         # 0) obligations first
         stage = "obligation"
@@ -1320,7 +1360,9 @@ class PolicyEngine:
         horizon = float(ease_cfg.get("horizon_us", 10.0)) if easing_enabled else 10.0
         # easing: use die-wide earliest for pop feasibility to avoid hook_plane bottleneck
         pop_earliest = self.addr.candidate_start_for_scope(now_us, die, Scope.DIE_WIDE, list(range(self.addr.planes))) if easing_enabled else earliest_start
+        _t0 = time.perf_counter()
         ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=horizon, earliest_start=pop_earliest, easing=easing_enabled)
+        PROF.add("obl.pop_urgent", time.perf_counter() - _t0)
         if ob:
             cfg_op=self.cfg["op_specs"][ob.require.name]
             op=build_operation(ob.require, cfg_op, ob.targets)
@@ -1385,6 +1427,7 @@ class PolicyEngine:
                     # ACCEPT
                     self.rejlog.log_accept(stage)
                     op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"
+                    PROF.add("spe.propose", time.perf_counter() - _t_propose)
                     return op
         else:
             # no obligation
@@ -1406,7 +1449,9 @@ class PolicyEngine:
         if not dist:
             self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_dist_for_hook")
         else:
+            _t_rlet = time.perf_counter()
             pick=roulette_pick(dist, allow)
+            PROF.add("spe.roulette_pick", time.perf_counter() - _t_rlet)
             if not pick:
                 self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "roulette_zero_weight")
             else:
@@ -1417,7 +1462,9 @@ class PolicyEngine:
                     fanout=1; alias_used="SR"
                 else:
                     fanout, interleave=self._fanout_from_alias(base, alias_const, hook.label)
+                    _t_plan = time.perf_counter()
                     plan=self.addr.plan_multipane(kind, die, hook_plane, fanout, interleave)
+                    PROF.add("addr.plan_multipane", time.perf_counter() - _t_plan)
                     alias_used=pick
                     if not plan and fanout>1:
                         self.stats["alias_degrade"]+=1
@@ -1433,7 +1480,9 @@ class PolicyEngine:
                             plan=self.addr.plan_multipane(kind, die, p, 1, True)
                             fanout=1
                         else:
+                            _t_plan2 = time.perf_counter()
                             plan=self.addr.plan_multipane(kind, die, p, fanout, interleave)
+                            PROF.add("addr.plan_multipane", time.perf_counter() - _t_plan2)
                         tried += 1
                         p = (p + 1) % self.addr.planes
                 if not plan:
@@ -1460,9 +1509,11 @@ class PolicyEngine:
                         # ACCEPT
                         self.rejlog.log_accept(stage)
                         op.meta["source"]="policy.phase_conditional"; op.meta["phase_key_used"]=used_key
+                        PROF.add("spe.propose", time.perf_counter() - _t_propose)
                         return op
 
         # backoff 단계 제거됨 (충돌 정합성 해소 계획에 따라 비활성화)
+        PROF.add("spe.propose", time.perf_counter() - _t_propose)
         return None
 
 # --------------------------------------------------------------------------
@@ -1489,13 +1540,13 @@ def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl
         return
     ratio = float(bs.get("pgm_ratio", 0.0))
     ratio = max(0.0, min(ratio, float(bs.get("max_ratio", 0.5))))
+    dies = addr.dies
     pages_per_block = addr.pages_per_block
     k = int(min(max(int(pages_per_block * ratio), 0), max(pages_per_block - 1, 0)))
     if k <= 0:
         return
     die = 0
     planes = addr.planes
-    t_win = float(bs.get("deadline_window_us", 50.0))
     gap = float(bs.get("stage_gap_us", 0.2))
     # base stagger; can be overridden by DOUT N-multiple rule below when generating DOUT obligations
     stagger = float(bs.get("stagger_us", 0.5))
@@ -1503,85 +1554,111 @@ def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl
     # nominal durations for dependency-aware deadlines
     erase_nom = get_kind_nominal_duration(cfg, "ERASE")
     prog_nom  = get_kind_nominal_duration(cfg, "PROGRAM")
-    erase_serial_span = planes * erase_nom  # DIE_WIDE → serial on die
+    read_nom  = get_kind_nominal_duration(cfg, "READ")
+    dout_nom  = get_kind_nominal_duration(cfg, "DOUT")
+    dout_mult = float(bs.get("dout_stagger_n", 0.0))
+    stagger_dout = max(stagger, dout_nom * dout_mult) if dout_mult > 0.0 else stagger
+
+    # gap_global = float(bs.get("dout_global_gap_us", 50.0))
+
     # eps 상수화(슬림 스키마): 필요 시 코드 변경으로 조정
-    eps_prog = 2.0
-    eps_read = 2.0
-    order_eps = 0.2
     # per-page step so that p increases in order and READ(p) < PROGRAM(p+1)
-    prog_step = prog_nom + max(eps_prog, eps_read + order_eps)
     seq_id = obl._seq
     # iterate all block stripes across planes so that every block is covered
     stripes = (addr.blocks + planes - 1) // planes
     # next stripe starts after the last deadline of previous stripe (strictly increasing)
-    stripe_base = quantize(addr.available_at(die, 0) + t_win)
+    stripe_base = quantize(addr.available_at(die, 0) + gap)
+    stripe_last_deadline = stripe_base
     # init creation logger
     if not hasattr(obl, "creation_logger"):
         obl.creation_logger = CreationLogger()
-    for s in range(stripes):
-        stripe_last_deadline = stripe_base
-        for p in range(k):
-            plane_targets = []
-            for pl in range(planes):
-                b_idx = pl + s * planes
-                if b_idx >= addr.blocks:
+    for die in range(dies):
+        # ERASE
+        for s in range(stripes):
+            for p in range(k):
+                plane_targets = []
+                for pl in range(planes):
+                    b_idx = pl + s * planes
+                    if b_idx >= addr.blocks:
+                        continue
+                    plane_targets.append(Address(die, pl, b_idx, p))
+                if not plane_targets:
                     continue
-                plane_targets.append(Address(die, pl, b_idx, p))
-            if not plane_targets:
-                continue
-            base = quantize(stripe_base + p * (3.0 * gap + stagger))
-            if p == 0:
-                # ERASE: multi-plane (all planes in this stripe)
+                erase_base = stripe_last_deadline + gap
+                erase_deadline = quantize(erase_base + erase_nom)
+                if p == 0:
+                    # ERASE: multi-plane (all planes in this stripe)
+                    seq_id += 1
+                    ob_erase = Obligation(id=seq_id, require=OpKind.ERASE, targets=list(plane_targets),
+                                        deadline_us=quantize(erase_deadline), hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
+                    heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_erase.deadline_us, seq=ob_erase.id, ob=ob_erase))
+                    obl.stats["created"] += 1
+                    obl.creation_logger.log(ob_erase, context="bootstrap", stripe=s, page_index=p)
+                    if obl.debug:
+                        dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.ERASE))
+                        print(f"[BOOTAUD] ERASE deadlines p=0: {dls}")
+                    stripe_last_deadline = ob_erase.deadline_us
+
+        # PROGRAM
+        for s in range(stripes):
+            for p in range(k):
+                plane_targets = []
+                for pl in range(planes):
+                    b_idx = pl + s * planes
+                    if b_idx >= addr.blocks:
+                        continue
+                    plane_targets.append(Address(die, pl, b_idx, p))
+                if not plane_targets:
+                    continue
+                # PROGRAM deadline: ensure page order
+                pgm_base = stripe_last_deadline + gap
+                prog_deadline = quantize(pgm_base + prog_nom)
                 seq_id += 1
-                ob_erase = Obligation(id=seq_id, require=OpKind.ERASE, targets=list(plane_targets),
-                                      deadline_us=quantize(base), hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
-                heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_erase.deadline_us, seq=ob_erase.id, ob=ob_erase))
+                ob_pgm = Obligation(id=seq_id, require=OpKind.PROGRAM, targets=plane_targets,
+                                    deadline_us=prog_deadline, hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
+                heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_pgm.deadline_us, seq=ob_pgm.id, ob=ob_pgm))
                 obl.stats["created"] += 1
-                obl.creation_logger.log(ob_erase, context="bootstrap", stripe=s, page_index=p)
+                obl.creation_logger.log(ob_pgm, context="bootstrap", stripe=s, page_index=p)
                 if obl.debug:
-                    dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.ERASE))
-                    print(f"[BOOTAUD] ERASE deadlines p=0: {dls}")
-                stripe_last_deadline = max(stripe_last_deadline, base)
-            # PROGRAM deadline: ensure page order by adding p * prog_step and respecting ERASE span
-            pgm_base = max(base + gap, base + erase_serial_span + max(eps_prog, order_eps))
-            prog_deadline = quantize(pgm_base + p * prog_step)
-            seq_id += 1
-            ob_pgm = Obligation(id=seq_id, require=OpKind.PROGRAM, targets=plane_targets,
-                                deadline_us=prog_deadline, hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
-            heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_pgm.deadline_us, seq=ob_pgm.id, ob=ob_pgm))
-            obl.stats["created"] += 1
-            obl.creation_logger.log(ob_pgm, context="bootstrap", stripe=s, page_index=p)
-            if obl.debug:
-                dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.PROGRAM))
-                print(f"[BOOTAUD] PROGRAM deadlines p={p}: {dls}")
-            stripe_last_deadline = max(stripe_last_deadline, prog_deadline)
-            # READ deadline: after PROGRAM(p) completes nominally
-            read_deadline = quantize(max(base + 2.0 * gap, prog_deadline + prog_nom + max(eps_read, order_eps)))
-            seq_id += 1
-            ob_read = Obligation(id=seq_id, require=OpKind.READ, targets=plane_targets,
-                                 deadline_us=read_deadline, hard_slot=hard_slot, source="bootstrap", skip_dout_creation=True)
-            heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_read.deadline_us, seq=ob_read.id, ob=ob_read))
-            obl.stats["created"] += 1
-            obl.creation_logger.log(ob_read, context="bootstrap", stripe=s, page_index=p)
-            if obl.debug:
-                dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.READ))
-                print(f"[BOOTAUD] READ deadlines p={p}: {dls}")
-            stripe_last_deadline = max(stripe_last_deadline, read_deadline)
-            # Pair (READ->DOUT) per page: DOUT after READ(p)
-            dout_nominal = get_kind_nominal_duration(cfg, "DOUT")
-            dout_mult = float(bs.get("dout_stagger_n", 0.0))
-            stagger_dout = max(stagger, dout_nominal * dout_mult) if dout_mult > 0.0 else stagger
-            base_dout_p = quantize(read_deadline + max(order_eps, 0.2))
-            for idx, t in enumerate(sorted(plane_targets, key=lambda a: a.plane)):
+                    dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.PROGRAM))
+                    print(f"[BOOTAUD] PROGRAM deadlines p={p}: {dls}")
+                stripe_last_deadline = ob_pgm.deadline_us
+
+        # READ
+        for s in range(stripes):
+            for p in range(k):
+                plane_targets = []
+                for pl in range(planes):
+                    b_idx = pl + s * planes
+                    if b_idx >= addr.blocks:
+                        continue
+                    plane_targets.append(Address(die, pl, b_idx, p))
+                if not plane_targets:
+                    continue
+                # READ deadline: after PROGRAM(p) completes nominally
+                read_base = stripe_last_deadline + gap
+                read_deadline = quantize(read_base + read_nom)
                 seq_id += 1
-                ob_dout = Obligation(id=seq_id, require=OpKind.DOUT, targets=[Address(t.die, t.plane, t.block, p)],
-                                     deadline_us=quantize(base_dout_p + idx * stagger_dout), hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
-                heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_dout.deadline_us, seq=ob_dout.id, ob=ob_dout))
+                ob_read = Obligation(id=seq_id, require=OpKind.READ, targets=plane_targets,
+                                    deadline_us=read_deadline, hard_slot=hard_slot, source="bootstrap", skip_dout_creation=True)
+                heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_read.deadline_us, seq=ob_read.id, ob=ob_read))
                 obl.stats["created"] += 1
-                obl.creation_logger.log(ob_dout, context="bootstrap", stripe=s, page_index=p)
-                stripe_last_deadline = max(stripe_last_deadline, ob_dout.deadline_us)
-        # next stripe starts strictly after last deadline of this stripe
-        stripe_base = quantize(stripe_last_deadline + max(order_eps, 0.2))
+                obl.creation_logger.log(ob_read, context="bootstrap", stripe=s, page_index=p)
+                if obl.debug:
+                    dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.READ))
+                    print(f"[BOOTAUD] READ deadlines p={p}: {dls}")
+                stripe_last_deadline = ob_read.deadline_us + gap
+                # Pair (READ->DOUT) per page: DOUT after READ(p)
+                for idx, t in enumerate(sorted(plane_targets, key=lambda a: a.plane)):
+                    dout_base = stripe_last_deadline + gap
+                    dout_deadline = quantize(dout_base + stagger_dout)
+                    seq_id += 1
+                    ob_dout = Obligation(id=seq_id, require=OpKind.DOUT, targets=[Address(t.die, t.plane, t.block, p)],
+                                        deadline_us=quantize(dout_deadline), hard_slot=hard_slot, source="bootstrap", skip_dout_creation=False)
+                    heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_dout.deadline_us, seq=ob_dout.id, ob=ob_dout))
+                    obl.stats["created"] += 1
+                    obl.creation_logger.log(ob_dout, context="bootstrap", stripe=s, page_index=p)
+                    stripe_last_deadline = ob_dout.deadline_us
     obl._seq = seq_id
 
 class Scheduler:
@@ -1593,13 +1670,10 @@ class Scheduler:
         self.stat_propose_calls=0; self.stat_scheduled=0
         self.logger = logger or TimelineLogger()
         self.latch = latch or LatchManager()
-        self._push(0.0, "QUEUE_REFILL", None)
+        self._push(1, "QUEUE_REFILL", None)
         for plane in range(self.addr.planes):
-            self._push(0.0, "PHASE_HOOK", PhaseHook(0.0, "BOOT.START", 0, plane))
-        # optional global nudge
-        gp = self.cfg.get("policy", {}).get("global_nudge_period_us")
-        if gp:
-            self._push(gp, "GLOBAL_NUDGE", None)
+            self._push(2, "PHASE_HOOK", PhaseHook(2, "BOOT.START", 0, plane))
+        # optional global nudge: 일원화 → QUEUE_REFILL에서 처리
         # bootstrap watchdog
         self._bootstrap_started=False
         self._bootstrap_start_time=None
@@ -1627,6 +1701,7 @@ class Scheduler:
         return op.kind.name
 
     def _schedule_operation(self, op: Operation):
+        _t_sched = time.perf_counter()
         start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
 
         # ---- fail-safe: schedule 직전 마지막 충돌 점검 ----
@@ -1643,10 +1718,12 @@ class Scheduler:
         # -----------------------------------------------
 
         # reserve plane scope + bus + register exclusions + future update
+        _t_res = time.perf_counter()
         self.addr.reserve_planescope(op, start, end)
-        self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
-        self.excl.register(op, start)
-        self.addr.register_future(op, start, end)
+        PROF.add("addr.reserve_planescope", time.perf_counter() - _t_res)
+        _t_bus = time.perf_counter(); self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op)); PROF.add("addr.bus_reserve", time.perf_counter() - _t_bus)
+        _t_excl = time.perf_counter(); self.excl.register(op, start); PROF.add("excl.register", time.perf_counter() - _t_excl)
+        _t_fut = time.perf_counter(); self.addr.register_future(op, start, end); PROF.add("addr.register_future", time.perf_counter() - _t_fut)
         # latch: if READ, plan lock from READ.end_us until DOUT ends
         if op.kind == OpKind.READ:
             self.latch.plan_lock_after_read(op.targets, end)
@@ -1704,17 +1781,32 @@ class Scheduler:
 
         # push events
         self._push(start, "OP_START", op); self._push(end, "OP_END", op)
+        PROF.add("sched._schedule_operation", time.perf_counter() - _t_sched)
 
-        # hooks
+        # hooks: bootstrap에서는 훅을 1회로 축소(END만). 비부트스트랩은 기존 2~3회 유지
+        bs_cfg = self.cfg.get("bootstrap", {})
+        pol_cfg = self.cfg.get("policy", {})
+        # bootstrap 전용: 오퍼레이션이 bootstrap 소스일 때만 훅 축소 적용
+        is_bootstrap_op = (op.meta.get("source") == "bootstrap")
+        reduce_hooks = bool(bs_cfg.get("reduce_phase_hooks", False)) and is_bootstrap_op
+        hook_margin = float(bs_cfg.get("hook_margin_us", 0.1))
+        # kind별 훅 차단
+        disabled_kinds = set(str(k).upper() for k in pol_cfg.get("phase_hook_disabled_kinds", []))
+        hooks_blocked = (op.kind.name in disabled_kinds)
         label_op=self._label_for_read(op)
-        for t in op.targets:
-            cur=start
-            for s in op.states:
-                self._push(cur,               "PHASE_HOOK", PhaseHook(cur,               f"{label_op}.{s.name}.START", t.die, t.plane))
-                if s.name=="CORE_BUSY":
-                    self._push(cur + s.dur_us*0.5, "PHASE_HOOK", PhaseHook(cur + s.dur_us*0.5, f"{label_op}.{s.name}.MID",   t.die, t.plane))
-                self._push(cur + s.dur_us,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{label_op}.{s.name}.END",   t.die, t.plane))
-                cur += s.dur_us
+        if not hooks_blocked:
+            for t in op.targets:
+                if reduce_hooks:
+                    # op 종료 시각 + margin 기준 한 번만 훅 발생
+                    self._push(end + hook_margin, "PHASE_HOOK", PhaseHook(end + hook_margin, f"{label_op}.END", t.die, t.plane))
+                else:
+                    cur=start
+                    for s in op.states:
+                        self._push(cur,               "PHASE_HOOK", PhaseHook(cur,               f"{label_op}.{s.name}.START", t.die, t.plane))
+                        if s.name=="CORE_BUSY":
+                            self._push(cur + s.dur_us*0.5, "PHASE_HOOK", PhaseHook(cur + s.dur_us*0.5, f"{label_op}.{s.name}.MID",   t.die, t.plane))
+                        self._push(cur + s.dur_us,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{label_op}.{s.name}.END",   t.die, t.plane))
+                        cur += s.dur_us
 
         first=op.targets[0]
         print(f"[{self.now:7.2f} us] SCHED  {op.kind.name:7s} arity={op.meta.get('arity')} scope={op.meta.get('scope')} start={start:7.2f} end={end:7.2f} 1st={_addr_str(first)} src={op.meta.get('source')} alias={op.meta.get('alias_used')}")
@@ -1723,6 +1815,7 @@ class Scheduler:
 
     def run_until(self, t_end: float):
         t_end=quantize(t_end)
+        _t_loop = time.perf_counter()
         while self.ev and self.ev[0][0] <= t_end:
             self.now, _, typ, payload = heapq.heappop(self.ev)
 
@@ -1730,19 +1823,14 @@ class Scheduler:
             self.obl.expire_due(self.now)
 
             if typ=="QUEUE_REFILL":
-                for plane in range(self.addr.planes):
-                    self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "REFILL.NUDGE", 0, plane))
-                self._push(self.now + self.cfg["policy"]["queue_refill_period_us"], "QUEUE_REFILL", None)
-            elif typ=="GLOBAL_NUDGE":
-                # trigger a global proposal tick on each plane (as a global trigger)
+                # 일원화된 훅 트리거: 글로벌/로컬 모두 여기에서 처리
                 ease_cfg = self.cfg.get("policy", {}).get("easing_hookscreen", {})
                 iters = max(1, int(ease_cfg.get("global_obl_iters", 1)))
                 for _ in range(iters):
-                    for plane in range(self.addr.planes):
-                        self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "GLOBAL.NUDGE", 0, plane))
-                gp = self.cfg.get("policy", {}).get("global_nudge_period_us")
-                if gp:
-                    self._push(self.now + gp, "GLOBAL_NUDGE", None)
+                    for die in range(self.addr.dies):
+                        for plane in range(self.addr.planes):
+                            self._push(self.now, "PHASE_HOOK", PhaseHook(self.now, "REFILL.NUDGE", die, plane))
+                self._push(self.now + self.cfg["policy"]["queue_refill_period_us"], "QUEUE_REFILL", None)
 
             elif typ=="PHASE_HOOK":
                 hook: PhaseHook = payload
@@ -1758,7 +1846,9 @@ class Scheduler:
                     if self._bootstrap_started and self._bootstrap_end_time is None:
                         self._bootstrap_end_time=self.now
                 self.stat_propose_calls+=1
+                _t_spe = time.perf_counter()
                 op=self.SPE.propose(self.now, hook, g, l, earliest_start)
+                PROF.add("spe.propose_total", time.perf_counter() - _t_spe)
                 if op: self._schedule_operation(op)
 
             elif typ=="OP_START":
@@ -1778,6 +1868,7 @@ class Scheduler:
                 self.obl.on_commit(op, self.now)
 
         # final stats
+        PROF.add("sched.run_until", time.perf_counter() - _t_loop)
         print(f"\n=== Stats ===")
         print(f"run_until     : {t_end:.2f}")
         print(f"propose calls : {self.stat_propose_calls}")
@@ -1795,6 +1886,40 @@ class Scheduler:
 # Main
 def main():
     # 1) 구성
+    # 1.0) 로깅 옵션
+    CFG["export"]["log_to_file"] = True
+    CFG["export"]["log_tee"] = False
+    CFG["bootstrap"]["disable_timeline_logging"] = False
+    CFG["bootstrap"]["split_timeline_logging"] = False
+    # 1.1) bootstrap, phase conditional 활성화 여부 설정
+    CFG["bootstrap"]["enabled"] = True
+    CFG["policy"]["enable_phase_conditional"] = True
+    CFG["bootstrap"]["pgm_ratio"] = 0.2
+    # 1.2) topology 설정
+    CFG["topology"]["dies"] = 1
+    CFG["topology"]["planes"] = 4
+    CFG["topology"]["blocks"] = 32
+    CFG["topology"]["pages_per_block"] = 40
+    print(f"topology: {CFG['topology']}")
+    try:
+        exp = CFG.get("export", {})
+        if bool(exp.get("log_to_file", False)):
+            path = str(exp.get("log_path", "run.log"))
+            f = open(path, "w", encoding="utf-8", newline="")
+            if bool(exp.get("log_tee", True)):
+                class _Tee:
+                    def __init__(self, a, b):
+                        self.a=a; self.b=b
+                    def write(self, s):
+                        self.a.write(s); self.b.write(s)
+                    def flush(self):
+                        self.a.flush(); self.b.flush()
+                sys.stdout = _Tee(sys.stdout, f)
+            else:
+                sys.stdout = f
+    except Exception as e:
+        print(f"[LOG] redirect skipped: {e}")
+
     _seed_rng_from_cfg(CFG)
     _coerce_states_to_fixed(CFG)
     _validate_phase_conditional_cfg(CFG)
@@ -1806,20 +1931,9 @@ def main():
     spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch)
     sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger, latch=latch)
 
-    # 1.1) bootstrap, phase conditional 활성화 여부 설정
-    CFG["bootstrap"]["enabled"] = True
-    CFG["policy"]["enable_phase_conditional"] = True
-    CFG["bootstrap"]["disable_timeline_logging"] = False
-    CFG["bootstrap"]["split_timeline_logging"] = True
+    obl.debug = False # debug mode
 
-    # 1.2) topology 설정
-    CFG["topology"]["dies"] = 1
-    CFG["topology"]["planes"] = 4
-    CFG["topology"]["blocks"] = 32
-    CFG["topology"]["pages_per_block"] = 40
-    print(f"topology: {CFG['topology']}")
-
-    # 1.5) Bootstrap obligations (optional)
+    # 1.3) Bootstrap obligations (optional)
     try:
         populate_bootstrap_obligations(CFG, addr, obl)
     except Exception as e:
@@ -1838,6 +1952,7 @@ def main():
                 margin_per_ob = float(CFG.get("policy", {}).get("run_until_bootstrap_margin_per_ob_us", 3.0))
                 # 제안식: run_until_boot = last_deadline_boot + num_bootstrap_ob * margin_per_ob
                 run_until_boot = quantize(last_deadline_boot + num_bootstrap_ob * margin_per_ob)
+                print(f"bootstrap: {num_bootstrap_ob} obligations, run_until_boot={run_until_boot}")
     except Exception:
         run_until_boot = 0.0
     # 총 런: run_until_tot = run_until_boot + run_until_base (사용자 제안식)
@@ -1885,14 +2000,17 @@ def main():
         df.to_csv("nand_timeline.csv", index=False)
 
     # 4) 규칙 자동검증
+    _t_val = time.perf_counter()
     report = validate_timeline(df, CFG)
+    PROF.add("viz.validate_timeline", time.perf_counter() - _t_val)
     print_validation_report(report, max_rows=30)
     viol_df = violations_to_dataframe(report)
     viol_df.to_csv("nand_violations.csv", index=False)
 
     # 4.5) Rejection log
     try:
-        rejlog.to_csv("reject_log.csv")
+        # rejlog.to_csv("reject_log.csv")
+        rejlog.to_obligation_skips_csv("obligation_skips.csv")
         print("\n=== Rejection Summary (by stage/reason) ===")
         for stage, d in rejlog.stats.items():
             total = sum(d.values())
@@ -1910,6 +2028,12 @@ def main():
             obl.creation_logger.to_csv("obligation_creations.csv")
     except Exception as e:
         print(f"[CREATIONS] skipped: {e}")
+
+    # 4.7) 성능 프로파일 저장
+    try:
+        PROF.to_csv("perf_profile.csv")
+    except Exception:
+        pass
 
     # 5) 시각화
     if split_logging and (df_boot is not None or df_pol is not None):
