@@ -14,6 +14,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import matplotlib.patches as mpatches
+import os, json, math, csv
 
 # -------------------- Colors (can be customized) --------------------
 DEFAULT_COLORS = {
@@ -471,3 +472,295 @@ def violations_to_dataframe(report: Dict[str, Any]) -> pd.DataFrame:
             "t0": isu.t0, "t1": isu.t1, "detail": isu.detail
         })
     return pd.DataFrame(rows)
+
+# -------------------- Pattern Export (ATE CSV) --------------------
+def _get_pattern_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    pe = cfg.get("pattern_export")
+    if not pe:
+        raise ValueError("CFG['pattern_export'] is missing. Add defaults in nandsim_demo.py.")
+    return pe
+
+def _alias_name_for_export(base_kind: str,
+                           kinds_in_group: Sequence[str],
+                           arity: int,
+                           pe: Dict[str, Any]) -> str:
+    # 1) 로그에 SIN_/MUL_ 별칭이 이미 있으면 그걸 사용(동일 base일 때)
+    for k in kinds_in_group:
+        if isinstance(k, str) and (k.startswith("SIN_") or k.startswith("MUL_")):
+            tail = k.split("_", 1)[1] if "_" in k else None
+            if tail == base_kind:
+                return k
+    # 2) 없으면 arity 기준으로 별칭 생성 (apply_to 대상에 한함)
+    apply_to = set(pe.get("aliasing", {}).get("apply_to", []))
+    if base_kind in apply_to:
+        th = int(pe.get("aliasing", {}).get("mul_threshold", 2))
+        return ("MUL_" if int(arity) >= th else "SIN_") + base_kind
+    return base_kind
+
+def pattern_build_ops_from_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    TimelineLogger DataFrame을 '오퍼레이션 1건=CSV 1행'으로 집계.
+    - op_uid가 있으면 op_uid로 그룹; 없으면 (die,start_us,end_us,base_kind,source)로 보수적으로 그룹
+    - time은 그룹의 start_us 최소값에 time.scale/round_decimals 적용
+    - payload는 CFG.pattern_export.payload 규칙 적용
+    """
+    pe = _get_pattern_cfg(cfg)
+    if df is None or df.empty:
+        return []
+
+    df2 = df.copy()
+    use_uid = ("op_uid" in df2.columns) and df2["op_uid"].ge(0).any()
+    if use_uid:
+        groups = df2.groupby("op_uid", sort=False)
+    else:
+        key_cols = ["die", "start_us", "end_us", "base_kind", "source"]
+        for k in key_cols:
+            if k not in df2.columns:
+                df2[k] = None
+        groups = df2.groupby(key_cols, sort=False)
+
+    rows: List[Dict[str, Any]] = []
+    tscale = float(pe.get("time", {}).get("scale", 1.0))
+    rdec   = int(pe.get("time", {}).get("round_decimals", 3))
+
+    for key, grp in groups:
+        base = str(grp["base_kind"].iloc[0])
+        die  = int(grp["die"].iloc[0]) if "die" in grp.columns else 0
+        smin = float(grp["start_us"].min())
+        emax = float(grp["end_us"].max())
+        arity = int(grp["arity"].max()) if ("arity" in grp.columns and grp["arity"].notna().any()) else int(len(grp))
+        kinds_in_group = [str(x) for x in (grp["kind"].unique() if "kind" in grp.columns else [base])]
+
+        op_name = _alias_name_for_export(base, kinds_in_group, arity, pe)
+        if base in ("DOUT", "SR"):  # DOUT/SR은 별칭 사용 안 함
+            op_name = base
+
+        op_id = pe.get("opcode_map", {}).get(op_name, None)
+        time_val = round(smin * tscale, rdec)
+
+        # 타겟 정렬(결정적 순서): plane, block, page
+        grp_sorted = grp.sort_values(["plane","block","page"], na_position="last")
+        targets: List[Dict[str,int]] = []
+        for _, r in grp_sorted.iterrows():
+            page = int(r["page"]) if pd.notna(r["page"]) else 0
+            targets.append({
+                "die": int(r["die"]), "pl": int(r["plane"]),
+                "block": int(r["block"]), "page": page
+            })
+
+        # payload 스펙
+        payload_spec = pe.get("payload", {}).get(op_name, pe.get("payload", {}).get("default", {"kind":"addresses_list"}))
+        pkind = payload_spec.get("kind", "addresses_list") if isinstance(payload_spec, dict) else str(payload_spec)
+        if pkind == "addresses_first":
+            payload_obj = targets[0] if targets else {}
+        elif pkind == "nop_rep_only":
+            payload_obj = {}  # NOP은 삽입 단계에서 채움
+        else:  # "addresses_list"
+            payload_obj = targets
+
+        # 그룹 ID
+        gid = int(grp.index[0]) if use_uid else hash((die, smin, emax, base))
+
+        rows.append({
+            "op_gid": gid,
+            "die": die,
+            "time_us": time_val,
+            "start_us_raw": smin,
+            "end_us": emax,
+            "op_name": op_name,
+            "op_id": op_id,
+            "payload_obj": payload_obj,
+            "base_kind": base,
+            "arity": arity,
+            "group_df": grp,
+        })
+
+    rows.sort(key=lambda r: (r["time_us"], r["op_gid"]))
+    return rows
+
+def pattern_maybe_insert_nops(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """인접 오퍼레이션 사이의 간극을 NOP(rep)로 채움."""
+    pe = _get_pattern_cfg(cfg)
+    nop_cfg = pe.get("nop", {})
+    if not nop_cfg or not nop_cfg.get("enable", False) or not rows:
+        return list(rows)
+
+    quantum = float(nop_cfg.get("quantum_us", 1.0))
+    min_gap = float(nop_cfg.get("min_gap_us", 0.0))
+    rdec    = int(pe.get("time", {}).get("round_decimals", 3))
+    tscale  = float(pe.get("time", {}).get("scale", 1.0))
+
+    out: List[Dict[str, Any]] = []
+
+    # 시작부 gap
+    prev_end = 0.0
+    first_start = float(rows[0].get("start_us_raw", rows[0]["time_us"]))
+    gap0 = first_start - prev_end
+    if gap0 >= min_gap:
+        rep = int(math.floor(gap0 / max(quantum, 1e-12)))
+        if rep > 0:
+            out.append({
+                "op_gid": -1, "die": int(rows[0]["die"]),
+                "time_us": round(prev_end * tscale, rdec),
+                "start_us_raw": prev_end, "end_us": prev_end,
+                "op_name": nop_cfg.get("op_name", "NOP"),
+                "op_id": int(nop_cfg.get("opcode", 0)),
+                "payload_obj": {str(nop_cfg.get("rep_key", "rep")): rep},
+                "base_kind": "NOP", "arity": 1, "group_df": None
+            })
+
+    for i, row in enumerate(rows):
+        if i > 0:
+            p = rows[i-1]
+            prev_end = float(p.get("end_us", p["time_us"]))
+            start = float(row.get("start_us_raw", row["time_us"]))
+            gap = start - prev_end
+            if gap >= min_gap:
+                rep = int(math.floor(gap / max(quantum, 1e-12)))
+                if rep > 0:
+                    out.append({
+                        "op_gid": -1, "die": int(row["die"]),
+                        "time_us": round(prev_end * tscale, rdec),
+                        "start_us_raw": prev_end, "end_us": prev_end,
+                        "op_name": nop_cfg.get("op_name", "NOP"),
+                        "op_id": int(nop_cfg.get("opcode", 0)),
+                        "payload_obj": {str(nop_cfg.get("rep_key", "rep")): rep},
+                        "base_kind": "NOP", "arity": 1, "group_df": None
+                    })
+        out.append(row)
+
+    return out
+
+def pattern_preflight(rows: List[Dict[str, Any]], df: pd.DataFrame, cfg: Dict[str, Any]) -> List[str]:
+    """출력 전 사전점검: opcode, payload JSON, page_equal_required, 시간 단조 증가."""
+    pe = _get_pattern_cfg(cfg)
+    errs: List[str] = []
+    if not rows:
+        return errs
+
+    opt = pe.get("preflight", {})
+    req_opcode   = bool(opt.get("require_opcode", True))
+    req_json     = bool(opt.get("require_json_payload", True))
+    chk_time     = bool(opt.get("time_monotonic", True))
+    chk_page_eq  = bool(opt.get("page_equal_required_from_op_specs", True))
+
+    prev_t = None
+    for idx, r in enumerate(rows):
+        if req_opcode and (r.get("op_id") is None):
+            errs.append(f"[row#{idx}] missing opcode for op_name={r.get('op_name')}")
+        if req_json:
+            try:
+                json.dumps(r.get("payload_obj", {}), ensure_ascii=False)
+            except Exception as e:
+                errs.append(f"[row#{idx}] payload not JSON-serializable: {e}")
+
+        if chk_page_eq and r.get("group_df") is not None:
+            base = str(r.get("base_kind"))
+            spec = cfg.get("op_specs", {}).get(base, {})
+            if spec and bool(spec.get("page_equal_required", False)):
+                grp = r["group_df"]
+                pages = set(int(p) for p in grp["page"].dropna().astype(int).tolist())
+                if len(pages) > 1:
+                    errs.append(f"[row#{idx}] page_equal_required violation ({r.get('op_name')} pages={sorted(pages)})")
+
+        if chk_time:
+            t = float(r.get("time_us", 0.0))
+            if prev_t is not None and t < prev_t:
+                errs.append(f"[row#{idx}] non-monotonic time: {t} < {prev_t}")
+            prev_t = t
+
+    return errs
+
+def pattern_split_rows(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    """행수/시간 기준 분할."""
+    pe = _get_pattern_cfg(cfg)
+    if not rows:
+        return []
+
+    parts: List[List[Dict[str, Any]]] = [rows]
+    sp = pe.get("split", {})
+
+    # by_time
+    bt = sp.get("by_time", {})
+    if bt.get("enable", False):
+        chunk = float(bt.get("chunk_us", 0.0))
+        if chunk > 0:
+            new_parts: List[List[Dict[str, Any]]] = []
+            cur: List[Dict[str, Any]] = []
+            window_end = rows[0]["time_us"] + chunk
+            for r in rows:
+                if not cur or r["time_us"] < window_end:
+                    cur.append(r)
+                else:
+                    new_parts.append(cur); cur = [r]
+                    window_end = r["time_us"] + chunk
+            if cur: new_parts.append(cur)
+            parts = new_parts
+
+    # by_rows
+    br = sp.get("by_rows", {})
+    if br.get("enable", False):
+        n = int(br.get("max_rows", 0))
+        if n > 0:
+            chopped: List[List[Dict[str, Any]]] = []
+            for prt in parts:
+                for i in range(0, len(prt), n):
+                    chopped.append(prt[i:i+n])
+            parts = chopped
+
+    return parts
+
+def pattern_rows_to_dataframe(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> pd.DataFrame:
+    pe = _get_pattern_cfg(cfg)
+    cols = list(pe.get("columns", ["seq","time","op_id","op_name","payload"]))
+    time_col = pe.get("time", {}).get("out_col", "time")
+
+    recs = []
+    for r in rows:
+        recs.append({
+            time_col: r["time_us"],
+            "op_id": int(r["op_id"] if r.get("op_id") is not None else 0),
+            "op_name": str(r["op_name"]),
+            "payload": json.dumps(r.get("payload_obj", {}), ensure_ascii=False, separators=(",",":")),
+        })
+    df_out = pd.DataFrame(recs)
+    df_out.insert(0, "seq", range(len(df_out)))
+    # 요청된 컬럼 순으로 정렬(없는 컬럼은 무시)
+    df_out = df_out[[c for c in cols if c in df_out.columns]]
+    return df_out
+
+def pattern_export_csv_parts(dfs: List[pd.DataFrame], out_dir: str, prefix: str) -> List[str]:
+    os.makedirs(out_dir, exist_ok=True)
+    paths: List[str] = []
+    for i, d in enumerate(dfs):
+        path = os.path.join(out_dir, f"{prefix}_{i:03d}.csv")
+        d.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL)
+        paths.append(path)
+    return paths
+
+def export_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[str]:
+    """end-to-end: build → NOP → preflight → split → to_csv, 반환은 파일 경로 리스트"""
+    pe = _get_pattern_cfg(cfg)
+    rows = pattern_build_ops_from_timeline(df, cfg)
+    if pe.get("nop", {}).get("enable", False):
+        rows = pattern_maybe_insert_nops(rows, cfg)
+
+    errs = pattern_preflight(rows, df, cfg)
+    if errs:
+        print(f"[pattern_export][preflight] {len(errs)} issue(s) found.")
+        for e in errs[:50]:
+            print("  -", e)
+
+    parts = pattern_split_rows(rows, cfg)
+    dfs   = [pattern_rows_to_dataframe(p, cfg) for p in parts]
+    out_dir = pe.get("output_dir", "out_patterns")
+    prefix  = pe.get("file_prefix", "pattern")
+    return pattern_export_csv_parts(dfs, out_dir, prefix)
+
+def pattern_preview_dataframe(df: pd.DataFrame, cfg: Dict[str, Any], insert_nops: bool = True) -> pd.DataFrame:
+    """CSV 쓰지 않고 미리보기 DataFrame만 생성"""
+    pe = _get_pattern_cfg(cfg)
+    rows = pattern_build_ops_from_timeline(df, cfg)
+    if insert_nops and pe.get("nop", {}).get("enable", False):
+        rows = pattern_maybe_insert_nops(rows, cfg)
+    return pattern_rows_to_dataframe(rows, cfg)

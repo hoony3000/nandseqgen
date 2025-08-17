@@ -8,6 +8,7 @@ Scripts/
 .venv/
 .vscode/
 figs/
+out_patterns/
 lib64
 * copy.py
 pyvenv.cfg

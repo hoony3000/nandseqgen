@@ -10,9 +10,9 @@ from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
 from collections import defaultdict
 import csv
-from viz_tools import TimelineLogger, plot_gantt, plot_gantt_by_die
-from viz_tools import plot_block_page_sequence_3d, plot_block_page_sequence_3d_by_die
+from viz_tools import TimelineLogger, plot_gantt, plot_gantt_by_die, plot_block_page_sequence_3d, plot_block_page_sequence_3d_by_die
 from viz_tools import validate_timeline, print_validation_report, violations_to_dataframe
+from viz_tools import export_patterns, pattern_preview_dataframe
 
 # --------------------------------------------------------------------------
 # Simulation resolution
@@ -290,6 +290,50 @@ CFG = {
         # "dout_global_gap_us": 5.0
     },
 }
+
+# --- Pattern export (ATE CSV) defaults ---
+CFG["pattern_export"] = {
+    "output_dir": "out_patterns",
+    "file_prefix": "pattern",
+    "columns": ["seq","time","op_id","op_name","payload"],
+    "time": {"from": "start_us", "scale": 1.0, "round_decimals": 0, "out_col": "time"},
+    "opcode_map": {
+        "NOP": 0,
+        "SIN_ERASE": 1, "SIN_PROGRAM": 2, "MUL_PROGRAM": 3,
+        "SIN_READ": 6, "MUL_READ": 7, "SR": 8, "DOUT": 9
+    },
+    "aliasing": {"apply_to": ["READ","PROGRAM","ERASE"], "mul_threshold": 2},
+    "nop": {
+        "enable": True,
+        "min_gap_us": 5.0,
+        "quantum_us": 1.0,
+        "opcode": 0,
+        "op_name": "NOP",
+        "rep_key": "rep"
+    },
+    "split": {
+        "by_rows": {"enable": False, "max_rows": 50000},
+        "by_time": {"enable": False, "chunk_us": 100000.0},
+        "guard_whole_op": True
+    },
+    "payload": {
+        "default": {"kind": "addresses_list"},   # 기본: 타깃 전체 리스트
+        "NOP": {"kind": "nop_rep_only"},         # NOP은 {"rep": n}
+        "SR": {"kind": "addresses_first"}        # SR은 첫 타깃만 (예시)
+    },
+    "preflight": {
+        "require_opcode": True,
+        "require_json_payload": True,
+        "page_equal_required_from_op_specs": True,
+        "time_monotonic": True
+    }
+}
+
+# 예시
+# CFG["pattern_export"]["payload"]["READ"] = {"kind": "addresses_list"}
+# CFG["pattern_export"]["payload"]["PROGRAM"] = {"kind": "addresses_first"}
+# CFG["pattern_export"]["nop"]["enable"] = False   # 미삽입
+# CFG["pattern_export"]["nop"].update({"min_gap_us": 10.0, "quantum_us": 2.0})
 
 # --------------------------------------------------------------------------
 # Alias mapping for policy/external naming
@@ -1893,7 +1937,7 @@ def main():
     CFG["bootstrap"]["split_timeline_logging"] = False
     # 1.1) bootstrap, phase conditional 활성화 여부 설정
     CFG["bootstrap"]["enabled"] = True
-    CFG["policy"]["enable_phase_conditional"] = True
+    CFG["policy"]["enable_phase_conditional"] = False
     CFG["bootstrap"]["pgm_ratio"] = 0.2
     # 1.2) topology 설정
     CFG["topology"]["dies"] = 1
@@ -1999,6 +2043,7 @@ def main():
         df = logger.to_dataframe()
         df.to_csv("nand_timeline.csv", index=False)
 
+
     # 4) 규칙 자동검증
     _t_val = time.perf_counter()
     report = validate_timeline(df, CFG)
@@ -2049,6 +2094,14 @@ def main():
         plot_gantt_by_die(df)  # 모든 die별로 개별 그림
         plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
                                            z_mode="global_die", draw_lines=True)
+
+    # (선택) 미리보기
+    # df_preview = pattern_preview_dataframe(df, CFG)
+    # print(df_preview.head())
+
+    # CSV 내보내기
+    paths = export_patterns(df, CFG)
+    print("written:", paths)
 
 if __name__=="__main__":
     main()
