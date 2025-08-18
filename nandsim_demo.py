@@ -208,7 +208,7 @@ CFG = {
         },
         "DOUT": {
             "scope": "NONE",
-            "page_equal_required": True,
+            "page_equal_required": False,
             "states": [
                 {"name": "ISSUE",     "bus": True, "dist": {"kind": "fixed",  "value": 0.2}},
                 {"name": "DATA_OUT",  "bus": True, "dist": {"kind": "fixed", "value": 1.0}},
@@ -1933,7 +1933,7 @@ def main():
     # 1.0) 로깅 옵션
     CFG["export"]["log_to_file"] = True
     CFG["export"]["log_tee"] = False
-    CFG["bootstrap"]["disable_timeline_logging"] = True
+    CFG["bootstrap"]["disable_timeline_logging"] = False
     CFG["bootstrap"]["split_timeline_logging"] = False
     # 1.1) bootstrap, phase conditional 활성화 여부 설정
     CFG["bootstrap"]["enabled"] = True
