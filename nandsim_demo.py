@@ -175,7 +175,7 @@ CFG = {
             "SR":      {"fanout": 1, "interleave": True},
         },
         "phase_overrides": {
-            "READ.CORE_BUSY.START": {"fanout": 4, "interleave": True},
+            "READ.CORE_BUSY": {"fanout": 4, "interleave": True},
         }
     },
 
