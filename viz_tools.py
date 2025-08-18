@@ -238,6 +238,7 @@ class ValidationIssue:
     t0: float
     t1: float
     detail: str
+    plane: Optional[int] = None
 
 def _spec_offsets_fixed(op_specs: Dict[str, Any]) -> Dict[str, Dict[str, Tuple[float,float]]]:
     """
@@ -304,14 +305,16 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
                     issues.append(ValidationIssue(
                         kind="READ_BEFORE_PROGRAM", die=die, block=block, page=page,
                         t0=float(r["start_us"]), t1=float(r["end_us"]),
-                        detail="READ started before page was programmed/committed"
+                        detail="READ started before page was programmed/committed",
+                        plane=int(r.get("plane", 0))
                     ))
             elif base == "PROGRAM":
                 if page in state[key]["committed"]:
                     issues.append(ValidationIssue(
                         kind="PROGRAM_DUPLICATE", die=die, block=block, page=page,
                         t0=float(r["start_us"]), t1=float(r["end_us"]),
-                        detail="PROGRAM on a page already committed without prior erase"
+                        detail="PROGRAM on a page already committed without prior erase",
+                        plane=int(r.get("plane", 0))
                     ))
                 # 순서 체크: 기대 = last+1
                 expected = state[key]["last"] + 1
@@ -319,7 +322,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
                     issues.append(ValidationIssue(
                         kind="PROGRAM_ORDER", die=die, block=block, page=page,
                         t0=float(r["start_us"]), t1=float(r["end_us"]),
-                        detail=f"PROGRAM order mismatch: expected page {expected}, got {page}"
+                        detail=f"PROGRAM order mismatch: expected page {expected}, got {page}",
+                        plane=int(r.get("plane", 0))
                     ))
 
         elif etype == "end":
@@ -350,7 +354,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
                 issues.append(ValidationIssue(
                     kind="DOUT_OVERLAP", die=int(r["die"]), block=int(r["block"]), page=int(r["page"]),
                     t0=t0, t1=t1,
-                    detail=f"DOUT overlaps with {rr['base_kind']} (die={rr['die']}, block={rr['block']})"
+                    detail=f"DOUT overlaps with {rr['base_kind']} (die={rr['die']}, block={rr['block']})",
+                    plane=int(r.get("plane", 0))
                 ))
 
     # CORE_BUSY windows
@@ -390,7 +395,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             issues.append(ValidationIssue(
                 kind="CORE_BUSY_DIEWIDE_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
                 t0=t0, t1=t1,
-                detail=f"{lhs}.CORE_BUSY overlaps with {rhs} on die {d}"
+                detail=f"{lhs}.CORE_BUSY overlaps with {rhs} on die {d}",
+                plane=int(r.get("plane", 0))
             ))
 
     # MUL_READ CORE_BUSY: 같은 die에서 READ/PROGRAM/ERASE 금지
@@ -414,7 +420,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             issues.append(ValidationIssue(
                 kind="MUL_READ_CORE_BUSY_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
                 t0=t0, t1=t1,
-                detail=f"MUL_READ.CORE_BUSY overlaps with {rhs} on die {d}"
+                detail=f"MUL_READ.CORE_BUSY overlaps with {rhs} on die {d}",
+                plane=int(r.get("plane", 0))
             ))
 
     # SIN_READ CORE_BUSY: 같은 die에서 MUL_READ/PROGRAM/ERASE 금지 (SIN_READ는 허용)
@@ -439,7 +446,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             issues.append(ValidationIssue(
                 kind="SIN_READ_CORE_BUSY_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
                 t0=t0, t1=t1,
-                detail=f"SIN_READ.CORE_BUSY overlaps with {rhs} on die {d}"
+                detail=f"SIN_READ.CORE_BUSY overlaps with {rhs} on die {d}",
+                plane=int(r.get("plane", 0))
             ))
 
     # counts
@@ -468,7 +476,7 @@ def violations_to_dataframe(report: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for isu in report.get("issues", []):
         rows.append({
-            "kind": isu.kind, "die": isu.die, "block": isu.block, "page": isu.page,
+            "kind": isu.kind, "die": isu.die, "plane": isu.plane, "block": isu.block, "page": isu.page,
             "t0": isu.t0, "t1": isu.t1, "detail": isu.detail
         })
     return pd.DataFrame(rows)
