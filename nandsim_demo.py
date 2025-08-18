@@ -1933,11 +1933,11 @@ def main():
     # 1.0) 로깅 옵션
     CFG["export"]["log_to_file"] = True
     CFG["export"]["log_tee"] = False
-    CFG["bootstrap"]["disable_timeline_logging"] = False
+    CFG["bootstrap"]["disable_timeline_logging"] = True
     CFG["bootstrap"]["split_timeline_logging"] = False
     # 1.1) bootstrap, phase conditional 활성화 여부 설정
     CFG["bootstrap"]["enabled"] = True
-    CFG["policy"]["enable_phase_conditional"] = False
+    CFG["policy"]["enable_phase_conditional"] = True
     CFG["bootstrap"]["pgm_ratio"] = 0.2
     # 1.2) topology 설정
     CFG["topology"]["dies"] = 1
@@ -2080,28 +2080,28 @@ def main():
     except Exception:
         pass
 
-    # 5) 시각화
-    if split_logging and (df_boot is not None or df_pol is not None):
-        if df_boot is not None and not df_boot.empty:
-            plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
-            plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
-                                               z_mode="global_die", draw_lines=True)
-        if df_pol is not None and not df_pol.empty:
-            plot_gantt_by_die(df_pol, title="Policy Timeline")
-            plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
-                                               z_mode="global_die", draw_lines=True)
-    else:
-        plot_gantt_by_die(df)  # 모든 die별로 개별 그림
-        plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
-                                           z_mode="global_die", draw_lines=True)
+    # # 5) 시각화
+    # if split_logging and (df_boot is not None or df_pol is not None):
+    #     if df_boot is not None and not df_boot.empty:
+    #         plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
+    #         plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
+    #                                            z_mode="global_die", draw_lines=True)
+    #     if df_pol is not None and not df_pol.empty:
+    #         plot_gantt_by_die(df_pol, title="Policy Timeline")
+    #         plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
+    #                                            z_mode="global_die", draw_lines=True)
+    # else:
+    #     plot_gantt_by_die(df)  # 모든 die별로 개별 그림
+    #     plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
+    #                                        z_mode="global_die", draw_lines=True)
 
     # (선택) 미리보기
     # df_preview = pattern_preview_dataframe(df, CFG)
     # print(df_preview.head())
 
     # CSV 내보내기
-    paths = export_patterns(df, CFG)
-    print("written:", paths)
+    # paths = export_patterns(df, CFG)
+    # print("written:", paths)
 
 if __name__=="__main__":
     main()
