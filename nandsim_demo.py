@@ -146,10 +146,14 @@ CFG = {
 
     # Phase-conditional proposal (alias keys allowed)
     "phase_conditional": {
-        "READ.ISSUE":           {"MUL_PROGRAM": 0.15, "SIN_PROGRAM": 0.10, "SIN_READ": 0.35, "MUL_READ": 0.25, "SIN_ERASE": 0.15},
-        "PROGRAM.ISSUE":        {"SIN_READ": 0.50, "MUL_READ": 0.20, "SIN_PROGRAM": 0.15, "SIN_ERASE": 0.10, "SR": 0.05},
-        "ERASE.ISSUE":          {"SIN_PROGRAM": 0.40, "MUL_PROGRAM": 0.20, "SIN_READ": 0.25, "MUL_READ": 0.10, "SR": 0.05},
-        "DEFAULT":              {"SIN_READ": 0.55, "SIN_PROGRAM": 0.25, "SIN_ERASE": 0.10, "SR": 0.10}
+        "READ.CORE_BUSY": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "READ.DATA_OUT": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "READ.DONE": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "PROGRAM.CORE_BUSY": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "PROGRAM.DONE": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "ERASE.CORE_BUSY": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "ERASE.DONE": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "DEFAULT": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
     },
 
     # Backoff scoring weights (used if phase_conditional fails)
@@ -241,7 +245,10 @@ CFG = {
             {"when": {"op": "READ", "alias": "SIN", "states": ["CORE_BUSY"]}, "scope": "DIE",
              "blocks": ["ALIAS:MUL_READ", "BASE:PROGRAM", "BASE:ERASE"]},
 
-            # DOUT 전역 배제창 제거: 버스/래치 검사만으로 충분
+            # DOUT : during DATA_OUT block READ/PROGRAM/ERASE (on the die); allow SR
+            {"when": {"op": "DOUT", "states": ["DATA_OUT"]}, "scope": "DIE",
+             "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
+
         ]
     },
 
