@@ -21,3 +21,7 @@ obligation*.csv
 *.log
 output.txt
 perf*.csv
+block*.csv
+commands.yaml
+states.yaml
+.DS_STORE

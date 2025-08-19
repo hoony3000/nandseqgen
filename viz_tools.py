@@ -338,26 +338,6 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
     # 4~7. 윈도우 겹침 검증 (고정 duration 전제)
     specs = _spec_offsets_fixed(cfg["op_specs"])
 
-    # DOUT freeze (전 구간)
-    dout_rows = df[df["base_kind"]=="DOUT"]
-    if not dout_rows.empty:
-        others = df[df["base_kind"]!="DOUT"]
-        for _, r in dout_rows.iterrows():
-            a0, a1 = float(r["start_us"]), float(r["end_us"])
-            # 다른 모든 op와 겹침 검사
-            ov = others[(others["start_us"] < (a1 - eps)) & ((a0 + eps) < others["end_us"])]
-            for __, rr in ov.iterrows():
-                t0 = max(a0, float(rr["start_us"]))
-                t1 = min(a1, float(rr["end_us"]))
-                if (t1 - t0) <= eps:
-                    continue
-                issues.append(ValidationIssue(
-                    kind="DOUT_OVERLAP", die=int(r["die"]), block=int(r["block"]), page=int(r["page"]),
-                    t0=t0, t1=t1,
-                    detail=f"DOUT overlaps with {rr['base_kind']} (die={rr['die']}, block={rr['block']})",
-                    plane=int(r.get("plane", 0))
-                ))
-
     # CORE_BUSY windows
     def core_busy_window(row) -> Optional[Tuple[float,float]]:
         base = str(row["base_kind"])
@@ -772,3 +752,231 @@ def pattern_preview_dataframe(df: pd.DataFrame, cfg: Dict[str, Any], insert_nops
     if insert_nops and pe.get("nop", {}).get("enable", False):
         rows = pattern_maybe_insert_nops(rows, cfg)
     return pattern_rows_to_dataframe(rows, cfg)
+
+# -------------------- Target Heatmap --------------------
+def plot_target_heatmap(df: pd.DataFrame,
+                        dies: Optional[Sequence[int]] = None,
+                        kinds: Optional[Sequence[str]] = None,
+                        title: Optional[str] = None,
+                        figsize: Tuple[float,float] = (14, 6),
+                        cmap: str = "Reds",
+                        vmin: Optional[float] = None,
+                        vmax: Optional[float] = None,
+                        save_path: Optional[str] = None):
+    """
+    Heatmap of target address hits.
+    - x-axis: die-block (flattened; labeled as "d{die}/blk{block}")
+    - y-axis: page
+    kinds: 필터할 base_kind 목록 (예: ("PROGRAM","READ")); None이면 전체 사용
+    dies: None이면 모든 die 포함, 아니면 지정한 die만 포함
+    """
+    if df is None or df.empty:
+        print("[plot_target_heatmap] empty dataframe"); return None, None
+    d = df.copy()
+    # filter by dies
+    if dies is not None:
+        d = d[d["die"].isin(list(dies))]
+    # filter by base kinds
+    if kinds is not None:
+        d = d[d["base_kind"].isin(list(kinds))]
+    if d.empty:
+        print("[plot_target_heatmap] no rows after filters"); return None, None
+    d = d.dropna(subset=["die","block","page"]).copy()
+    d["die"] = d["die"].astype(int)
+    d["block"] = d["block"].astype(int)
+    d["page"] = d["page"].astype(int)
+
+    # counts per (die, block, page)
+    cnt = d.groupby(["die","block","page"], dropna=False).size().reset_index(name="count")
+    # pivot: index=page, columns=(die,block)
+    cnt = cnt.sort_values(["die","block","page"])  
+    pivot = cnt.pivot_table(index="page", columns=["die","block"], values="count", aggfunc="sum", fill_value=0)
+    # sort columns numerically
+    pivot = pivot.sort_index(axis=1, level=[0,1])
+
+    # labels for x-axis: combined die/block
+    x_labels = [f"d{di}/blk{bl}" for (di, bl) in pivot.columns.tolist()]
+    y_labels = pivot.index.tolist()
+
+    import numpy as np  # local import to avoid global dependency if unused
+    data = pivot.to_numpy(dtype=float)
+
+    plt.figure(figsize=figsize)
+    im = plt.imshow(data, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    plt.colorbar(im, fraction=0.046, pad=0.04, label="hits")
+    plt.ylabel("page")
+    plt.xlabel("die/block")
+    if title:
+        plt.title(title)
+    else:
+        plt.title("Target address heatmap")
+
+    # tick density control
+    max_xticks = 60
+    step = max(1, int(np.ceil(len(x_labels) / max_xticks)))
+    xticks = np.arange(0, len(x_labels), step)
+    plt.xticks(xticks, [x_labels[i] for i in xticks], rotation=90)
+    # y ticks: show reasonable density
+    max_yticks = 40
+    ystep = max(1, int(np.ceil(len(y_labels) / max_yticks)))
+    yticks = np.arange(0, len(y_labels), ystep)
+    plt.yticks(yticks, [y_labels[i] for i in yticks])
+
+    plt.tight_layout()
+    if save_path:
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            plt.savefig(save_path, dpi=140)
+            print(f"[plot_target_heatmap] saved to {save_path}")
+        except Exception as e:
+            print(f"[plot_target_heatmap] save failed: {e}")
+    plt.show()
+    return plt.gcf(), plt.gca()
+
+# -------------------- Target Address Statistics --------------------
+def _weighted_quantile(values: pd.Series, weights: pd.Series, q: float) -> float:
+    if values.empty:
+        return float("nan")
+    d = pd.DataFrame({"v": values.astype(float), "w": weights.astype(float)})
+    d = d.sort_values("v")
+    cw = d["w"].cumsum()
+    cutoff = q * d["w"].sum()
+    idx = cw.searchsorted(cutoff, side="right")
+    idx = min(max(int(idx), 0), len(d) - 1)
+    return float(d.iloc[idx]["v"])
+
+def _gini_from_counts(counts: pd.Series) -> float:
+    # Gini for non-negative counts; 0 if uniform/empty
+    x = counts.astype(float).values
+    if x.size == 0:
+        return 0.0
+    if x.sum() <= 0:
+        return 0.0
+    x_sorted = sorted(x)
+    n = len(x_sorted)
+    cum = 0.0
+    for i, xi in enumerate(x_sorted, start=1):
+        cum += i * xi
+    g = (2.0 * cum) / (n * x.sum()) - (n + 1.0) / n
+    return float(max(0.0, min(1.0, g)))
+
+def compute_block_usage_stats(df: pd.DataFrame,
+                              kinds: Sequence[str] = ("PROGRAM", "READ")) -> Dict[str, pd.DataFrame]:
+    """
+    블록/주소 쏠림을 계측하는 통계 집계.
+    반환:
+      - detail: die, plane, block, base_kind, count
+      - summary_die: die, base_kind, metrics...
+      - summary_die_plane: die, plane, base_kind, metrics...
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    if df is None or df.empty:
+        out["detail"] = pd.DataFrame()
+        out["summary_die"] = pd.DataFrame()
+        out["summary_die_plane"] = pd.DataFrame()
+        return out
+
+    d0 = df.copy()
+    d0 = d0[d0["base_kind"].isin(list(kinds))]
+    if d0.empty:
+        out["detail"] = pd.DataFrame()
+        out["summary_die"] = pd.DataFrame()
+        out["summary_die_plane"] = pd.DataFrame()
+        return out
+
+    # detail counts by die/plane/block/base_kind
+    grp_cols = ["die", "plane", "block", "base_kind"]
+    detail = d0.groupby(grp_cols, dropna=False).size().reset_index(name="count")
+    out["detail"] = detail
+
+    # helper to compute summary metrics on block index distribution
+    def _summarize(group: pd.DataFrame, level_cols: List[str]) -> pd.DataFrame:
+        rows = []
+        if group.empty:
+            return pd.DataFrame()
+        # limits per die for normalization (block index 0..max)
+        # If block max unknown in subset, infer from data
+        blk_min = int(group["block"].min()) if not group["block"].empty else 0
+        blk_max = int(group["block"].max()) if not group["block"].empty else 0
+        blk_span = max(1, blk_max - blk_min)
+        for keys, gk in group.groupby(level_cols + ["base_kind"], dropna=False):
+            # keys could be tuple; normalize
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            key_dict = {col: val for col, val in zip(level_cols + ["base_kind"], keys)}
+            cnts = gk.groupby("block").size().rename("count")
+            total = int(cnts.sum())
+            if total <= 0:
+                continue
+            # weighted stats
+            blocks = cnts.index.to_series()
+            weights = cnts.values
+            mean_b = float((blocks * cnts.values).sum() / total)
+            med_b  = _weighted_quantile(blocks, pd.Series(weights), 0.5)
+            p90_b  = _weighted_quantile(blocks, pd.Series(weights), 0.9)
+            # normalization to [0,1] w.r.t observed span
+            mean_norm = (mean_b - blk_min) / blk_span
+            med_norm  = (med_b - blk_min) / blk_span
+            p90_norm  = (p90_b - blk_min) / blk_span
+            gini      = _gini_from_counts(cnts)
+            # head/tail ratio by block index (bottom/top 10%)
+            # define thresholds by index percentiles
+            thr_low  = blk_min + 0.10 * blk_span
+            thr_high = blk_min + 0.90 * blk_span
+            head_sum = int(cnts[blocks <= math.floor(thr_low)].sum()) if not cnts.empty else 0
+            tail_sum = int(cnts[blocks >= math.ceil(thr_high)].sum()) if not cnts.empty else 0
+            head_tail_ratio = (tail_sum / max(head_sum, 1)) if head_sum > 0 else float("inf") if tail_sum > 0 else 0.0
+            rows.append({
+                **key_dict,
+                "total_ops": total,
+                "num_blocks": int(cnts.index.nunique()),
+                "block_min": blk_min,
+                "block_max": blk_max,
+                "mean_block": mean_b,
+                "mean_norm": mean_norm,
+                "median_block": med_b,
+                "median_norm": med_norm,
+                "p90_block": p90_b,
+                "p90_norm": p90_norm,
+                "gini": gini,
+                "head_tail_ratio": float(head_tail_ratio),
+            })
+        return pd.DataFrame(rows)
+
+    # per-die summary (aggregate planes)
+    die_group = detail.groupby(["die", "block", "base_kind"], dropna=False).size().reset_index(name="count")
+    summary_die = _summarize(die_group, ["die"]).sort_values(["die", "base_kind"]).reset_index(drop=True)
+    out["summary_die"] = summary_die
+
+    # per-die-plane summary
+    dpl_group = detail.groupby(["die", "plane", "block", "base_kind"], dropna=False).size().reset_index(name="count")
+    summary_dpl = _summarize(dpl_group, ["die", "plane"]).sort_values(["die", "plane", "base_kind"]).reset_index(drop=True)
+    out["summary_die_plane"] = summary_dpl
+
+    return out
+
+def save_block_usage_stats(stats: Dict[str, pd.DataFrame], prefix: str = "block_usage") -> List[str]:
+    paths: List[str] = []
+    detail = stats.get("detail")
+    if isinstance(detail, pd.DataFrame) and not detail.empty:
+        p = f"{prefix}_detail.csv"; detail.to_csv(p, index=False); paths.append(p)
+    s_die = stats.get("summary_die")
+    if isinstance(s_die, pd.DataFrame) and not s_die.empty:
+        p = f"{prefix}_die_summary.csv"; s_die.to_csv(p, index=False); paths.append(p)
+    s_dpl = stats.get("summary_die_plane")
+    if isinstance(s_dpl, pd.DataFrame) and not s_dpl.empty:
+        p = f"{prefix}_die_plane_summary.csv"; s_dpl.to_csv(p, index=False); paths.append(p)
+    return paths
+
+def print_block_usage_summary(stats: Dict[str, pd.DataFrame], max_rows: int = 20):
+    s = stats.get("summary_die")
+    if s is None or s.empty:
+        print("[block_usage] no data")
+        return
+    print("\n=== Block Usage Summary (per die, by base_kind) ===")
+    cols = ["die", "base_kind", "total_ops", "num_blocks", "mean_norm", "median_norm", "p90_norm", "gini", "head_tail_ratio"]
+    s2 = s[cols].copy()
+    # pretty rounding
+    for c in ("mean_norm", "median_norm", "p90_norm", "gini", "head_tail_ratio"):
+        s2[c] = s2[c].astype(float).round(4)
+    print(s2.head(max_rows).to_string(index=False))

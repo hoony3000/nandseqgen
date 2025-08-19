@@ -13,6 +13,8 @@ import csv
 from viz_tools import TimelineLogger, plot_gantt, plot_gantt_by_die, plot_block_page_sequence_3d, plot_block_page_sequence_3d_by_die
 from viz_tools import validate_timeline, print_validation_report, violations_to_dataframe
 from viz_tools import export_patterns, pattern_preview_dataframe
+from viz_tools import plot_target_heatmap
+from viz_tools import compute_block_usage_stats, save_block_usage_stats, print_block_usage_summary
 
 # --------------------------------------------------------------------------
 # Simulation resolution
@@ -122,7 +124,7 @@ CFG = {
     "rng_seed": 12345,
     "policy": {
         "queue_refill_period_us": 5.0,
-        "run_until_us": 1000.0,
+        "run_until_us": 2000.0,
         "planner_max_tries": 8,
         # global_nudge 제거됨: 전역 트리거는 QUEUE_REFILL에서 일원화 처리
         "easing_hookscreen": {"enable": True, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
@@ -133,6 +135,16 @@ CFG = {
         # bootstrap 러닝타임 여유 = last_deadline_boot + margin_per_ob * num_bootstrap_obligations
         "run_until_bootstrap_margin_per_ob_us": 5.0,
         "enable_phase_conditional": True,
+        # ---- screening policy (READ/PROGRAM vs future ERASE/PROGRAM) ----
+        # READ 정책: 커밋만 허용할지, 미래 PROGRAM(커밋 전)도 허용할지
+        "read_requires_committed": False,
+        "read_allow_future_program": True,
+        # 미래 PROGRAM 인정 경계 마진(us): program_end <= read_start - margin
+        "read_future_program_guard_us": 0.2,
+        # ERASE 겹침 판단 마진(us): erase_end <= read_start - margin 이면 OK, 아니면 충돌
+        "read_erase_guard_margin_us": 0.2,
+        # PROGRAM과 미래 ERASE 충돌 판단 마진(us)
+        "program_erase_conflict_guard_us": 0.0,
     },
 
     # Admission gating (near-future only to prevent policy explosion)
@@ -146,14 +158,11 @@ CFG = {
 
     # Phase-conditional proposal (alias keys allowed)
     "phase_conditional": {
-        "READ.CORE_BUSY": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "READ.DATA_OUT": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "READ.DONE": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "PROGRAM.CORE_BUSY": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "PROGRAM.DONE": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "ERASE.CORE_BUSY": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "ERASE.DONE": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "DEFAULT": {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "READ.CORE_BUSY":       {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "READ.DATA_OUT":        {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "PROGRAM.CORE_BUSY":    {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "ERASE.CORE_BUSY":      {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "DEFAULT":              {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
     },
 
     # Backoff scoring weights (used if phase_conditional fails)
@@ -174,7 +183,7 @@ CFG = {
     "selection": {
         "defaults": {
             "READ":    {"fanout": 1, "interleave": True},
-            "PROGRAM": {"fanout": 2, "interleave": True},
+            "PROGRAM": {"fanout": 2, "interleave": False},
             "ERASE":   {"fanout": 2, "interleave": False},
             "SR":      {"fanout": 1, "interleave": True},
         },
@@ -215,7 +224,6 @@ CFG = {
             "page_equal_required": False,
             "states": [
                 {"name": "ISSUE",     "bus": True, "dist": {"kind": "fixed",  "value": 0.2}},
-                {"name": "DATA_OUT",  "bus": True, "dist": {"kind": "fixed", "value": 1.0}},
             ],
         },
         "SR": {
@@ -223,7 +231,6 @@ CFG = {
             "page_equal_required": False,
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.2}},
-                {"name": "DATA_OUT",  "bus": True,  "dist": {"kind": "fixed",  "value": 0.3}},
             ],
         },
     },
@@ -238,15 +245,15 @@ CFG = {
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
 
             # MUL_READ: during CORE_BUSY block READ/PROGRAM/ERASE (on the die); allow SR
-            {"when": {"op": "READ", "alias": "MUL", "states": ["CORE_BUSY"]}, "scope": "DIE",
+            {"when": {"op": "READ", "alias": "MUL", "states": ["ISSUE","CORE_BUSY","DATA_OUT"]}, "scope": "DIE",
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
 
             # SIN_READ: during CORE_BUSY block MUL_READ + PROGRAM + ERASE; allow SIN_READ & SR
-            {"when": {"op": "READ", "alias": "SIN", "states": ["CORE_BUSY"]}, "scope": "DIE",
+            {"when": {"op": "READ", "alias": "SIN", "states": ["ISSUE","CORE_BUSY","DATA_OUT"]}, "scope": "DIE",
              "blocks": ["ALIAS:MUL_READ", "BASE:PROGRAM", "BASE:ERASE"]},
 
             # DOUT : during DATA_OUT block READ/PROGRAM/ERASE (on the die); allow SR
-            {"when": {"op": "DOUT", "states": ["DATA_OUT"]}, "scope": "DIE",
+            {"when": {"op": "DOUT", "states": ["ISSUE"]}, "scope": "DIE",
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
 
         ]
@@ -295,6 +302,25 @@ CFG = {
         "hook_margin_us": 1,
         # READ 이후 DOUT으로 넘어가기 전 전역 간극(부트스트랩 전용)
         # "dout_global_gap_us": 5.0
+    },
+    # Debug options
+    "debug": {
+        "log_block_sampling": True
+    },
+    # Addressing strategies (experimental)
+    "addressing": {
+        "program": {
+            # ascending | cyclic_from_write_head
+            "search_order": "cyclic_from_write_head"
+        },
+        "erase": {
+            # ascending_non_erased | cyclic_from_write_head
+            "pick_strategy": "cyclic_from_write_head"
+        },
+        "write_head": {
+            # to_erased_block | round_robin_next | stay
+            "on_erase": "round_robin_next"
+        }
     },
 }
 
@@ -587,16 +613,29 @@ def sample_dist(d: Dict[str, Any]) -> float:
 
 def parse_hook_key(label: str):
     parts = label.split(".")
-    if len(parts) >= 3: return parts[0], parts[1], parts[2]
-    if len(parts) == 2: return parts[0], parts[1], None
-    return None, None, None
+    if len(parts) == 2: return parts[0], parts[1]
+    return None, None
 
 def get_phase_dist(cfg: Dict[str,Any], hook_label: str):
-    op, state, pos = parse_hook_key(hook_label)
+    op, state = parse_hook_key(hook_label)
     pc = cfg.get("phase_conditional", {})
     keys=[]
     # POS granularity removed by plan; only OP.STATE and DEFAULT are considered
-    if op and state:         keys.append(f"{op}.{state}")
+    # Expand keys to try alias/base variants to support configs written with ALIAS or BASE.
+    if op and state:
+        # 1) as-is
+        keys.append(f"{op}.{state}")
+        # 2) alias candidates from base (e.g., READ -> SIN_READ/MUL_READ)
+        for _ali in _op_alias_candidates(op):
+            k=f"{_ali}.{state}"
+            if k not in keys:
+                keys.append(k)
+        # 3) base from alias (e.g., SIN_READ -> READ)
+        _base=_op_base_from_alias(op)
+        if _base:
+            k=f"{_base}.{state}"
+            if k not in keys:
+                keys.append(k)
     keys.append("DEFAULT")
     for key in keys:
         dist = pc.get(key)
@@ -615,6 +654,21 @@ def roulette_pick(dist: Dict[str, float], allow: set) -> Optional[str]:
 def resolve_alias(name: str) -> Tuple[str, Optional[Tuple[str,int]]]:
     if name in OP_ALIAS: return OP_ALIAS[name]["base"], OP_ALIAS[name]["fanout"]
     return name, None
+
+# --- alias/base helpers for hook label resolution ---
+def _op_alias_candidates(op: str) -> List[str]:
+    mapping={
+        "READ":["SIN_READ","MUL_READ"],
+        "PROGRAM":["SIN_PROGRAM","MUL_PROGRAM"],
+        "ERASE":["SIN_ERASE","MUL_ERASE"],
+    }
+    return mapping.get(op, [])
+
+def _op_base_from_alias(op: str) -> Optional[str]:
+    if op in ("SIN_READ","MUL_READ"): return "READ"
+    if op in ("SIN_PROGRAM","MUL_PROGRAM"): return "PROGRAM"
+    if op in ("SIN_ERASE","MUL_ERASE"): return "ERASE"
+    return None
 
 def get_admission_delta(cfg: Dict[str,Any], hook_label: str, op_kind_name: str) -> float:
     adm = cfg.get("admission", {})
@@ -662,6 +716,14 @@ class AddressManager:
         self.resv={(die,p):[] for p in range(self.planes) for die in range(self.dies)}        # per-plane reservations: (start,end,block)
         self.bus_resv: List[Tuple[float,float]] = []            # global bus reservations
 
+        # ---- content validity tracking (future + last-commit times) ----
+        # Scheduled-but-not-committed windows
+        self.future_erase_by_block: Dict[Tuple[int,int], List[Tuple[float,float]]] = {}
+        self.future_program_by_page: Dict[Tuple[int,int,int], List[Tuple[float,float]]] = {}
+        # Last committed times
+        self.last_erase_end: Dict[Tuple[int,int], float] = {}
+        self.last_program_end: Dict[Tuple[int,int,int], float] = {}
+
         init_state = int(cfg.get("address_init_state", -2))
         self.addr_state_committed: Dict[Tuple[int,int], int] = {}
         self.addr_state_future:    Dict[Tuple[int,int], int] = {}
@@ -672,6 +734,8 @@ class AddressManager:
             for b in range(self.blocks):
                 self.addr_state_committed[(die,b)] = init_state
                 self.addr_state_future[(die,b)]    = init_state
+                self.future_erase_by_block[(die,b)] = []
+                self.last_erase_end[(die,b)] = float('-inf')
             for p in range(self.planes):
                 self.write_head[(die,p)] = p  # first block of that plane stripe
 
@@ -682,6 +746,26 @@ class AddressManager:
     def iter_blocks_of_plane(self, plane:int):
         for b in range(plane, self.blocks, self.planes):
             yield b
+
+    def _blocks_of_plane_list(self, plane:int) -> List[int]:
+        return list(self.iter_blocks_of_plane(plane))
+
+    def _iter_blocks_of_plane_cyclic(self, plane:int, start_block:int):
+        blocks = self._blocks_of_plane_list(plane)
+        if not blocks:
+            return
+        # align start_block to stripe of plane
+        try:
+            start_idx = blocks.index(start_block)
+        except ValueError:
+            # if not in list, map to nearest stripe position
+            try:
+                start_idx = blocks.index(plane)
+            except ValueError:
+                start_idx = 0
+        n = len(blocks)
+        for i in range(n):
+            yield blocks[(start_idx + i) % n]
 
     # ---- observations ----
     def available_at(self, die:int, plane:int)->float: return self.available[(die,plane)]
@@ -718,6 +802,36 @@ class AddressManager:
         plane_busy_frac="high" if self.available_at(die,plane)>now_us else "low"
         return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls":"host"},
                 {"plane_busy_frac": plane_busy_frac})
+
+    # ---- debug logging for block sampling ----
+    def _log_block_sampling(self, kind: str, die: int, plane_set: List[int], targets: List['Address']):
+        try:
+            dbg = bool(self.cfg.get("debug", {}).get("log_block_sampling", False))
+            if not dbg:
+                return
+            head_n = 5
+            tail_n = 4
+            head_set = set(range(0, min(head_n, self.blocks)))
+            tail_set = set(range(max(0, self.blocks - tail_n), self.blocks))
+            blocks = [t.block for t in targets]
+            pages  = [t.page for t in targets]
+            planes = [t.plane for t in targets]
+            srcs = []
+            for t in targets:
+                if kind == "PROGRAM":
+                    srcs.append("HEAD" if self.write_head[(die, t.plane)] == t.block else "FIND")
+                elif kind == "ERASE":
+                    srcs.append("NON_ERASED" if self.addr_state_future[(die, t.block)] >= 0 else "HEAD")
+                else:
+                    srcs.append("COMMITTED")
+            pos = []
+            for b in blocks:
+                if b in head_set: pos.append("HEAD_ZONE")
+                elif b in tail_set: pos.append("TAIL_ZONE")
+                else: pos.append("MID")
+            print(f"[BLKDBG] kind={kind} die={die} planes={plane_set} blocks={blocks} pages={pages} src={srcs} zone={pos}")
+        except Exception:
+            pass
 
     # ---- bus segments & gating ----
     def bus_segments_for_op(self, op: Operation)->List[Tuple[float,float]]:
@@ -815,6 +929,7 @@ class AddressManager:
                     if not candidates: continue
 
                     chosen=None
+                    search_order = str(self.cfg.get("addressing", {}).get("program", {}).get("search_order", "ascending")).lower()
                     for page in candidates:
                         tlist=[]
                         ok=True
@@ -823,29 +938,49 @@ class AddressManager:
                             if self._next_page_future(die,b_head)==page:
                                 b=b_head
                             else:
-                                b=self._find_block_for_page_future_on_plane(die,pl,page)
+                                if search_order=="cyclic_from_write_head":
+                                    b=None
+                                    for bb in self._iter_blocks_of_plane_cyclic(pl, b_head):
+                                        if self._next_page_future(die,bb)==page:
+                                            b=bb; break
+                                    if b is None:
+                                        b=self._find_block_for_page_future_on_plane(die,pl,page)
+                                else:
+                                    b=self._find_block_for_page_future_on_plane(die,pl,page)
                                 if b is None: ok=False; break
                             tlist.append(Address(die,pl,b,page))
                         if ok: chosen=tlist; break
                     if not chosen: continue
+                    # debug log
+                    self._log_block_sampling("PROGRAM", die, plane_set, chosen)
                     return chosen, plane_set, Scope.DIE_WIDE
 
                 elif kind==OpKind.ERASE:
                     targets=[]
+                    pick_strategy = str(self.cfg.get("addressing", {}).get("erase", {}).get("pick_strategy", "ascending_non_erased")).lower()
                     for pl in plane_set:
-                        # prefer a non-erased block on this plane; fallback to write_head
                         chosen_b=None
-                        for bb in self.iter_blocks_of_plane(pl):
-                            if self.addr_state_future[(die,bb)] >= 0:
-                                chosen_b=bb; break
+                        if pick_strategy=="cyclic_from_write_head":
+                            start_b = self.write_head[(die,pl)]
+                            for bb in self._iter_blocks_of_plane_cyclic(pl, start_b):
+                                if self.addr_state_future[(die,bb)] >= 0:
+                                    chosen_b=bb; break
+                        else:  # ascending_non_erased (default)
+                            for bb in self.iter_blocks_of_plane(pl):
+                                if self.addr_state_future[(die,bb)] >= 0:
+                                    chosen_b=bb; break
                         if chosen_b is None:
                             chosen_b=self.write_head[(die,pl)]
                         targets.append(Address(die, pl, chosen_b, 0))  # page=0 for logging
+                    # debug log
+                    self._log_block_sampling("ERASE", die, plane_set, targets)
                     return targets, plane_set, Scope.DIE_WIDE
 
                 elif kind==OpKind.SR:
                     # page=0 for uniform address shape
-                    return [Address(die, plane_set[0], plane_set[0], 0)], plane_set[:1], Scope.NONE
+                    tgt = [Address(die, plane_set[0], plane_set[0], 0)]
+                    self._log_block_sampling("SR", die, plane_set[:1], tgt)
+                    return tgt, plane_set[:1], Scope.NONE
 
         return None
 
@@ -879,13 +1014,41 @@ class AddressManager:
                 if t.page >= self.pages_per_block:
                     print(f"[PRECCHK] program_oob die={t.die} block={t.block} page={t.page} pages_per_block={self.pages_per_block}")
                     return False
+                # prevent programming a page that is under a future erase window overlapping start_hint
+                guard = float(self.cfg.get("policy",{}).get("program_erase_conflict_guard_us", 0.0))
+                wins = self.future_erase_by_block.get((t.die,t.block), [])
+                for (s,e) in wins:
+                    if not ((e <= (start_hint - guard)) or (end_hint <= s)):
+                        print(f"[PRECCHK] program_future_erase_conflict die={t.die} block={t.block} page={t.page} win=({s:.2f},{e:.2f})")
+                        return False
             elif kind==OpKind.READ:
                 if t.page is None:
                     print(f"[PRECCHK] read_page_none die={t.die} block={t.block}")
                     return False
-                if (t.block, t.page) not in self.programmed_committed[(t.die,)]:
-                    print(f"[PRECCHK] read_not_committed die={t.die} block={t.block} page={t.page} com={com}")
-                    return False
+                # consider future program windows: if page is not yet committed now, allow if a future PROGRAM window ends before this READ starts
+                committed_now = ((t.block, t.page) in self.programmed_committed[(t.die,)])
+                pol = self.cfg.get("policy", {})
+                if (not committed_now):
+                    if bool(pol.get("read_requires_committed", False)):
+                        print(f"[PRECCHK] read_requires_committed die={t.die} block={t.block} page={t.page}")
+                        return False
+                    if bool(pol.get("read_allow_future_program", True)):
+                        wins = self.future_program_by_page.get((t.die,t.block,int(t.page)), [])
+                        guard = float(pol.get("read_future_program_guard_us", 0.01))
+                        prog_ok = any(e <= (start_hint - guard) for (s,e) in wins)
+                        if not prog_ok:
+                            print(f"[PRECCHK] read_not_committed (no prior future program) die={t.die} block={t.block} page={t.page} at={start_hint:.2f}")
+                            return False
+                    else:
+                        print(f"[PRECCHK] read_not_committed (future program not allowed) die={t.die} block={t.block} page={t.page}")
+                        return False
+                # also block READ if a future ERASE overlaps or ends at/after start (treat boundary as conflict)
+                wins_er = self.future_erase_by_block.get((t.die,t.block), [])
+                er_guard = float(pol.get("read_erase_guard_margin_us", 0.0))
+                for (s,e) in wins_er:
+                    if not ((e <= (start_hint - er_guard)) or (end_hint <= s)):
+                        print(f"[PRECCHK] read_future_erase_conflict die={t.die} block={t.block} page={t.page} win=({s:.2f},{e:.2f})")
+                        return False
             elif kind==OpKind.ERASE:
                 pass
         return True
@@ -913,9 +1076,25 @@ class AddressManager:
                     er = self._first_erased_block_on_plane(t.die, t.plane)
                     if er is not None:
                         self.write_head[(t.die, t.plane)] = er
+                # future program window register
+                kpp=(t.die,t.block,int(t.page))
+                self.future_program_by_page.setdefault(kpp, []).append((quantize(start), quantize(end)))
             elif op.kind==OpKind.ERASE:
                 self.addr_state_future[key] = -1
-                self.write_head[(t.die, t.plane)] = t.block
+                on_erase = str(self.cfg.get("addressing", {}).get("write_head", {}).get("on_erase", "to_erased_block")).lower()
+                if on_erase=="round_robin_next":
+                    # move to next block in stripe after erased block
+                    next_b = t.block + self.planes
+                    if next_b >= self.blocks:
+                        next_b = t.plane  # wrap to first stripe block for this plane
+                    self.write_head[(t.die, t.plane)] = next_b
+                elif on_erase=="stay":
+                    # do not change write_head
+                    pass
+                else:  # to_erased_block (default)
+                    self.write_head[(t.die, t.plane)] = t.block
+                # future erase window register
+                self.future_erase_by_block.setdefault(key, []).append((quantize(start), quantize(end)))
 
     def commit(self, op: Operation):
         for t in op.targets:
@@ -923,11 +1102,21 @@ class AddressManager:
             if op.kind==OpKind.PROGRAM and t.page is not None:
                 self.addr_state_committed[key] = max(self.addr_state_committed[key], t.page)
                 self.programmed_committed[(t.die,)].add((t.block, t.page))
+                # record last program end
+                try:
+                    self.last_program_end[(t.die,t.block,int(t.page))] = float(self.available[(t.die,t.plane)])
+                except Exception:
+                    pass
             elif op.kind==OpKind.ERASE:
                 self.addr_state_committed[key] = -1
                 self.programmed_committed[(t.die,)] = {
                     pp for pp in self.programmed_committed[(t.die,)] if pp[0] != t.block
                 }
+                # record last erase end
+                try:
+                    self.last_erase_end[(t.die,t.block)] = float(self.available[(t.die,t.plane)])
+                except Exception:
+                    pass
 
 # --------------------------------------------------------------------------
 # Exclusion Manager (runtime blocking windows)
@@ -1540,6 +1729,12 @@ class PolicyEngine:
                     self._reject(now_us, hook, stage, "plan_none", base, alias_used, fanout, None, earliest_start, None, "no_targets")
                 else:
                     targets, plane_set, scope=plan
+                    # debug
+                    try:
+                        if bool(self.cfg.get("debug", {}).get("log_block_sampling", False)):
+                            print(f"[BLKDBG.SCHED] pick base={base} alias={alias_used} die={die} planes={plane_set} scope={scope.name}")
+                    except Exception:
+                        pass
                     cfg_op=self.cfg["op_specs"][base]; op=build_operation(kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=pick
                     # earliest_start re-calc at candidate time for scope
@@ -1570,11 +1765,21 @@ class PolicyEngine:
 # --------------------------------------------------------------------------
 # Selection overrides
 def get_phase_selection_override(cfg: Dict[str,Any], hook_label: str, kind_name: str):
-    op, state, pos = parse_hook_key(hook_label)
+    op, state = parse_hook_key(hook_label)
     po=cfg.get("selection",{}).get("phase_overrides",{})
     keys=[]
-    if op and state and pos: keys.append(f"{op}.{state}.{pos}")
-    if op and state:         keys.append(f"{op}.{state}")
+    # Try alias/base expanded keys for robustness
+    if op and state:
+        keys.append(f"{op}.{state}")
+        for _ali in _op_alias_candidates(op):
+            k=f"{_ali}.{state}"
+            if k not in keys:
+                keys.append(k)
+        _base=_op_base_from_alias(op)
+        if _base:
+            k=f"{_base}.{state}"
+            if k not in keys:
+                keys.append(k)
     for k in keys:
         val=po.get(k)
         if val:
@@ -1853,10 +2058,10 @@ class Scheduler:
                 else:
                     cur=start
                     for s in op.states:
-                        self._push(cur,               "PHASE_HOOK", PhaseHook(cur,               f"{label_op}.{s.name}.START", t.die, t.plane))
-                        if s.name=="CORE_BUSY":
-                            self._push(cur + s.dur_us*0.5, "PHASE_HOOK", PhaseHook(cur + s.dur_us*0.5, f"{label_op}.{s.name}.MID",   t.die, t.plane))
-                        self._push(cur + s.dur_us,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{label_op}.{s.name}.END",   t.die, t.plane))
+                        if s.name !="ISSUE":
+                            eps = random.random()*s.dur_us*0.2
+                            self._push(cur + s.dur_us - eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{label_op}.{s.name}.MID",   t.die, t.plane))
+                            self._push(cur + s.dur_us + eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{label_op}.{s.name}.END",   t.die, t.plane))
                         cur += s.dur_us
 
         first=op.targets[0]
@@ -1949,8 +2154,8 @@ def main():
     # 1.2) topology 설정
     CFG["topology"]["dies"] = 1
     CFG["topology"]["planes"] = 4
-    CFG["topology"]["blocks"] = 32
-    CFG["topology"]["pages_per_block"] = 40
+    CFG["topology"]["blocks"] = 8
+    CFG["topology"]["pages_per_block"] = 100
     print(f"topology: {CFG['topology']}")
     try:
         exp = CFG.get("export", {})
@@ -1991,6 +2196,7 @@ def main():
         print(f"[BOOTSTRAP] skipped: {e}")
 
     # 2) 실행: bootstrap 전용 여유와 총 러닝타임 분리 계산
+    CFG["policy"]["run_until_us"] = 50000.0
     run_until_base = CFG["policy"]["run_until_us"]
     run_until_boot = 0.0
     try:
@@ -2059,6 +2265,14 @@ def main():
     viol_df = violations_to_dataframe(report)
     viol_df.to_csv("nand_violations.csv", index=False)
 
+    # 4.2) Target address usage stats (PROGRAM/READ 중심)
+    try:
+        stats = compute_block_usage_stats(df, kinds=("PROGRAM","READ"))
+        save_block_usage_stats(stats, prefix="block_usage")
+        print_block_usage_summary(stats, max_rows=50)
+    except Exception as e:
+        print(f"[BLOCK_USAGE] skipped: {e}")
+
     # 4.5) Rejection log
     try:
         # rejlog.to_csv("reject_log.csv")
@@ -2087,20 +2301,39 @@ def main():
     except Exception:
         pass
 
-    # # 5) 시각화
-    # if split_logging and (df_boot is not None or df_pol is not None):
-    #     if df_boot is not None and not df_boot.empty:
-    #         plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
-    #         plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
-    #                                            z_mode="global_die", draw_lines=True)
-    #     if df_pol is not None and not df_pol.empty:
-    #         plot_gantt_by_die(df_pol, title="Policy Timeline")
-    #         plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
-    #                                            z_mode="global_die", draw_lines=True)
-    # else:
-    #     plot_gantt_by_die(df)  # 모든 die별로 개별 그림
-    #     plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
-    #                                        z_mode="global_die", draw_lines=True)
+    # 5) 시각화
+    if split_logging and (df_boot is not None or df_pol is not None):
+        if df_boot is not None and not df_boot.empty:
+            plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
+            plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
+                                               z_mode="global_die", draw_lines=True)
+            # heatmap (bootstrap)
+            try:
+                plot_target_heatmap(df_boot, kinds=("PROGRAM","READ"),
+                                    title="Target heatmap (bootstrap)",
+                                    save_path="figs/heatmap_bootstrap.png")
+            except Exception as e:
+                print(f"[HEATMAP] bootstrap skipped: {e}")
+        if df_pol is not None and not df_pol.empty:
+            plot_gantt_by_die(df_pol, title="Policy Timeline")
+            plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
+                                               z_mode="global_die", draw_lines=True)
+            try:
+                plot_target_heatmap(df_pol, kinds=("PROGRAM","READ"),
+                                    title="Target heatmap (policy)",
+                                    save_path="figs/heatmap_policy.png")
+            except Exception as e:
+                print(f"[HEATMAP] policy skipped: {e}")
+    else:
+        plot_gantt_by_die(df)  # 모든 die별로 개별 그림
+        plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
+                                           z_mode="global_die", draw_lines=True)
+        try:
+            plot_target_heatmap(df, kinds=("PROGRAM","READ"),
+                                title="Target heatmap (all)",
+                                save_path="figs/heatmap_all.png")
+        except Exception as e:
+            print(f"[HEATMAP] all skipped: {e}")
 
     # (선택) 미리보기
     # df_preview = pattern_preview_dataframe(df, CFG)
