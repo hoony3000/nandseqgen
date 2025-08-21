@@ -812,13 +812,13 @@ def plot_target_heatmap(df: pd.DataFrame,
 
     # tick density control
     max_xticks = 60
-    step = max(1, int(np.ceil(len(x_labels) / max_xticks)))
-    xticks = np.arange(0, len(x_labels), step)
+    step = max(1, len(x_labels) // max_xticks if max_xticks >0 else 1)
+    xticks = range(0, len(x_labels), step)
     plt.xticks(xticks, [x_labels[i] for i in xticks], rotation=90)
     # y ticks: show reasonable density
     max_yticks = 40
-    ystep = max(1, int(np.ceil(len(y_labels) / max_yticks)))
-    yticks = np.arange(0, len(y_labels), ystep)
+    ystep = max(1, len(y_labels) // max_yticks if max_yticks > 0 else 1)
+    yticks = range(0, len(y_labels), ystep)
     plt.yticks(yticks, [y_labels[i] for i in yticks])
 
     plt.tight_layout()
