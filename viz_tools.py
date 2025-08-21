@@ -798,8 +798,7 @@ def plot_target_heatmap(df: pd.DataFrame,
     x_labels = [f"d{di}/blk{bl}" for (di, bl) in pivot.columns.tolist()]
     y_labels = pivot.index.tolist()
 
-    import numpy as np  # local import to avoid global dependency if unused
-    data = pivot.to_numpy(dtype=float)
+    data = pivot.values.astype(float)
 
     plt.figure(figsize=figsize)
     im = plt.imshow(data, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)

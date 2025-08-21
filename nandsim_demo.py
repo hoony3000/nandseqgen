@@ -61,12 +61,6 @@ def _seed_rng_from_cfg(cfg):
         if seed is not None:
             random.seed(int(seed))
             print(f"[INIT] random.seed({seed})")
-            try:
-                import numpy as np  # optional
-                np.random.seed(int(seed))
-                print(f"[INIT] numpy.random.seed({seed})")
-            except Exception:
-                pass
     except Exception as e:
         print(f"[INIT] random.seed skipped: {e}")
 
