@@ -67,9 +67,12 @@ def _coerce_states_to_fixed(cfg):
 
 def _validate_phase_conditional_cfg(cfg):
     """
-    Ensure each phase_conditional distribution sums to 1.0 (within epsilon) and has no negative weights.
-    This is a pre-run guard to avoid unstable sampling behavior.
+    Ensure each phase_conditional distribution has no negative weights and
+    normalize to sum to 1.0 if necessary (within epsilon). Log when normalization occurs.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     pc = cfg.get("phase_conditional", {})
     eps = 1e-6
     for key, dist in pc.items():
@@ -83,7 +86,13 @@ def _validate_phase_conditional_cfg(cfg):
             raise ValueError(f"phase_conditional[{key}] contains negative weight(s)")
         s = float(sum(float(v) for v in vals))
         if abs(s - 1.0) > eps:
-            raise ValueError(f"phase_conditional[{key}] sum={s} != 1.0")
+            # 합이 0이거나 비정상적으로 작은 경우는 정규화 불가
+            if s <= eps:
+                raise ValueError(f"phase_conditional[{key}] sum={s} is non-positive; cannot normalize")
+            factor = 1.0 / s
+            for k in list(dist.keys()):
+                dist[k] = float(dist[k]) * factor
+            logger.warning(f"[CFG] normalized phase_conditional[%s]: sum %.6f -> 1.0", key, s)
 
 CFG = {
     "rng_seed": 12345,
