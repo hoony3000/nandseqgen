@@ -9,3 +9,4 @@ prompt_toolkit
 streamlit
 pyvis
 pandas
+bokeh>=3.4.0

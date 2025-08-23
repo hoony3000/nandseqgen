@@ -4,7 +4,7 @@
 # - Latch/DOUT 중 SR 예약 금지 케이스를 bus/excl에서 일관되게 차단
 
 from __future__ import annotations
-import heapq, random, sys, os, time
+import heapq, random, sys, os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
@@ -21,35 +21,6 @@ from viz_tools import compute_block_usage_stats, save_block_usage_stats, print_b
 SIM_RES_US = 0.01
 def quantize(t: float) -> float:
     return round(t / SIM_RES_US) * SIM_RES_US
-
-# --------------------------------------------------------------------------
-# Simple Profiler
-class _Profiler:
-    def __init__(self):
-        self._totals = {}
-        self._counts = {}
-
-    def add(self, label: str, dt: float):
-        try:
-            self._totals[label] = self._totals.get(label, 0.0) + float(dt)
-            self._counts[label] = self._counts.get(label, 0) + 1
-        except Exception:
-            pass
-
-    def to_csv(self, path: str = "perf_profile.csv"):
-        try:
-            import csv
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["label", "total_sec", "count", "avg_ms"]) 
-                for k in sorted(self._totals.keys()):
-                    tot = self._totals[k]; cnt = self._counts.get(k, 0)
-                    avg_ms = (tot / max(cnt, 1)) * 1000.0
-                    w.writerow([k, round(tot, 6), cnt, round(avg_ms, 3)])
-        except Exception:
-            pass
-
-PROF = _Profiler()
 
 # --------------------------------------------------------------------------
 # Config
@@ -1583,7 +1554,6 @@ class PolicyEngine:
 
     def propose(self, now_us: float, hook: PhaseHook, g: Dict[str,str], l: Dict[str,str], earliest_start: float) -> Optional[Operation]:
         die, hook_plane = hook.die, hook.plane
-        _t_propose = time.perf_counter()
 
         # 0) obligations first
         stage = "obligation"
@@ -1594,9 +1564,7 @@ class PolicyEngine:
         horizon = float(ease_cfg.get("horizon_us", 10.0)) if easing_enabled else 10.0
         # easing: use die-wide earliest for pop feasibility to avoid hook_plane bottleneck
         pop_earliest = self.addr.candidate_start_for_scope(now_us, die, Scope.DIE_WIDE, list(range(self.addr.planes))) if easing_enabled else earliest_start
-        _t0 = time.perf_counter()
         ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=horizon, earliest_start=pop_earliest, easing=easing_enabled)
-        PROF.add("obl.pop_urgent", time.perf_counter() - _t0)
         if ob:
             cfg_op=self.cfg["op_specs"][ob.require.name]
             op=build_operation(ob.require, cfg_op, ob.targets)
@@ -1615,8 +1583,6 @@ class PolicyEngine:
             self.current_obligation = ob
             if start_hint > ob.deadline_us:
                 self._reject(now_us, hook, stage, "soft_defer/feasible", ob.require.name, None, len(plane_set), plane_set, start_hint, None, "deadline_miss_after_recalc")
-                if self.obl.debug:
-                    print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=feasible(deadline_miss) start_hint={start_hint:.2f} deadline={ob.deadline_us:.2f}")
                 # push back to heap with small epsilon to avoid hot-loop
                 self.obl.requeue(ob)
                 # audit now to capture potential loss
@@ -1629,39 +1595,28 @@ class PolicyEngine:
                 admission_ok = True if bypass else self._admission_ok(now_us, hook.label, ob.require.name, start_hint, ob.deadline_us)
                 if not admission_ok:
                     self._reject(now_us, hook, stage, "soft_defer/admission", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "deadline_window")
-                    if self.obl.debug:
-                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=admission start_hint={start_hint:.2f} deadline={ob.deadline_us:.2f}")
                     self.obl.requeue(ob)
                     self.obl.audit(now_us, "soft_defer/admission")
                 elif not self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope):
                     self._reject(now_us, hook, stage, "soft_defer/precheck", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "addr/precheck")
-                    if self.obl.debug:
-                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=precheck start_hint={start_hint:.2f} scope={scope.name} planes={plane_set}")
                     self.obl.requeue(ob)
                     self.obl.audit(now_us, "soft_defer/precheck")
                 elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
                     self._reject(now_us, hook, stage, "soft_defer/bus", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "bus_conflict")
-                    if self.obl.debug:
-                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=bus start_hint={start_hint:.2f} planes={plane_set}")
                     self.obl.requeue(ob)
                     self.obl.audit(now_us, "soft_defer/bus")
                 elif not self.latch.allowed(op, start_hint):
                     self._reject(now_us, hook, stage, "soft_defer/latch", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "read->dout plane latched")
-                    if self.obl.debug:
-                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=latch start_hint={start_hint:.2f} planes={plane_set}")
                     self.obl.requeue(ob)
                     self.obl.audit(now_us, "soft_defer/latch")
                 elif not self._exclusion_ok(op, start_hint):
                     self._reject(now_us, hook, stage, "soft_defer/excl", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "exclusion_window")
-                    if self.obl.debug:
-                        print(f"[OBLIGDBG] soft_defer: id={ob.id} req={ob.require.name} reason=excl start_hint={start_hint:.2f} planes={plane_set}")
                     self.obl.requeue(ob)
                     self.obl.audit(now_us, "soft_defer/excl")
                 else:
                     # ACCEPT
                     self.rejlog.log_accept(stage)
                     op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"
-                    PROF.add("spe.propose", time.perf_counter() - _t_propose)
                     return op
         else:
             # no obligation
@@ -1683,9 +1638,7 @@ class PolicyEngine:
         if not dist:
             self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_dist_for_hook")
         else:
-            _t_rlet = time.perf_counter()
             pick=roulette_pick(dist, allow)
-            PROF.add("spe.roulette_pick", time.perf_counter() - _t_rlet)
             if not pick:
                 self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "roulette_zero_weight")
             else:
@@ -1696,9 +1649,7 @@ class PolicyEngine:
                     fanout=1; alias_used="SR"
                 else:
                     fanout, interleave=self._fanout_from_alias(base, alias_const, hook.label)
-                    _t_plan = time.perf_counter()
                     plan=self.addr.plan_multipane(kind, die, hook_plane, fanout, interleave)
-                    PROF.add("addr.plan_multipane", time.perf_counter() - _t_plan)
                     alias_used=pick
                     if not plan and fanout>1:
                         self.stats["alias_degrade"]+=1
@@ -1714,9 +1665,7 @@ class PolicyEngine:
                             plan=self.addr.plan_multipane(kind, die, p, 1, True)
                             fanout=1
                         else:
-                            _t_plan2 = time.perf_counter()
                             plan=self.addr.plan_multipane(kind, die, p, fanout, interleave)
-                            PROF.add("addr.plan_multipane", time.perf_counter() - _t_plan2)
                         tried += 1
                         p = (p + 1) % self.addr.planes
                 if not plan:
@@ -1749,11 +1698,9 @@ class PolicyEngine:
                         # ACCEPT
                         self.rejlog.log_accept(stage)
                         op.meta["source"]="policy.phase_conditional"; op.meta["phase_key_used"]=used_key
-                        PROF.add("spe.propose", time.perf_counter() - _t_propose)
                         return op
 
         # backoff 단계 제거됨 (충돌 정합성 해소 계획에 따라 비활성화)
-        PROF.add("spe.propose", time.perf_counter() - _t_propose)
         return None
 
 # --------------------------------------------------------------------------
@@ -1844,9 +1791,7 @@ def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl
                     heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_erase.deadline_us, seq=ob_erase.id, ob=ob_erase))
                     obl.stats["created"] += 1
                     obl.creation_logger.log(ob_erase, context="bootstrap", stripe=s, page_index=p)
-                    if obl.debug:
-                        dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.ERASE))
-                        print(f"[BOOTAUD] ERASE deadlines p=0: {dls}")
+                    # debug logging removed
                     stripe_last_deadline = ob_erase.deadline_us
 
         # PROGRAM
@@ -1869,9 +1814,7 @@ def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl
                 heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_pgm.deadline_us, seq=ob_pgm.id, ob=ob_pgm))
                 obl.stats["created"] += 1
                 obl.creation_logger.log(ob_pgm, context="bootstrap", stripe=s, page_index=p)
-                if obl.debug:
-                    dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.PROGRAM))
-                    print(f"[BOOTAUD] PROGRAM deadlines p={p}: {dls}")
+                # debug logging removed
                 stripe_last_deadline = ob_pgm.deadline_us
 
         # READ
@@ -1894,9 +1837,7 @@ def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl
                 heapq.heappush(obl.heap, _ObHeapItem(deadline_us=ob_read.deadline_us, seq=ob_read.id, ob=ob_read))
                 obl.stats["created"] += 1
                 obl.creation_logger.log(ob_read, context="bootstrap", stripe=s, page_index=p)
-                if obl.debug:
-                    dls = sorted((it.ob.deadline_us for it in obl.heap if it.ob.require==OpKind.READ))
-                    print(f"[BOOTAUD] READ deadlines p={p}: {dls}")
+                # debug logging removed
                 stripe_last_deadline = ob_read.deadline_us + gap
                 # Pair (READ->DOUT) per page: DOUT after READ(p)
                 for idx, t in enumerate(sorted(plane_targets, key=lambda a: a.plane)):
@@ -1951,7 +1892,6 @@ class Scheduler:
         return op.kind.name
 
     def _schedule_operation(self, op: Operation):
-        _t_sched = time.perf_counter()
         start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
 
         # ---- fail-safe: schedule 직전 마지막 충돌 점검 ----
@@ -1968,12 +1908,10 @@ class Scheduler:
         # -----------------------------------------------
 
         # reserve plane scope + bus + register exclusions + future update
-        _t_res = time.perf_counter()
         self.addr.reserve_planescope(op, start, end)
-        PROF.add("addr.reserve_planescope", time.perf_counter() - _t_res)
-        _t_bus = time.perf_counter(); self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op)); PROF.add("addr.bus_reserve", time.perf_counter() - _t_bus)
-        _t_excl = time.perf_counter(); self.excl.register(op, start); PROF.add("excl.register", time.perf_counter() - _t_excl)
-        _t_fut = time.perf_counter(); self.addr.register_future(op, start, end); PROF.add("addr.register_future", time.perf_counter() - _t_fut)
+        self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
+        self.excl.register(op, start)
+        self.addr.register_future(op, start, end)
         # latch: if READ, plan lock from READ.end_us until DOUT ends
         if op.kind == OpKind.READ:
             self.latch.plan_lock_after_read(op.targets, end)
@@ -2007,8 +1945,8 @@ class Scheduler:
                             "plane":    int(t.plane),
                             "block":    int(t.block),
                             "page":     int(page),
-                            "kind":     label,
-                            "base_kind": op.kind.name,
+                            "op_name":     label,
+                            "op_kind": op.kind.name,
                             "source":   op.meta.get("source"),
                             "op_uid":   int(op.meta.get("uid", -1)),
                             "arity":    int(op.meta.get("arity", 1)),
@@ -2031,7 +1969,6 @@ class Scheduler:
 
         # push events
         self._push(start, "OP_START", op); self._push(end, "OP_END", op)
-        PROF.add("sched._schedule_operation", time.perf_counter() - _t_sched)
 
         # hooks: bootstrap에서는 훅을 1회로 축소(END만). 비부트스트랩은 기존 2~3회 유지
         bs_cfg = self.cfg.get("bootstrap", {})
@@ -2065,7 +2002,6 @@ class Scheduler:
 
     def run_until(self, t_end: float):
         t_end=quantize(t_end)
-        _t_loop = time.perf_counter()
         while self.ev and self.ev[0][0] <= t_end:
             self.now, _, typ, payload = heapq.heappop(self.ev)
 
@@ -2096,9 +2032,7 @@ class Scheduler:
                     if self._bootstrap_started and self._bootstrap_end_time is None:
                         self._bootstrap_end_time=self.now
                 self.stat_propose_calls+=1
-                _t_spe = time.perf_counter()
                 op=self.SPE.propose(self.now, hook, g, l, earliest_start)
-                PROF.add("spe.propose_total", time.perf_counter() - _t_spe)
                 if op: self._schedule_operation(op)
 
             elif typ=="OP_START":
@@ -2118,7 +2052,6 @@ class Scheduler:
                 self.obl.on_commit(op, self.now)
 
         # final stats
-        PROF.add("sched.run_until", time.perf_counter() - _t_loop)
         print(f"\n=== Stats ===")
         print(f"run_until     : {t_end:.2f}")
         print(f"propose calls : {self.stat_propose_calls}")
@@ -2252,9 +2185,7 @@ def main():
 
 
     # 4) 규칙 자동검증
-    _t_val = time.perf_counter()
     report = validate_timeline(df, CFG)
-    PROF.add("viz.validate_timeline", time.perf_counter() - _t_val)
     print_validation_report(report, max_rows=30)
     viol_df = violations_to_dataframe(report)
     viol_df.to_csv("nand_violations.csv", index=False)
@@ -2289,11 +2220,7 @@ def main():
     except Exception as e:
         print(f"[CREATIONS] skipped: {e}")
 
-    # 4.7) 성능 프로파일 저장
-    try:
-        PROF.to_csv("perf_profile.csv")
-    except Exception:
-        pass
+    # 4.7) 성능 프로파일 저장 제거됨
 
     # 5) 시각화
     if split_logging and (df_boot is not None or df_pol is not None):
@@ -2334,8 +2261,8 @@ def main():
     # print(df_preview.head())
 
     # CSV 내보내기
-    # paths = export_patterns(df, CFG)
-    # print("written:", paths)
+    paths = export_patterns(df, CFG)
+    print("written:", paths)
 
 if __name__=="__main__":
     main()

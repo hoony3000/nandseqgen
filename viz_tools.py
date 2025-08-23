@@ -64,8 +64,8 @@ class TimelineLogger:
                 "plane":    int(t.plane),
                 "block":    int(t.block),
                 "page":     int(page),
-                "kind":     label,          # alias-aware (SIN_/MUL_ for multi/single)
-                "base_kind": op.kind.name,  # ERASE/PROGRAM/READ/DOUT/SR/...
+                "op_name":     label,          # alias-aware (SIN_/MUL_ for multi/single)
+                "op_kind": op.kind.name,  # ERASE/PROGRAM/READ/DOUT/SR/...
                 "source":   op.meta.get("source"),
                 "op_uid":   int(op.meta.get("uid", -1)),
                 "arity":    int(op.meta.get("arity", 1)),
@@ -91,14 +91,14 @@ def plot_gantt(df: pd.DataFrame,
                figsize: Tuple[float,float] = (12, 4),
                title: Optional[str] = None):
     """
-    Gantt-like timeline: y=(die, block), x=time(us), color=base_kind.
+    Gantt-like timeline: y=(die, block), x=time(us), color=op_kind.
     """
     if df.empty:
         print("[plot_gantt] empty dataframe"); return
     d = df if die is None else df[df["die"] == die]
     if blocks is not None:
         d = d[d["block"].isin(blocks)]
-    d = d[d["base_kind"].isin(kinds)]
+    d = d[d["op_kind"].isin(kinds)]
     if d.empty:
         if die is None:
             print("[plot_gantt] no rows with given filters"); return
@@ -112,7 +112,7 @@ def plot_gantt(df: pd.DataFrame,
     plt.figure(figsize=figsize)
     for _, r in d.iterrows():
         y = ymap[(int(r["die"]), int(r["block"]))]
-        c = _color_for(r["base_kind"])
+        c = _color_for(r["op_kind"])
         plt.hlines(y, r["start_us"], r["end_us"], colors=c, linewidth=linewidth)
 
     plt.yticks(list(ymap.values()), [f"d{di}/blk{bl}" for (di, bl) in pairs])
@@ -163,7 +163,7 @@ def plot_block_page_sequence_3d(df: pd.DataFrame,
                                 line_alpha: float = 0.6,
                                 line_width: float = 1.2):
     """
-    3D scatter: x=block, y=page, z=order, color=base_kind.
+    3D scatter: x=block, y=page, z=order, color=op_kind.
     - z_mode:
         * "per_block": seq_per_block (블록별 순번)
         * "global_die": seq_global_die (die 전체 순번)
@@ -175,7 +175,7 @@ def plot_block_page_sequence_3d(df: pd.DataFrame,
     d = df[df["die"] == die].copy()
     if blocks is not None:
         d = d[d["block"].isin(blocks)]
-    d = d[d["base_kind"].isin(kinds)]
+    d = d[d["op_kind"].isin(kinds)]
     if d.empty:
         print(f"[plot_block_page_sequence_3d] no rows for die={die} with given filters"); return
 
@@ -186,7 +186,7 @@ def plot_block_page_sequence_3d(df: pd.DataFrame,
 
     # scatter by kind
     for k in kinds:
-        dk = d[d["base_kind"] == k]
+        dk = d[d["op_kind"] == k]
         if dk.empty: continue
         ax.scatter(dk["block"], dk["page"], dk[zcol],
                    s=28, depthshade=True, c=_color_for(k), label=k)
@@ -242,7 +242,7 @@ class ValidationIssue:
 
 def _spec_offsets_fixed(op_specs: Dict[str, Any]) -> Dict[str, Dict[str, Tuple[float,float]]]:
     """
-    op_specs -> 각 base_kind별로 { 'total': (0,total), 'core_busy': (t0,t1) or None }를 계산.
+    op_specs -> 각 op_kind별로 { 'total': (0,total), 'core_busy': (t0,t1) or None }를 계산.
     (고정 duration만 지원)
     """
     out: Dict[str, Dict[str, Tuple[float,float]]] = {}
@@ -293,7 +293,7 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
     for _, _, etype, idx in events:
         r = df.iloc[idx]
         die, block, page = int(r["die"]), int(r["block"]), int(r["page"])
-        base = str(r["base_kind"])
+        base = str(r["op_kind"])
 
         key = (die, block)
         if key not in state:
@@ -340,7 +340,7 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # CORE_BUSY windows
     def core_busy_window(row) -> Optional[Tuple[float,float]]:
-        base = str(row["base_kind"])
+        base = str(row["op_kind"])
         spec = specs.get(base)
         if not spec: return None
         cb = spec.get("core_busy")
@@ -350,8 +350,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
         return (s0, s1)
 
     # PROGRAM/ERASE CORE_BUSY: 같은 die에서 READ/PROGRAM/ERASE 전체 금지
-    diewide_rows = df[df["base_kind"].isin(["PROGRAM","ERASE"])]
-    all_rpe = df[df["base_kind"].isin(["READ","PROGRAM","ERASE"])]
+    diewide_rows = df[df["op_kind"].isin(["PROGRAM","ERASE"])]
+    all_rpe = df[df["op_kind"].isin(["READ","PROGRAM","ERASE"])]
     for _, r in diewide_rows.iterrows():
         win = core_busy_window(r)
         if not win: continue
@@ -369,9 +369,9 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             t1 = min(s1, float(rr["end_us"]))
             if (t1 - t0) <= eps:
                 continue
-            # 멀티/싱글 풀 라벨 표기(READ는 kind, 그 외는 base_kind 기준으로 출력)
-            lhs = r.get("kind") if r["base_kind"]=="READ" else r["base_kind"]
-            rhs = rr.get("kind") if rr["base_kind"]=="READ" else rr["base_kind"]
+            # 멀티/싱글 풀 라벨 표기(READ는 kind, 그 외는 op_kind 기준으로 출력)
+            lhs = r.get("op_name") if r["op_kind"]=="READ" else r["op_kind"]
+            rhs = rr.get("op_name") if rr["op_kind"]=="READ" else rr["op_kind"]
             issues.append(ValidationIssue(
                 kind="CORE_BUSY_DIEWIDE_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
                 t0=t0, t1=t1,
@@ -380,7 +380,7 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             ))
 
     # MUL_READ CORE_BUSY: 같은 die에서 READ/PROGRAM/ERASE 금지
-    mul_rows = df[(df["base_kind"]=="READ") & (df["kind"]=="MUL_READ")]
+    mul_rows = df[(df["op_kind"]=="READ") & (df["op_name"]=="MUL_READ")]
     for _, r in mul_rows.iterrows():
         win = core_busy_window(r)
         if not win: continue
@@ -396,7 +396,7 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             t1 = min(s1, float(rr["end_us"]))
             if (t1 - t0) <= eps:
                 continue
-            rhs = rr.get("kind") if rr["base_kind"]=="READ" else rr["base_kind"]
+            rhs = rr.get("op_name") if rr["op_kind"]=="READ" else rr["op_kind"]
             issues.append(ValidationIssue(
                 kind="MUL_READ_CORE_BUSY_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
                 t0=t0, t1=t1,
@@ -405,8 +405,8 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             ))
 
     # SIN_READ CORE_BUSY: 같은 die에서 MUL_READ/PROGRAM/ERASE 금지 (SIN_READ는 허용)
-    sin_rows = df[(df["base_kind"]=="READ") & (df["kind"]=="SIN_READ")]
-    ban_for_sin = df[(df["base_kind"].isin(["PROGRAM","ERASE"])) | ((df["base_kind"]=="READ") & (df["kind"]=="MUL_READ"))]
+    sin_rows = df[(df["op_kind"]=="READ") & (df["op_name"]=="SIN_READ")]
+    ban_for_sin = df[(df["op_kind"].isin(["PROGRAM","ERASE"])) | ((df["op_kind"]=="READ") & (df["op_name"]=="MUL_READ"))]
     for _, r in sin_rows.iterrows():
         win = core_busy_window(r)
         if not win: continue
@@ -422,7 +422,7 @@ def validate_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
             t1 = min(s1, float(rr["end_us"]))
             if (t1 - t0) <= eps:
                 continue
-            rhs = rr.get("kind") if rr["base_kind"]=="READ" else rr["base_kind"]
+            rhs = rr.get("op_name") if rr["op_kind"]=="READ" else rr["op_kind"]
             issues.append(ValidationIssue(
                 kind="SIN_READ_CORE_BUSY_OVERLAP", die=d, block=int(r["block"]), page=int(r.get("page", 0)),
                 t0=t0, t1=t1,
@@ -468,7 +468,7 @@ def _get_pattern_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("CFG['pattern_export'] is missing. Add defaults in nandsim_demo.py.")
     return pe
 
-def _alias_name_for_export(base_kind: str,
+def _alias_name_for_export(op_kind: str,
                            kinds_in_group: Sequence[str],
                            arity: int,
                            pe: Dict[str, Any]) -> str:
@@ -476,19 +476,19 @@ def _alias_name_for_export(base_kind: str,
     for k in kinds_in_group:
         if isinstance(k, str) and (k.startswith("SIN_") or k.startswith("MUL_")):
             tail = k.split("_", 1)[1] if "_" in k else None
-            if tail == base_kind:
+            if tail == op_kind:
                 return k
     # 2) 없으면 arity 기준으로 별칭 생성 (apply_to 대상에 한함)
     apply_to = set(pe.get("aliasing", {}).get("apply_to", []))
-    if base_kind in apply_to:
+    if op_kind in apply_to:
         th = int(pe.get("aliasing", {}).get("mul_threshold", 2))
-        return ("MUL_" if int(arity) >= th else "SIN_") + base_kind
-    return base_kind
+        return ("MUL_" if int(arity) >= th else "SIN_") + op_kind
+    return op_kind
 
 def pattern_build_ops_from_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     TimelineLogger DataFrame을 '오퍼레이션 1건=CSV 1행'으로 집계.
-    - op_uid가 있으면 op_uid로 그룹; 없으면 (die,start_us,end_us,base_kind,source)로 보수적으로 그룹
+    - op_uid가 있으면 op_uid로 그룹; 없으면 (die,start_us,end_us,op_kind,source)로 보수적으로 그룹
     - time은 그룹의 start_us 최소값에 time.scale/round_decimals 적용
     - payload는 CFG.pattern_export.payload 규칙 적용
     """
@@ -501,7 +501,7 @@ def pattern_build_ops_from_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Li
     if use_uid:
         groups = df2.groupby("op_uid", sort=False)
     else:
-        key_cols = ["die", "start_us", "end_us", "base_kind", "source"]
+        key_cols = ["die", "start_us", "end_us", "op_kind", "source"]
         for k in key_cols:
             if k not in df2.columns:
                 df2[k] = None
@@ -512,7 +512,7 @@ def pattern_build_ops_from_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Li
     rdec   = int(pe.get("time", {}).get("round_decimals", 3))
 
     for key, grp in groups:
-        base = str(grp["base_kind"].iloc[0])
+        base = str(grp["op_kind"].iloc[0])
         die  = int(grp["die"].iloc[0]) if "die" in grp.columns else 0
         smin = float(grp["start_us"].min())
         emax = float(grp["end_us"].max())
@@ -558,7 +558,7 @@ def pattern_build_ops_from_timeline(df: pd.DataFrame, cfg: Dict[str, Any]) -> Li
             "op_name": op_name,
             "op_id": op_id,
             "payload_obj": payload_obj,
-            "base_kind": base,
+            "op_kind": base,
             "arity": arity,
             "group_df": grp,
         })
@@ -594,7 +594,7 @@ def pattern_maybe_insert_nops(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -
                 "op_name": nop_cfg.get("op_name", "NOP"),
                 "op_id": int(nop_cfg.get("opcode", 0)),
                 "payload_obj": {str(nop_cfg.get("rep_key", "rep")): rep},
-                "base_kind": "NOP", "arity": 1, "group_df": None
+                "op_kind": "NOP", "arity": 1, "group_df": None
             })
 
     for i, row in enumerate(rows):
@@ -613,7 +613,7 @@ def pattern_maybe_insert_nops(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -
                         "op_name": nop_cfg.get("op_name", "NOP"),
                         "op_id": int(nop_cfg.get("opcode", 0)),
                         "payload_obj": {str(nop_cfg.get("rep_key", "rep")): rep},
-                        "base_kind": "NOP", "arity": 1, "group_df": None
+                        "op_kind": "NOP", "arity": 1, "group_df": None
                     })
         out.append(row)
 
@@ -643,7 +643,7 @@ def pattern_preflight(rows: List[Dict[str, Any]], df: pd.DataFrame, cfg: Dict[st
                 errs.append(f"[row#{idx}] payload not JSON-serializable: {e}")
 
         if chk_page_eq and r.get("group_df") is not None:
-            base = str(r.get("base_kind"))
+            base = str(r.get("op_kind"))
             spec = cfg.get("op_specs", {}).get(base, {})
             if spec and bool(spec.get("page_equal_required", False)):
                 grp = r["group_df"]
@@ -767,7 +767,7 @@ def plot_target_heatmap(df: pd.DataFrame,
     Heatmap of target address hits.
     - x-axis: die-block (flattened; labeled as "d{die}/blk{block}")
     - y-axis: page
-    kinds: 필터할 base_kind 목록 (예: ("PROGRAM","READ")); None이면 전체 사용
+    kinds: 필터할 op_kind 목록 (예: ("PROGRAM","READ")); None이면 전체 사용
     dies: None이면 모든 die 포함, 아니면 지정한 die만 포함
     """
     if df is None or df.empty:
@@ -778,7 +778,7 @@ def plot_target_heatmap(df: pd.DataFrame,
         d = d[d["die"].isin(list(dies))]
     # filter by base kinds
     if kinds is not None:
-        d = d[d["base_kind"].isin(list(kinds))]
+        d = d[d["op_kind"].isin(list(kinds))]
     if d.empty:
         print("[plot_target_heatmap] no rows after filters"); return None, None
     d = d.dropna(subset=["die","block","page"]).copy()
@@ -864,9 +864,9 @@ def compute_block_usage_stats(df: pd.DataFrame,
     """
     블록/주소 쏠림을 계측하는 통계 집계.
     반환:
-      - detail: die, plane, block, base_kind, count
-      - summary_die: die, base_kind, metrics...
-      - summary_die_plane: die, plane, base_kind, metrics...
+      - detail: die, plane, block, op_kind, count
+      - summary_die: die, op_kind, metrics...
+      - summary_die_plane: die, plane, op_kind, metrics...
     """
     out: Dict[str, pd.DataFrame] = {}
     if df is None or df.empty:
@@ -876,15 +876,15 @@ def compute_block_usage_stats(df: pd.DataFrame,
         return out
 
     d0 = df.copy()
-    d0 = d0[d0["base_kind"].isin(list(kinds))]
+    d0 = d0[d0["op_kind"].isin(list(kinds))]
     if d0.empty:
         out["detail"] = pd.DataFrame()
         out["summary_die"] = pd.DataFrame()
         out["summary_die_plane"] = pd.DataFrame()
         return out
 
-    # detail counts by die/plane/block/base_kind
-    grp_cols = ["die", "plane", "block", "base_kind"]
+    # detail counts by die/plane/block/op_kind
+    grp_cols = ["die", "plane", "block", "op_kind"]
     detail = d0.groupby(grp_cols, dropna=False).size().reset_index(name="count")
     out["detail"] = detail
 
@@ -898,11 +898,11 @@ def compute_block_usage_stats(df: pd.DataFrame,
         blk_min = int(group["block"].min()) if not group["block"].empty else 0
         blk_max = int(group["block"].max()) if not group["block"].empty else 0
         blk_span = max(1, blk_max - blk_min)
-        for keys, gk in group.groupby(level_cols + ["base_kind"], dropna=False):
+        for keys, gk in group.groupby(level_cols + ["op_kind"], dropna=False):
             # keys could be tuple; normalize
             if not isinstance(keys, tuple):
                 keys = (keys,)
-            key_dict = {col: val for col, val in zip(level_cols + ["base_kind"], keys)}
+            key_dict = {col: val for col, val in zip(level_cols + ["op_kind"], keys)}
             cnts = gk.groupby("block").size().rename("count")
             total = int(cnts.sum())
             if total <= 0:
@@ -943,13 +943,13 @@ def compute_block_usage_stats(df: pd.DataFrame,
         return pd.DataFrame(rows)
 
     # per-die summary (aggregate planes)
-    die_group = detail.groupby(["die", "block", "base_kind"], dropna=False).size().reset_index(name="count")
-    summary_die = _summarize(die_group, ["die"]).sort_values(["die", "base_kind"]).reset_index(drop=True)
+    die_group = detail.groupby(["die", "block", "op_kind"], dropna=False).size().reset_index(name="count")
+    summary_die = _summarize(die_group, ["die"]).sort_values(["die", "op_kind"]).reset_index(drop=True)
     out["summary_die"] = summary_die
 
     # per-die-plane summary
-    dpl_group = detail.groupby(["die", "plane", "block", "base_kind"], dropna=False).size().reset_index(name="count")
-    summary_dpl = _summarize(dpl_group, ["die", "plane"]).sort_values(["die", "plane", "base_kind"]).reset_index(drop=True)
+    dpl_group = detail.groupby(["die", "plane", "block", "op_kind"], dropna=False).size().reset_index(name="count")
+    summary_dpl = _summarize(dpl_group, ["die", "plane"]).sort_values(["die", "plane", "op_kind"]).reset_index(drop=True)
     out["summary_die_plane"] = summary_dpl
 
     return out
@@ -972,8 +972,8 @@ def print_block_usage_summary(stats: Dict[str, pd.DataFrame], max_rows: int = 20
     if s is None or s.empty:
         print("[block_usage] no data")
         return
-    print("\n=== Block Usage Summary (per die, by base_kind) ===")
-    cols = ["die", "base_kind", "total_ops", "num_blocks", "mean_norm", "median_norm", "p90_norm", "gini", "head_tail_ratio"]
+    print("\n=== Block Usage Summary (per die, by op_kind) ===")
+    cols = ["die", "op_kind", "total_ops", "num_blocks", "mean_norm", "median_norm", "p90_norm", "gini", "head_tail_ratio"]
     s2 = s[cols].copy()
     # pretty rounding
     for c in ("mean_norm", "median_norm", "p90_norm", "gini", "head_tail_ratio"):
