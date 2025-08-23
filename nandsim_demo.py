@@ -131,11 +131,14 @@ CFG = {
     },
 
     # Phase-conditional proposal (alias keys allowed)
+    "state_timeline": {
+        "affects": {"READ": True, "PROGRAM": True, "ERASE": True, "DOUT": True, "SR": False}
+    },
     "phase_conditional": {
-        "READ.CORE_BUSY":       {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "READ.DATA_OUT":        {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "PROGRAM.CORE_BUSY":    {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
-        "ERASE.CORE_BUSY":      {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
+        "READ.CORE_BUSY":       {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.25, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
+        "READ.DATA_OUT":        {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.00, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
+        "PROGRAM.CORE_BUSY":    {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.00, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
+        "ERASE.CORE_BUSY":      {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.00, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
         "DEFAULT":              {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
     },
 
@@ -306,8 +309,11 @@ CFG["pattern_export"] = {
     "time": {"from": "start_us", "scale": 1.0, "round_decimals": 0, "out_col": "time"},
     "opcode_map": {
         "NOP": 0,
-        "SIN_ERASE": 1, "SIN_PROGRAM": 2, "MUL_PROGRAM": 3,
-        "SIN_READ": 6, "MUL_READ": 7, "SR": 8, "DOUT": 9
+        "SIN_ERASE": 1, "MUL_ERASE": 2,
+        "SIN_PROGRAM": 3, "MUL_PROGRAM": 4,
+        "SIN_READ": 5, "MUL_READ": 6,
+        "SR": 7,
+        "DOUT": 8
     },
     "aliasing": {"apply_to": ["READ","PROGRAM","ERASE"], "mul_threshold": 2},
     "nop": {
@@ -1213,6 +1219,164 @@ class LatchManager:
             return True
 
 # --------------------------------------------------------------------------
+# State Timeline (OP.STATE + END with inf tail)
+@dataclass
+class StateInterval:
+    die: int
+    plane: int
+    op: str
+    state: str
+    start_us: float
+    end_us: float
+
+class StateTimeline:
+    def __init__(self):
+        self.by_plane: Dict[Tuple[int,int], List[StateInterval]] = {}
+        self.last_end_idx: Dict[Tuple[int,int], int] = {}
+        # 1) per-plane starts cache for binary search
+        self._starts_by_plane: Dict[Tuple[int,int], List[float]] = {}
+        # 2) DIE-level merged index (exclude END)
+        self._die_index: Dict[int, List[StateInterval]] = {}
+        self._die_starts: Dict[int, List[float]] = {}
+        # 3) GLOBAL merged index (exclude END)
+        self._global_index: List[StateInterval] = []
+        self._global_starts: List[float] = []
+
+    def _insert_plane(self, key: Tuple[int,int], seg: StateInterval):
+        lst = self.by_plane.setdefault(key, [])
+        starts = self._starts_by_plane.setdefault(key, [s.start_us for s in lst])
+        import bisect as _bisect
+        # refresh starts list if out-of-sync in size
+        if len(starts) != len(lst):
+            starts[:] = [s.start_us for s in lst]
+        i = _bisect.bisect_left(starts, seg.start_us)
+        lst.insert(i, seg)
+        starts.insert(i, seg.start_us)
+
+    def _insert_die(self, die: int, seg: StateInterval):
+        if seg.state == "END":
+            return
+        lst = self._die_index.setdefault(die, [])
+        starts = self._die_starts.setdefault(die, [s.start_us for s in lst])
+        import bisect as _bisect
+        if len(starts) != len(lst):
+            starts[:] = [s.start_us for s in lst]
+        i = _bisect.bisect_left(starts, seg.start_us)
+        lst.insert(i, seg)
+        starts.insert(i, seg.start_us)
+
+    def _insert_global(self, seg: StateInterval):
+        if seg.state == "END":
+            return
+        lst = self._global_index
+        starts = self._global_starts
+        import bisect as _bisect
+        if len(starts) != len(lst):
+            starts[:] = [s.start_us for s in lst]
+        i = _bisect.bisect_left(starts, seg.start_us)
+        lst.insert(i, seg)
+        starts.insert(i, seg.start_us)
+
+    def reserve_op(self, die: int, plane: int, op_name: str, states: List[Tuple[str, float]], start_us: float, affect: bool):
+        if not affect:
+            return
+        import math as _math
+        key=(die, plane)
+        lst = self.by_plane.setdefault(key, [])
+        # truncate previous END
+        end_idx = self.last_end_idx.get(key)
+        if end_idx is not None and 0 <= end_idx < len(lst) and lst[end_idx].state == "END":
+            lst[end_idx].end_us = start_us
+        # insert concrete states
+        t = start_us
+        for st_name, dur in states:
+            seg = StateInterval(die, plane, op_name, st_name, t, t + float(dur))
+            self._insert_plane(key, seg)
+            self._insert_die(die, seg)
+            self._insert_global(seg)
+            t += float(dur)
+        # insert new END
+        end_seg = StateInterval(die, plane, op_name, "END", t, _math.inf)
+        self._insert_plane(key, end_seg)
+        self.last_end_idx[key] = lst.index(end_seg)
+
+    def state_at(self, die: int, plane: int, t: float) -> Optional[str]:
+        key=(die, plane)
+        lst = self.by_plane.get(key, [])
+        if not lst:
+            return None
+        starts = self._starts_by_plane.get(key)
+        if starts is None or len(starts) != len(lst):
+            starts = [s.start_us for s in lst]
+            self._starts_by_plane[key] = starts
+        import bisect as _bisect
+        i = _bisect.bisect_right(starts, t) - 1
+        if 0 <= i < len(lst):
+            s = lst[i]
+            if s.start_us <= t < s.end_us:
+                return f"{s.op}.{s.state}"
+        return None
+
+    def overlaps(self, die: int, plane: int, start: float, end: float, pred=None) -> bool:
+        key=(die, plane)
+        lst = self.by_plane.get(key, [])
+        if not lst:
+            return False
+        starts = self._starts_by_plane.get(key)
+        if starts is None or len(starts) != len(lst):
+            starts = [s.start_us for s in lst]
+            self._starts_by_plane[key] = starts
+        import bisect as _bisect
+        # candidates have seg.start_us < end
+        idx = _bisect.bisect_left(starts, end)
+        # scan a small window backward to include possibly overlapping segs before idx
+        i = max(0, idx - 1)
+        while i < len(lst) and lst[i].start_us < end:
+            seg = lst[i]
+            if seg.start_us < end and start < seg.end_us:
+                if pred is None or pred(seg):
+                    return True
+            i += 1
+        return False
+
+    def overlaps_die(self, die: int, start: float, end: float, pred=None) -> bool:
+        lst = self._die_index.get(die, [])
+        if not lst:
+            return False
+        starts = self._die_starts.get(die)
+        if starts is None or len(starts) != len(lst):
+            starts = [s.start_us for s in lst]
+            self._die_starts[die] = starts
+        import bisect as _bisect
+        idx = _bisect.bisect_left(starts, end)
+        i = max(0, idx - 1)
+        while i < len(lst) and lst[i].start_us < end:
+            seg = lst[i]
+            if seg.start_us < end and start < seg.end_us:
+                if pred is None or pred(seg):
+                    return True
+            i += 1
+        return False
+
+    def overlaps_global(self, start: float, end: float, pred=None) -> bool:
+        lst = self._global_index
+        if not lst:
+            return False
+        starts = self._global_starts
+        if len(starts) != len(lst):
+            starts[:] = [s.start_us for s in lst]
+        import bisect as _bisect
+        idx = _bisect.bisect_left(starts, end)
+        i = max(0, idx - 1)
+        while i < len(lst) and lst[i].start_us < end:
+            seg = lst[i]
+            if seg.start_us < end and start < seg.end_us:
+                if pred is None or pred(seg):
+                    return True
+            i += 1
+        return False
+
+# --------------------------------------------------------------------------
 # Obligation Manager (with stats)
 @dataclass(order=True)
 class _ObHeapItem:
@@ -1524,11 +1688,15 @@ class PolicyEngine:
 
     def __init__(self, cfg, addr: AddressManager, obl: ObligationManager, excl: ExclusionManager,
                  rejlog: Optional[RejectionLogger] = None,
-                 latch: Optional[LatchManager] = None):
+                 latch: Optional[LatchManager] = None,
+                 state_timeline: Optional["StateTimeline"] = None):
         self.cfg=cfg; self.addr=addr; self.obl=obl; self.excl=excl
         self.stats={"alias_degrade":0}
         self.rejlog = rejlog or RejectionLogger()
         self.latch = latch or LatchManager()
+        self.state_timeline = state_timeline
+        # compile exclusion rules for data-driven predicates
+        self._excl_rules = self._compile_exclusion_rules()
 
     def _score(self, op_name: str, phase_label: str, g: Dict[str,str], l: Dict[str,str]) -> float:
         w=self.cfg["weights"]["base"]["host"].get(op_name,0.0)
@@ -1560,6 +1728,119 @@ class PolicyEngine:
         if deadline is not None:  # for obligations if bypass disabled
             delta = min(delta, max(0.0, deadline - now_us))
         return start_hint <= now_us + delta
+
+    # --- exclusion rules compilation & predicates (data-driven) ---
+    def _compile_exclusion_rules(self):
+        rules = []
+        try:
+            for r in self.cfg.get("constraints", {}).get("exclusions", []):
+                when = r.get("when", {})
+                wop = str(when.get("op", "")).upper()
+                states = when.get("states", ["*"])
+                tokens = set(r.get("blocks", []))
+                scope = str(r.get("scope", "GLOBAL")).upper()
+                rules.append((wop, set(states), tokens, scope))
+        except Exception:
+            pass
+        return rules
+
+    def _token_blocks_labels(self, token: str, base_name: str, alias_label: Optional[str]) -> bool:
+        if token == "ANY":
+            return True
+        if token.startswith("BASE:"):
+            return base_name == token.split(":",1)[1]
+        if token.startswith("ALIAS:"):
+            return (alias_label or "") == token.split(":",1)[1]
+        return False
+
+    def _alias_label_for(self, base_name: str, arity: int) -> Optional[str]:
+        # derive alias label from base and arity using helper candidates
+        try:
+            cands = _op_alias_candidates(base_name)
+            if not cands:
+                return None
+            # pick MUL_* when arity>1 else SIN_*
+            prefer = "MUL_" if arity > 1 else "SIN_"
+            for c in cands:
+                if c.startswith(prefer):
+                    return c
+            return cands[0]
+        except Exception:
+            return None
+
+    def _excl_pred(self, seg: "StateInterval", op: Operation) -> bool:
+        # END state never blocks
+        if getattr(seg, "state", None) == "END":
+            return False
+        base_name = op.kind.name
+        alias_label = self._alias_label_for(base_name, int(op.meta.get("arity", 1)) if hasattr(op, "meta") else 1)
+        for wop, states, tokens, _scope in self._excl_rules:
+            if wop and str(seg.op).upper() != wop:
+                continue
+            if ("*" not in states) and (str(seg.state) not in states):
+                continue
+            # if any token blocks this candidate
+            for tok in tokens:
+                if self._token_blocks_labels(tok, base_name, alias_label):
+                    return True
+        return False
+
+    def _bus_pred(self, seg: "StateInterval") -> bool:
+        # END state has no bus usage
+        if getattr(seg, "state", None) == "END":
+            return False
+        try:
+            spec = self.cfg.get("op_specs", {}).get(str(seg.op), {})
+            for st in spec.get("states", []):
+                if str(st.get("name")) == str(seg.state):
+                    return bool(st.get("bus", False))
+        except Exception:
+            return False
+        return False
+
+    # --- scope-aware overlaps helpers ---
+    def _normalize_scope(self, s: Optional[str]) -> str:
+        try:
+            v = str(s or "PLANE").upper()
+            return v if v in ("PLANE","DIE","GLOBAL") else "PLANE"
+        except Exception:
+            return "PLANE"
+
+    def _overlaps_scope(self, die: int, plane_set: List[int], t0: float, t1: float, pred, scope: str) -> bool:
+        if self.state_timeline is None:
+            return False
+        sc = self._normalize_scope(scope)
+        if sc == "GLOBAL":
+            return self.state_timeline.overlaps_global(t0, t1, pred=pred)
+        elif sc == "DIE":
+            return self.state_timeline.overlaps_die(die, t0, t1, pred=pred)
+        else:  # PLANE
+            for p in plane_set:
+                if self.state_timeline.overlaps(die, p, t0, t1, pred=pred):
+                    return True
+            return False
+
+    def _excl_blocks_candidate(self, die: int, plane_set: List[int], t0: float, t1: float, base_name: str, alias_label: Optional[str]) -> bool:
+        # iterate compiled rules and test overlaps in their scopes
+        if not self._excl_rules:
+            return False
+        for wop, states, tokens, scope in self._excl_rules:
+            # build seg predicate
+            def _pred(seg: "StateInterval"):
+                if getattr(seg, "state", None) == "END":
+                    return False
+                if wop and str(seg.op).upper() != wop:
+                    return False
+                if ("*" not in states) and (str(seg.state) not in states):
+                    return False
+                # check if rule tokens would block the candidate
+                for tok in tokens:
+                    if self._token_blocks_labels(tok, base_name, alias_label):
+                        return True
+                return False
+            if self._overlaps_scope(die, plane_set, t0, t1, pred=_pred, scope=scope):
+                return True
+        return False
 
     def propose(self, now_us: float, hook: PhaseHook, g: Dict[str,str], l: Dict[str,str], earliest_start: float) -> Optional[Operation]:
         die, hook_plane = hook.die, hook.plane
@@ -1634,6 +1915,14 @@ class PolicyEngine:
         # 1) phase-conditional (optional; can be disabled via CFG)
         stage = "phase_conditional"
         self.rejlog.log_attempt(stage)
+        # Step 1: admission screen (target-level) - available_at <= now + default_delta
+        try:
+            default_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
+            if self.addr.available_at(die, hook_plane) > now_us + default_delta:
+                self._reject(now_us, hook, stage, "admission_target", None, None, None, None, earliest_start, default_delta, "target_busy")
+                return None
+        except Exception:
+            pass
         # disable knob
         if not self.cfg.get("policy", {}).get("enable_phase_conditional", True):
             self._reject(now_us, hook, stage, "disabled", None, None, None, None, earliest_start, None, "disabled_by_cfg")
@@ -1642,12 +1931,53 @@ class PolicyEngine:
         if self.obl.has_pending(source="bootstrap"):
             self._reject(now_us, hook, stage, "guard_bootstrap_pending", None, None, None, None, earliest_start, None, "bootstrap_pending_skip")
             return None
-        allow=set(list(OP_ALIAS.keys())+["READ","PROGRAM","ERASE","SR"])
-        dist, used_key = get_phase_dist(self.cfg, hook.label)
+        allow=set(list(OP_ALIAS.keys())+["READ","PROGRAM","ERASE","SR","DOUT"])
+        # derive state key from state_timeline at reference time (earliest_start)
+        st_key = None
+        try:
+            if self.state_timeline is not None:
+                st_key = self.state_timeline.state_at(hook.die, hook.plane, earliest_start)  # e.g., "READ.CORE_BUSY" or "READ.END"
+        except Exception:
+            st_key = None
+        used_label = st_key if st_key else hook.label
+        dist, used_key = get_phase_dist(self.cfg, used_label)
         if not dist:
             self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_dist_for_hook")
         else:
-            pick=roulette_pick(dist, allow)
+            # Step 2-3: exclusion/bus screens at operation-level using state_timeline
+            # Step 4: phase_conditional screen → allow = positive weight items
+            cand = {name: w for name, w in dist.items() if name in allow and float(w) > 0.0}
+            if not cand:
+                self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "all_zero_weight")
+                return None
+            # DIE_WIDE op screen with state_timeline (operation screen)
+            filtered = {}
+            for name, w in cand.items():
+                base, _cons = resolve_alias(name)
+                # exclude/bus op-level quick screen on hook plane interval
+                try:
+                    dur_nom = get_kind_nominal_duration(self.cfg, base)
+                except Exception:
+                    dur_nom = 0.0
+                t0 = earliest_start; t1 = quantize(earliest_start + dur_nom)
+                # exclusion op-level filter (scope-aware)
+                alias_label = self._alias_label_for(base, 1)
+                if self._excl_blocks_candidate(die, [hook_plane], t0, t1, base, alias_label):
+                    continue
+                # bus op-level prescreen on hook plane
+                if self.state_timeline is not None and dur_nom > 0.0:
+                    if self.state_timeline.overlaps(die, hook_plane, t0, t1, pred=lambda seg: self._bus_pred(seg)):
+                        continue
+                # DIE_WIDE scope screen: die-wide busy check (coarse)
+                scope_name = str(self.cfg.get("op_specs", {}).get(base, {}).get("scope", "PLANE_SET"))
+                if scope_name == "DIE_WIDE" and self.state_timeline is not None and dur_nom > 0.0:
+                    if self._overlaps_scope(die, [hook_plane], t0, t1, pred=lambda seg: seg.state != "END", scope="DIE"):
+                        continue
+                filtered[name] = w
+            if not filtered:
+                self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "allow_filtered_empty")
+                return None
+            pick=roulette_pick(filtered, set(filtered.keys()))
             if not pick:
                 self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "roulette_zero_weight")
             else:
@@ -1691,18 +2021,21 @@ class PolicyEngine:
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=pick
                     # earliest_start re-calc at candidate time for scope
                     start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+                    # Step 1 reaffirm admission with exact start_hint
                     adm_ok=self._admission_ok(now_us, hook.label, base, start_hint)
                     adm_delta=get_admission_delta(self.cfg, hook.label, base)
                     if not adm_ok:
                         self._reject(now_us, hook, stage, "admission", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "near_future_gate")
-                    elif not self.addr.precheck_planescope(kind, targets, start_hint, scope):
-                        self._reject(now_us, hook, stage, "precheck", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "addr/precheck")
-                    elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
-                        self._reject(now_us, hook, stage, "bus", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "bus_conflict")
+                    # Step 6: multi-plane screening with priority and ordered checks
                     elif not self.latch.allowed(op, start_hint):
                         self._reject(now_us, hook, stage, "latch", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "read->dout plane latched")
-                    elif not self._exclusion_ok(op, start_hint):
+                    elif (
+                        # scope-aware exclusion check using compiled rules against exact start/end
+                        self._excl_blocks_candidate(die, plane_set, start_hint, quantize(start_hint + get_op_duration(op)), base, self._alias_label_for(base, len(plane_set)))
+                    ):
                         self._reject(now_us, hook, stage, "excl", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "exclusion_window")
+                    elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
+                        self._reject(now_us, hook, stage, "bus", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "bus_conflict")
                     else:
                         # ACCEPT
                         self.rejlog.log_accept(stage)
@@ -1870,6 +2203,8 @@ class Scheduler:
         self.stat_propose_calls=0; self.stat_scheduled=0
         self.logger = logger or TimelineLogger()
         self.latch = latch or LatchManager()
+        # state timeline
+        self.state_timeline = StateTimeline()
         self._push(1, "QUEUE_REFILL", None)
         for plane in range(self.addr.planes):
             self._push(2, "PHASE_HOOK", PhaseHook(2, "BOOT.START", 0, plane))
@@ -1921,6 +2256,14 @@ class Scheduler:
         self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
         self.excl.register(op, start)
         self.addr.register_future(op, start, end)
+        # state timeline register per target
+        affects = self.cfg.get("state_timeline", {}).get("affects", {})
+        affect_op = bool(affects.get(op.kind.name, True))
+        if affect_op:
+            # build states as (name, dur) list
+            st_list = [(s.name, float(s.dur_us)) for s in op.states]
+            for t in op.targets:
+                self.state_timeline.reserve_op(t.die, t.plane, op.kind.name, st_list, start, True)
         # latch: if READ, plan lock from READ.end_us until DOUT ends
         if op.kind == OpKind.READ:
             self.latch.plan_lock_after_read(op.targets, end)
@@ -2120,10 +2463,12 @@ def main():
     addr = AddressManager(CFG); excl = ExclusionManager(CFG)
     obl  = ObligationManager(CFG["obligations"], cfg_root=CFG)
     latch = LatchManager()
-    spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch)
+    # shared state timeline
+    state_timeline = StateTimeline()
+    spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch, state_timeline=state_timeline)
     sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger, latch=latch)
-
-    obl.debug = False # debug mode
+    # wire the same timeline to scheduler
+    sch.state_timeline = state_timeline
 
     # 1.3) Bootstrap obligations (optional)
     try:
