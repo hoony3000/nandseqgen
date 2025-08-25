@@ -708,6 +708,7 @@ class AddressManager:
         self.addr_state_committed: Dict[Tuple[int,int], int] = {}
         self.addr_state_future:    Dict[Tuple[int,int], int] = {}
         self.programmed_committed: Dict[Tuple[int], Set[Tuple[int,int]]] = {(die,): set() for die in range(self.dies)}
+        self.programmed_future:    Dict[Tuple[int], Set[Tuple[int,int]]] = {(die,): set() for die in range(self.dies)}
         self.write_head: Dict[Tuple[int,int], int] = {}  # (die,plane)->block
 
         for die in range(self.dies):
@@ -852,6 +853,9 @@ class AddressManager:
     def _committed_pages_on_plane(self, die:int, plane:int)->Set[int]:
         return {p for (b,p) in self.programmed_committed[(die,)] if (b % self.planes)==plane}
 
+    def _future_pages_on_plane(self, die:int, plane:int)->Set[int]:
+        return {p for (b,p) in self.programmed_future[(die,)] if (b % self.planes)==plane}
+
     # ---- planner (non-greedy; degrade fanout; READ=committed, PROGRAM=future) ----
     def _random_plane_sets(self, fanout:int, tries:int, start_plane:int)->List[List[int]]:
         """난수 기반 plane-set 후보 생성 (재현성은 random.seed에 따름)"""
@@ -878,14 +882,14 @@ class AddressManager:
                 if kind==OpKind.READ:
                     commons=None
                     for pl in plane_set:
-                        pages=self._committed_pages_on_plane(die, pl)
+                        pages=self._future_pages_on_plane(die, pl)
                         commons=pages if commons is None else (commons & pages)
                         if not commons: break
                     if not commons: continue
                     page=random.choice(sorted(list(commons)))
                     targets=[]
                     for pl in plane_set:
-                        blks=[b for (b,p) in self.programmed_committed[(die,)] if p==page and (b%self.planes)==pl]
+                        blks=[b for (b,p) in self.programmed_future[(die,)] if p==page and (b%self.planes)==pl]
                         if not blks: targets=[]; break
                         targets.append(Address(die,pl,blks[0],page))
                     if not targets: continue
@@ -1005,6 +1009,12 @@ class AddressManager:
                 if t.page is None:
                     print(f"[PRECCHK] read_page_none die={t.die} block={t.block}")
                     return False
+                if fut <= -1:
+                    print(f"[PRECCHK] read_seq die={t.die} block={t.block} page={t.page} fut={fut} com={com}")
+                    return False
+                if t.page >= self.pages_per_block:
+                    print(f"[PRECCHK] read_oob die={t.die} block={t.block} page={t.page} pages_per_block={self.pages_per_block}")
+                    return False
                 # consider future program windows: if page is not yet committed now, allow if a future PROGRAM window ends before this READ starts
                 committed_now = ((t.block, t.page) in self.programmed_committed[(t.die,)])
                 pol = self.cfg.get("policy", {})
@@ -1050,6 +1060,7 @@ class AddressManager:
             key=(t.die,t.block)
             if op.kind==OpKind.PROGRAM and t.page is not None:
                 self.addr_state_future[key] = max(self.addr_state_future[key], t.page)
+                self.programmed_future[(t.die,)].add((t.block, t.page))
                 # advance write head if full
                 nxt = self._next_page_future(t.die, t.block)
                 if nxt >= self.pages_per_block:
@@ -1061,6 +1072,7 @@ class AddressManager:
                 self.future_program_by_page.setdefault(kpp, []).append((quantize(start), quantize(end)))
             elif op.kind==OpKind.ERASE:
                 self.addr_state_future[key] = -1
+                self.programmed_future[(t.die,)].clear()
                 on_erase = str(self.cfg.get("addressing", {}).get("write_head", {}).get("on_erase", "to_erased_block")).lower()
                 if on_erase=="round_robin_next":
                     # move to next block in stripe after erased block
