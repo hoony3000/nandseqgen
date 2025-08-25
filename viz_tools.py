@@ -69,6 +69,8 @@ class TimelineLogger:
                 "source":   op.meta.get("source"),
                 "op_uid":   int(op.meta.get("uid", -1)),
                 "arity":    int(op.meta.get("arity", 1)),
+                "phase_key_used": op.meta.get("phase_key_used"),
+                "state_key_at_schedule": op.meta.get("state_key_at_schedule"),
             })
 
     def to_dataframe(self) -> pd.DataFrame:

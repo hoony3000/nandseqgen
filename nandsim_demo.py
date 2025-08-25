@@ -137,8 +137,11 @@ CFG = {
     "phase_conditional": {
         "READ.CORE_BUSY":       {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.25, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
         "READ.DATA_OUT":        {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.00, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
+        "READ.END":             {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
         "PROGRAM.CORE_BUSY":    {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.00, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
+        "PROGRAM.END":          {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
         "ERASE.CORE_BUSY":      {"SIN_PROGRAM": 0.00, "MUL_PROGRAM": 0.00, "SIN_READ": 0.00, "MUL_READ": 0.00, "SIN_ERASE": 0.00, "MUL_ERASE": 0.00, "SR": 0.10},
+        "ERASE.END":            {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
         "DEFAULT":              {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
     },
 
@@ -282,7 +285,7 @@ CFG = {
     },
     # Debug options
     "debug": {
-        "log_block_sampling": True
+        "log_block_sampling": False
     },
     # Addressing strategies (experimental)
     "addressing": {
@@ -1351,6 +1354,64 @@ class StateTimeline:
             i += 1
         return False
 
+    def to_dataframe(self):
+        """
+        Materialize state timeline to a pandas DataFrame for visualization/export.
+        - Includes END segments if they have a finite end (infinite tail segments are skipped)
+        - Columns: start_us, end_us, die, plane, op_name(OP.STATE), lane("die/plane"), op, state, dur_us
+        """
+        rows = []
+        for (die, plane), lst in self.by_plane.items():
+            for seg in lst:
+                # keep END only if it has a finite end time (tail with +inf is skipped)
+                if seg.state == "END":
+                    try:
+                        import math as _math
+                        if _math.isinf(seg.end_us):
+                            continue
+                    except Exception:
+                        # best-effort: if end_us is a very large number, still include
+                        pass
+                rows.append({
+                    "start_us": float(seg.start_us),
+                    "end_us": float(seg.end_us),
+                    "die": int(die),
+                    "plane": int(plane),
+                    "op_name": f"{seg.op}.{seg.state}",
+                    "lane": f"{die}/{plane}",
+                    "op": seg.op,
+                    "state": seg.state,
+                })
+        try:
+            import pandas as _pd
+            df = _pd.DataFrame(rows)
+            if not df.empty:
+                df = df.sort_values(["die", "plane", "start_us", "end_us"]).reset_index(drop=True)
+                df["dur_us"] = df["end_us"] - df["start_us"]
+            return df
+        except Exception:
+            # pandas not available or other issue; return minimal fallback-like structure
+            return rows  # type: ignore[return-value]
+
+    def to_csv(self, path: str):
+        """Export state timeline to CSV at given path."""
+        try:
+            import pandas as _pd
+            df = self.to_dataframe()
+            if isinstance(df, list):
+                # fallback without pandas
+                import csv as _csv
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    if not df:
+                        return
+                    writer = _csv.DictWriter(f, fieldnames=list(df[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(df)
+            else:
+                df.to_csv(path, index=False)
+        except Exception as _e:
+            print(f"[STATE_TIMELINE] export failed: {_e}")
+
     def overlaps_die(self, die: int, start: float, end: float, pred=None) -> bool:
         lst = self._die_index.get(die, [])
         if not lst:
@@ -2031,6 +2092,12 @@ class PolicyEngine:
                         pass
                     cfg_op=self.cfg["op_specs"][base]; op=build_operation(kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=pick
+                    # record phase key used for aggregation at propose-time
+                    try:
+                        op.meta["phase_key_used"] = str(used_key if used_key else used_label)
+                        op.meta["state_key_at_schedule"] = str(st_key) if st_key else None
+                    except Exception:
+                        op.meta["phase_key_used"] = str(used_label)
                     # earliest_start re-calc at candidate time for scope
                     start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
                     # Step 1 reaffirm admission with exact start_hint
@@ -2548,6 +2615,13 @@ def main():
     else:
         df = logger.to_dataframe()
         df.to_csv("nand_timeline.csv", index=False)
+
+    # 3.5) Export state timeline for Bokeh Gantt
+    try:
+        state_timeline.to_csv("nand_state_timeline.csv")
+        print("[STATE_TIMELINE] saved to nand_state_timeline.csv")
+    except Exception as e:
+        print(f"[STATE_TIMELINE] save skipped: {e}")
 
 
     # 4) 규칙 자동검증
