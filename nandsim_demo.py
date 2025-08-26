@@ -100,9 +100,7 @@ CFG = {
         "queue_refill_period_us": 5.0,
         "run_until_us": 2000.0,
         "planner_max_tries": 8,
-        # global_nudge 제거됨: 전역 트리거는 QUEUE_REFILL에서 일원화 처리
-        "easing_hookscreen": {"enable": True, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
-        # "easing_hookscreen": {"enable": False, "startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
+        "hookscreen": {"startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
         # PHASE_HOOK 차단: op.kind 기준 훅 생성 비활성화(빈 리스트면 비활성화 없음)
         # 예: ["DOUT", "SR"]
         "phase_hook_disabled_kinds": ["SR"],
@@ -145,20 +143,6 @@ CFG = {
         "DEFAULT":              {"SIN_PROGRAM": 0.15, "MUL_PROGRAM": 0.10, "SIN_READ": 0.25, "MUL_READ": 0.15, "SIN_ERASE": 0.15, "MUL_ERASE": 0.10, "SR": 0.10},
     },
 
-    # Backoff scoring weights (used if phase_conditional fails)
-    "weights": {
-        "base": {"host": {"READ": 0.70, "PROGRAM": 0.15, "ERASE": 0.05, "DOUT": 0.00, "SR": 0.10}},
-        "g_state": {"pgmable_ratio": {"low": 1.3, "mid": 1.0, "high": 0.8},
-                    "readable_ratio": {"low": 1.3, "mid": 1.0, "high": 0.9}},
-        "g_local": {"plane_busy_frac": {"low": 1.2, "mid": 1.0, "high": 0.9}},
-        "g_phase": {
-            "READ": {"START_NEAR": 1.2, "MID_NEAR": 0.9, "END_NEAR": 1.2},
-            "PROGRAM": {"START_NEAR": 1.1, "MID_NEAR": 1.0, "END_NEAR": 0.9},
-            "ERASE": {"START_NEAR": 0.9, "MID_NEAR": 1.1, "END_NEAR": 1.1},
-            "SR": {"START_NEAR": 1.1, "MID_NEAR": 1.1, "END_NEAR": 1.1},
-        },
-    },
-
     # Selection defaults/overrides (for fanout/interleave)
     "selection": {
         "defaults": {
@@ -178,7 +162,7 @@ CFG = {
             "scope": "PLANE_SET",
             "page_equal_required": True,
             "states": [
-                {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
+                {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed", "value": 0.4}},
                 {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 8.0}},
                 {"name": "DATA_OUT",  "bus": False, "dist": {"kind": "fixed", "value": 2.0}},
             ],
@@ -187,7 +171,7 @@ CFG = {
             "scope": "DIE_WIDE",
             "page_equal_required": True,
             "states": [
-                {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
+                {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed", "value": 0.4}},
                 {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 20.0}},
             ],
         },
@@ -195,7 +179,7 @@ CFG = {
             "scope": "DIE_WIDE",
             "page_equal_required": False,
             "states": [
-                {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.4}},
+                {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed", "value": 0.4}},
                 {"name": "CORE_BUSY", "bus": False, "dist": {"kind": "fixed", "value": 40.0}},
             ],
         },
@@ -1549,6 +1533,7 @@ class ObligationManager:
                             id=self._seq,
                             require=OpKind[spec["require"]],
                             targets=[t],
+                            source='obligation.dout',
                             deadline_us=quantize(base_deadline + idx * plane_stagger),
                             hard_slot=hard_slot,
                         )
@@ -1570,7 +1555,7 @@ class ObligationManager:
                     first = op.targets[0]
                     print(f"[{now_us:7.2f} us] OBLIG  created: {op.kind.name} -> {ob.require.name} by {ob.deadline_us:7.2f} us, target(d{first.die},p{first.plane})")
 
-    def pop_urgent(self, now_us: float, die:int, plane:int, horizon_us: float, earliest_start: float, easing: bool = False) -> Optional[Obligation]:
+    def pop_urgent(self, now_us: float, die:int, plane:int, horizon_us: float, earliest_start: float) -> Optional[Obligation]:
         if not self.heap:
             return None
         kept: List[_ObHeapItem] = []
@@ -1583,21 +1568,19 @@ class ObligationManager:
             item = heapq.heappop(self.heap)
             ob=item.ob
             self.stats["pop_examined"] += 1
-            plane_list={a.plane for a in ob.targets}
             same_die=(ob.targets[0].die==die)
-            same_plane=(plane in plane_list)
             in_horizon=((ob.deadline_us - now_us) <= max(horizon_us, 0.0)) or ob.hard_slot
             feasible=(earliest_start <= ob.deadline_us)
-            cond = (same_die and in_horizon and feasible and (same_plane or easing))
+            cond = (same_die and in_horizon and feasible)
             if cond:
                 if self.debug:
-                    print(f"[OBLIGDBG] pop_urgent: CHOOSE id={ob.id} req={ob.require.name} src={getattr(ob,'source',None)} deadline={ob.deadline_us:.2f} conds sd={same_die} sp={same_plane} hz={in_horizon} fs={feasible}")
+                    print(f"[OBLIGDBG] pop_urgent: CHOOSE id={ob.id} req={ob.require.name} src={getattr(ob,'source',None)} deadline={ob.deadline_us:.2f} conds sd={same_die} hz={in_horizon} fs={feasible}")
                 self.stats["pop_chosen"] += 1
                 chosen=ob; break
             kept.append(item)
             self.stats["pop_kept"] += 1
             if self.debug:
-                print(f"[OBLIGDBG] pop_urgent: SKIP  id={ob.id} req={ob.require.name} src={getattr(ob,'source',None)} deadline={ob.deadline_us:.2f} conds sd={same_die} sp={same_plane} hz={in_horizon} fs={feasible}")
+                print(f"[OBLIGDBG] pop_urgent: SKIP  id={ob.id} req={ob.require.name} src={getattr(ob,'source',None)} deadline={ob.deadline_us:.2f} conds sd={same_die} hz={in_horizon} fs={feasible}")
         for it in kept: heapq.heappush(self.heap, it)
         self.stats["pop_returned"] += len(kept)
         if self.debug:
@@ -1679,17 +1662,6 @@ class PolicyEngine:
         self.state_timeline = state_timeline
         # compile exclusion rules for data-driven predicates
         self._excl_rules = self._compile_exclusion_rules()
-
-    def _score(self, op_name: str, phase_label: str, g: Dict[str,str], l: Dict[str,str]) -> float:
-        w=self.cfg["weights"]["base"]["host"].get(op_name,0.0)
-        w*=self.cfg["weights"]["g_state"]["pgmable_ratio"].get(g["pgmable_ratio"],1.0)
-        w*=self.cfg["weights"]["g_state"]["readable_ratio"].get(g["readable_ratio"],1.0)
-        w*=self.cfg["weights"]["g_local"]["plane_busy_frac"].get(l["plane_busy_frac"],1.0)
-        near="MID_NEAR"
-        if phase_label.endswith("START"): near="START_NEAR"
-        elif phase_label.endswith("END"): near="END_NEAR"
-        w*=self.cfg["weights"]["g_phase"].get(op_name,{}).get(near,1.0)
-        return w
 
     def _fanout_from_alias(self, base_name: str, alias_constraint: Optional[Tuple[str,int]], hook_label: str)->Tuple[int,bool]:
         fanout, interleave = get_phase_selection_override(self.cfg, hook_label, base_name)
@@ -1830,13 +1802,10 @@ class PolicyEngine:
         # 0) obligations first
         stage = "obligation"
         self.rejlog.log_attempt(stage)
-        # easing flag wired
-        ease_cfg = self.cfg.get("policy", {}).get("easing_hookscreen", {})
-        easing_enabled = bool(ease_cfg.get("enable", False))
-        horizon = float(ease_cfg.get("horizon_us", 10.0)) if easing_enabled else 10.0
-        # easing: use die-wide earliest for pop feasibility to avoid hook_plane bottleneck
-        pop_earliest = self.addr.candidate_start_for_scope(now_us, die, Scope.DIE_WIDE, list(range(self.addr.planes))) if easing_enabled else earliest_start
-        ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=horizon, earliest_start=pop_earliest, easing=easing_enabled)
+        hookscreen_cfg = self.cfg.get("policy", {}).get("hookscreen", {})
+        horizon = float(hookscreen_cfg.get("horizon_us", 10.0))
+        pop_earliest = self.addr.candidate_start_for_scope(now_us, die, Scope.DIE_WIDE, list(range(self.addr.planes)))
+        ob=self.obl.pop_urgent(now_us, die, hook_plane, horizon_us=horizon, earliest_start=pop_earliest)
         if ob:
             cfg_op=self.cfg["op_specs"][ob.require.name]
             op=build_operation(ob.require, cfg_op, ob.targets)
@@ -1847,7 +1816,6 @@ class PolicyEngine:
             if getattr(ob, "skip_dout_creation", False):
                 op.meta["skip_dout_creation"] = True
             scope=Scope[op.meta["scope"]]; plane_set=op.meta["plane_list"]
-            # easing: if same_plane mismatch, recompute earliest_start on plane_set instead of hook_plane only
             start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
 
             # feasibility after re-calculation: if miss, SOFT-DEFER (requeue), no drop
@@ -1881,23 +1849,17 @@ class PolicyEngine:
                 else:
                     # ACCEPT
                     self.rejlog.log_accept(stage)
-                    op.meta["source"]="obligation"; op.meta["phase_key_used"]="(obligation)"
+                    op.meta["phase_key_used"]="(obligation)"
                     return op
-        else:
-            # no obligation
-            self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_obligation")
 
         # 1) phase-conditional (optional; can be disabled via CFG)
         stage = "phase_conditional"
         self.rejlog.log_attempt(stage)
         # Step 1: admission screen (target-level) - available_at <= now + default_delta
-        try:
-            default_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
-            if self.addr.available_at(die, hook_plane) > now_us + default_delta:
-                self._reject(now_us, hook, stage, "admission_target", None, None, None, None, earliest_start, default_delta, "target_busy")
-                return None
-        except Exception:
-            pass
+        default_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
+        if self.addr.available_at(die, hook_plane) > now_us + default_delta:
+            self._reject(now_us, hook, stage, "admission_target", None, None, None, None, earliest_start, default_delta, "target_busy")
+            return None
         # disable knob
         if not self.cfg.get("policy", {}).get("enable_phase_conditional", True):
             self._reject(now_us, hook, stage, "disabled", None, None, None, None, earliest_start, None, "disabled_by_cfg")
@@ -1909,11 +1871,8 @@ class PolicyEngine:
         allow=set(list(OP_ALIAS.keys())+["READ","PROGRAM","ERASE","SR","DOUT"])
         # derive state key from state_timeline at reference time (earliest_start)
         st_key = None
-        try:
-            if self.state_timeline is not None:
-                st_key = self.state_timeline.state_at(hook.die, hook.plane, earliest_start)  # e.g., "READ.CORE_BUSY" or "READ.END"
-        except Exception:
-            st_key = None
+        if self.state_timeline is not None:
+            st_key = self.state_timeline.state_at(hook.die, hook.plane, earliest_start)  # e.g., "READ.CORE_BUSY" or "READ.END"
         used_label = st_key if st_key else hook.label
         dist, used_key = get_phase_dist(self.cfg, used_label)
         if not dist:
@@ -1970,8 +1929,8 @@ class PolicyEngine:
                         plan=self.addr.plan_multipane(kind, die, hook_plane, 1, interleave)
                         if plan: fanout=1
                 # start_plane round-robin scan when easing enabled and no plan
-                if not plan and easing_enabled:
-                    scan = max(1, int(ease_cfg.get("startplane_scan", 1)))
+                if not plan:
+                    scan = max(1, int(hookscreen_cfg.get("startplane_scan", 1)))
                     tried = 0
                     p = (hook_plane + 1) % self.addr.planes
                     while tried < self.addr.planes and tried < scan and not plan:
@@ -2337,8 +2296,8 @@ class Scheduler:
 
             if typ=="QUEUE_REFILL":
                 # 일원화된 훅 트리거: 글로벌/로컬 모두 여기에서 처리
-                ease_cfg = self.cfg.get("policy", {}).get("easing_hookscreen", {})
-                iters = max(1, int(ease_cfg.get("global_obl_iters", 1)))
+                hookscreen_cfg = self.cfg.get("policy", {}).get("hookscreen", {})
+                iters = max(1, int(hookscreen_cfg.get("global_obl_iters", 1)))
                 for _ in range(iters):
                     for die in range(self.addr.dies):
                         for plane in range(self.addr.planes):
