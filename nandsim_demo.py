@@ -283,10 +283,6 @@ CFG = {
         # READ 이후 DOUT으로 넘어가기 전 전역 간극(부트스트랩 전용)
         # "dout_global_gap_us": 5.0
     },
-    # Debug options
-    "debug": {
-        "log_block_sampling": False
-    },
     # Addressing strategies (experimental)
     "addressing": {
         "program": {
@@ -787,36 +783,6 @@ class AddressManager:
         return ({"pgmable_ratio": pgmable_ratio, "readable_ratio": readable_ratio, "cls":"host"},
                 {"plane_busy_frac": plane_busy_frac})
 
-    # ---- debug logging for block sampling ----
-    def _log_block_sampling(self, kind: str, die: int, plane_set: List[int], targets: List['Address']):
-        try:
-            dbg = bool(self.cfg.get("debug", {}).get("log_block_sampling", False))
-            if not dbg:
-                return
-            head_n = 5
-            tail_n = 4
-            head_set = set(range(0, min(head_n, self.blocks)))
-            tail_set = set(range(max(0, self.blocks - tail_n), self.blocks))
-            blocks = [t.block for t in targets]
-            pages  = [t.page for t in targets]
-            planes = [t.plane for t in targets]
-            srcs = []
-            for t in targets:
-                if kind == "PROGRAM":
-                    srcs.append("HEAD" if self.write_head[(die, t.plane)] == t.block else "FIND")
-                elif kind == "ERASE":
-                    srcs.append("NON_ERASED" if self.addr_state_future[(die, t.block)] >= 0 else "HEAD")
-                else:
-                    srcs.append("COMMITTED")
-            pos = []
-            for b in blocks:
-                if b in head_set: pos.append("HEAD_ZONE")
-                elif b in tail_set: pos.append("TAIL_ZONE")
-                else: pos.append("MID")
-            print(f"[BLKDBG] kind={kind} die={die} planes={plane_set} blocks={blocks} pages={pages} src={srcs} zone={pos}")
-        except Exception:
-            pass
-
     # ---- bus segments & gating ----
     def bus_segments_for_op(self, op: Operation)->List[Tuple[float,float]]:
         segs=[]; t=0.0
@@ -939,7 +905,6 @@ class AddressManager:
                         if ok: chosen=tlist; break
                     if not chosen: continue
                     # debug log
-                    self._log_block_sampling("PROGRAM", die, plane_set, chosen)
                     return chosen, plane_set, Scope.DIE_WIDE
 
                 elif kind==OpKind.ERASE:
@@ -960,13 +925,11 @@ class AddressManager:
                             chosen_b=self.write_head[(die,pl)]
                         targets.append(Address(die, pl, chosen_b, 0))  # page=0 for logging
                     # debug log
-                    self._log_block_sampling("ERASE", die, plane_set, targets)
                     return targets, plane_set, Scope.DIE_WIDE
 
                 elif kind==OpKind.SR:
                     # page=0 for uniform address shape
                     tgt = [Address(die, plane_set[0], plane_set[0], 0)]
-                    self._log_block_sampling("SR", die, plane_set[:1], tgt)
                     return tgt, plane_set[:1], Scope.NONE
 
         return None
