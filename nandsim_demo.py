@@ -1459,22 +1459,6 @@ class ObligationManager:
         }
         self.debug = False
         self._last_audit_lost = 0
-        self.assert_on_inversion = bool((cfg_root or {}).get("policy", {}).get("audit_assert_on_inversion", False))
-        # audit to file support
-        self.audit_file_path: Optional[str] = None
-        self._audit_file_initialized: bool = False
-
-    def set_audit_file(self, path: str):
-        """Enable audit CSV writing; overwrites the file with header."""
-        self.audit_file_path = path
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["time_us","where","created","fulfilled","live","heap","assigned","lost"]) 
-            self._audit_file_initialized = True
-        except Exception:
-            self.audit_file_path = None
-            self._audit_file_initialized = False
 
     def _page_index_of_ob(self, ob: Obligation) -> int:
         try:
@@ -1487,10 +1471,6 @@ class ObligationManager:
         except Exception:
             return -1
         return -1
-
-    def _log_inversion_check(self, ob: Obligation, where: str):
-        # backwards-compat single-group check routed to full audit
-        self.audit_order_all(where)
 
     def audit_order_all(self, where: str):
         # group by (require, die, source)
@@ -1518,34 +1498,6 @@ class ObligationManager:
         if any_inv and self.assert_on_inversion:
             raise AssertionError(f"Obligation deadline inversion detected at {where}")
 
-    def audit(self, now_us: float, where: str):
-        total_created = self.stats.get("created", 0)
-        total_fulfilled = self.stats.get("fulfilled", 0)
-        in_heap = len(self.heap)
-        in_assigned = len(self.assigned)
-        live = in_heap + in_assigned
-        lost = total_created - (total_fulfilled + live)
-        if self.debug:
-            print(f"[OBLIGAUD] {now_us:7.2f} at={where:>18s} created={total_created} fulfilled={total_fulfilled} live={live} (heap={in_heap},assigned={in_assigned}) lost={lost}")
-        # highlight when lost changes
-        if lost != self._last_audit_lost and self.debug:
-            print(f"[OBLIGAUD] LOST_CHANGED from {self._last_audit_lost} -> {lost} at {where}")
-        self._last_audit_lost = lost
-        # write CSV row if enabled
-        if self.audit_file_path:
-            try:
-                if not self._audit_file_initialized:
-                    # best-effort header (should be set via set_audit_file)
-                    with open(self.audit_file_path, "w", newline="", encoding="utf-8") as f:
-                        w = csv.writer(f)
-                        w.writerow(["time_us","where","created","fulfilled","live","heap","assigned","lost"]) 
-                    self._audit_file_initialized = True
-                with open(self.audit_file_path, "a", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f)
-                    w.writerow([now_us, where, total_created, total_fulfilled, live, in_heap, in_assigned, lost])
-            except Exception:
-                pass
-
     def _rebuild_heap(self):
         items = self.heap
         self.heap = []
@@ -1559,8 +1511,6 @@ class ObligationManager:
         self.stats["requeued"] += 1
         if self.debug:
             print(f"[OBLIGDBG] requeue: id={ob.id} prev_deadline={prev:.2f} new_deadline={ob.deadline_us:.2f}")
-            self.audit(ob.deadline_us, "requeue")
-            self._log_inversion_check(ob, "requeue")
 
     def has_pending(self, source: Optional[str] = None) -> bool:
         if not self.heap:
@@ -1662,7 +1612,6 @@ class ObligationManager:
         self.stats["assigned"] += 1
         if self.debug:
             print(f"[OBLIGDBG] mark_assigned: id={ob.id} require={ob.require.name} deadline={ob.deadline_us:.2f} src={getattr(ob,'source',None)} heap_size={len(self.heap)} assigned={len(self.assigned)}")
-            self.audit(ob.deadline_us, "mark_assigned")
 
     def mark_fulfilled(self, ob: Obligation, now: float):
         self.assigned.pop(ob.id, None)
@@ -1673,7 +1622,6 @@ class ObligationManager:
             print(f"not_fulfilled: {ob.require.name} by {now:7.2f} us, deadline={ob.deadline_us:7.2f} us, target(d{ob.targets[0].die},p{ob.targets[0].plane})")
         if self.debug:
             print(f"[OBLIGDBG] mark_fulfilled: id={ob.id} at={now:.2f} heap_size={len(self.heap)} assigned={len(self.assigned)}")
-            self.audit(now, "mark_fulfilled")
 
     def expire_due(self, now: float):
         if not self.heap:
@@ -1689,10 +1637,8 @@ class ObligationManager:
             self.stats["extended_total"] += len(self.heap)
             if self.debug:
                 print(f"[OBLIGDBG] extend_all: delta={delta:.2f} heap_size={len(self.heap)} new_earliest={self.heap[0].deadline_us:.2f}")
-                self.audit(now, "expire_due")
                 # choose one representative ob to check ordering per kind
                 rep = self.heap[0].ob
-                self._log_inversion_check(rep, "expire_due")
 
 # --------------------------------------------------------------------------
 # Policy Engine (phase-conditional + admission gating + backoff + latch check)
@@ -1911,8 +1857,6 @@ class PolicyEngine:
                 self._reject(now_us, hook, stage, "soft_defer/feasible", ob.require.name, None, len(plane_set), plane_set, start_hint, None, "deadline_miss_after_recalc")
                 # push back to heap with small epsilon to avoid hot-loop
                 self.obl.requeue(ob)
-                # audit now to capture potential loss
-                self.obl.audit(now_us, "soft_defer/feasible")
                 ob = None
                 # fallthrough to phase-conditional
             else:
@@ -1922,23 +1866,18 @@ class PolicyEngine:
                 if not admission_ok:
                     self._reject(now_us, hook, stage, "soft_defer/admission", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "deadline_window")
                     self.obl.requeue(ob)
-                    self.obl.audit(now_us, "soft_defer/admission")
                 elif not self.addr.precheck_planescope(op.kind, op.targets, start_hint, scope):
                     self._reject(now_us, hook, stage, "soft_defer/precheck", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "addr/precheck")
                     self.obl.requeue(ob)
-                    self.obl.audit(now_us, "soft_defer/precheck")
                 elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
                     self._reject(now_us, hook, stage, "soft_defer/bus", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "bus_conflict")
                     self.obl.requeue(ob)
-                    self.obl.audit(now_us, "soft_defer/bus")
                 elif not self.latch.allowed(op, start_hint):
                     self._reject(now_us, hook, stage, "soft_defer/latch", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "read->dout plane latched")
                     self.obl.requeue(ob)
-                    self.obl.audit(now_us, "soft_defer/latch")
                 elif not self._exclusion_ok(op, start_hint):
                     self._reject(now_us, hook, stage, "soft_defer/excl", ob.require.name, None, len(plane_set), plane_set, start_hint, admission_delta, "exclusion_window")
                     self.obl.requeue(ob)
-                    self.obl.audit(now_us, "soft_defer/excl")
                 else:
                     # ACCEPT
                     self.rejlog.log_accept(stage)
@@ -2047,12 +1986,6 @@ class PolicyEngine:
                     self._reject(now_us, hook, stage, "plan_none", base, alias_used, fanout, None, earliest_start, None, "no_targets")
                 else:
                     targets, plane_set, scope=plan
-                    # debug
-                    try:
-                        if bool(self.cfg.get("debug", {}).get("log_block_sampling", False)):
-                            print(f"[BLKDBG.SCHED] pick base={base} alias={alias_used} die={die} planes={plane_set} scope={scope.name}")
-                    except Exception:
-                        pass
                     cfg_op=self.cfg["op_specs"][base]; op=build_operation(kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=pick
                     # record phase key used for aggregation at propose-time
