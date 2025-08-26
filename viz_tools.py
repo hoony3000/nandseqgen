@@ -52,7 +52,7 @@ class TimelineLogger:
     rows: List[Dict[str, Any]] = field(default_factory=list)
 
     def log_op(self, op, start_us: float, end_us: float, label_for_read: Optional[str] = None):
-        label = op.kind.name
+        label = op.base.name
         if label_for_read:
             label = label_for_read  # READ:MUL_/SIN_, PROGRAM/ERASE도 MUL_/SIN_ 반영
         for t in op.targets:
@@ -65,7 +65,7 @@ class TimelineLogger:
                 "block":    int(t.block),
                 "page":     int(page),
                 "op_name":     label,          # alias-aware (SIN_/MUL_ for multi/single)
-                "op_kind": op.kind.name,  # ERASE/PROGRAM/READ/DOUT/SR/...
+                "op_kind": op.base.name,  # ERASE/PROGRAM/READ/DOUT/SR/...
                 "source":   op.meta.get("source"),
                 "op_uid":   int(op.meta.get("uid", -1)),
                 "arity":    int(op.meta.get("arity", 1)),
