@@ -4,7 +4,7 @@
 # - Latch/DOUT 중 SR 예약 금지 케이스를 bus/excl에서 일관되게 차단
 
 from __future__ import annotations
-import heapq, random, sys, os
+import heapq, random, sys, os, time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Any, Optional, Tuple, Set
@@ -240,6 +240,7 @@ CFG = {
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.2}},
             ],
+            "ignore": ["admission", "reserve_planscope"],
         },
     },
 
@@ -1849,6 +1850,61 @@ class PolicyEngine:
                 return True
         return False
 
+    def _validate_candidate(self, now_us: float, hook: PhaseHook, stage: str, op: Operation,
+                            plane_set: List[int], start_hint: float,
+                            deadline: Optional[float] = None, ob: Optional["Obligation"] = None) -> bool:
+        ignore = set(self.cfg.get("op_specs", {}).get(op.name, {}).get("ignore", []))
+        attempted = op.base.name
+        alias_used = op.name if op.name != attempted else None
+        if deadline is not None and start_hint > deadline:
+            self._reject(now_us, hook, stage, "deadline", attempted, alias_used,
+                         len(plane_set), plane_set, start_hint, None, "deadline_miss")
+            if ob:
+                self.obl.requeue(ob)
+            return False
+        bypass = (stage == "obligation" and self.cfg.get("admission", {}).get("obligation_bypass", True))
+        if "admission" not in ignore and not bypass:
+            adm_delta = get_admission_delta(self.cfg, hook.label, attempted)
+            if not self._admission_ok(now_us, hook.label, attempted, start_hint, deadline):
+                self._reject(now_us, hook, stage, "admission", attempted, alias_used,
+                             len(plane_set), plane_set, start_hint, adm_delta, "near_future_gate")
+                if ob:
+                    self.obl.requeue(ob)
+                return False
+        else:
+            adm_delta = None
+        if "precheck" not in ignore:
+            scope = Scope[op.meta.get("scope", "PLANE_SET")]
+            if not self.addr.precheck_planescope(op.base, op.targets, start_hint, scope):
+                self._reject(now_us, hook, stage, "precheck", attempted, alias_used,
+                             len(plane_set), plane_set, start_hint, adm_delta, "addr/precheck")
+                if ob:
+                    self.obl.requeue(ob)
+                return False
+        if "bus_precheck" not in ignore:
+            if not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
+                self._reject(now_us, hook, stage, "bus", attempted, alias_used,
+                             len(plane_set), plane_set, start_hint, adm_delta, "bus_conflict")
+                if ob:
+                    self.obl.requeue(ob)
+                return False
+        if "latch" not in ignore:
+            if not self.latch.allowed(op, start_hint):
+                self._reject(now_us, hook, stage, "latch", attempted, alias_used,
+                             len(plane_set), plane_set, start_hint, adm_delta, "read->dout plane latched")
+                if ob:
+                    self.obl.requeue(ob)
+                return False
+        if "excl" not in ignore:
+            if not self._exclusion_ok(op, start_hint):
+                self._reject(now_us, hook, stage, "excl", attempted, alias_used,
+                             len(plane_set), plane_set, start_hint, adm_delta, "exclusion_window")
+                if ob:
+                    self.obl.requeue(ob)
+                return False
+        self.rejlog.log_accept(stage)
+        return True
+
     def propose(self, now_us: float, hook: PhaseHook, g: Dict[str,str], l: Dict[str,str], earliest_start: float) -> Optional[Operation]:
         die, hook_plane = hook.die, hook.plane
 
@@ -1868,42 +1924,13 @@ class PolicyEngine:
                 op.meta["source"] = ob.source
             if getattr(ob, "skip_dout_creation", False):
                 op.meta["skip_dout_creation"] = True
-            scope=Scope[op.meta["scope"]]; plane_set=op.meta["plane_list"]
+            plane_set=op.meta["plane_list"]
+            scope=Scope[op.meta["scope"]]
             start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
-
-            # feasibility after re-calculation: if miss, SOFT-DEFER (requeue), no drop
-            # expose current obligation for logging context (e.g., ob_id)
             self.current_obligation = ob
-            if start_hint > ob.deadline_us:
-                self._reject(now_us, hook, stage, "soft_defer/feasible", ob.require, None, len(plane_set), plane_set, start_hint, None, "deadline_miss_after_recalc")
-                # push back to heap with small epsilon to avoid hot-loop
-                self.obl.requeue(ob)
-                ob = None
-                # fallthrough to phase-conditional
-            else:
-                bypass = self.cfg.get("admission",{}).get("obligation_bypass",True)
-                admission_delta = (None if bypass else get_admission_delta(self.cfg, hook.label, ob.require))
-                admission_ok = True if bypass else self._admission_ok(now_us, hook.label, ob.require, start_hint, ob.deadline_us)
-                if not admission_ok:
-                    self._reject(now_us, hook, stage, "soft_defer/admission", ob.require, None, len(plane_set), plane_set, start_hint, admission_delta, "deadline_window")
-                    self.obl.requeue(ob)
-                elif not self.addr.precheck_planescope(op.base, op.targets, start_hint, scope):
-                    self._reject(now_us, hook, stage, "soft_defer/precheck", ob.require, None, len(plane_set), plane_set, start_hint, admission_delta, "addr/precheck")
-                    self.obl.requeue(ob)
-                elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
-                    self._reject(now_us, hook, stage, "soft_defer/bus", ob.require, None, len(plane_set), plane_set, start_hint, admission_delta, "bus_conflict")
-                    self.obl.requeue(ob)
-                elif not self.latch.allowed(op, start_hint):
-                    self._reject(now_us, hook, stage, "soft_defer/latch", ob.require, None, len(plane_set), plane_set, start_hint, admission_delta, "read->dout plane latched")
-                    self.obl.requeue(ob)
-                elif not self._exclusion_ok(op, start_hint):
-                    self._reject(now_us, hook, stage, "soft_defer/excl", ob.require, None, len(plane_set), plane_set, start_hint, admission_delta, "exclusion_window")
-                    self.obl.requeue(ob)
-                else:
-                    # ACCEPT
-                    self.rejlog.log_accept(stage)
-                    op.meta["phase_key_used"]="(obligation)"
-                    return op
+            if self._validate_candidate(now_us, hook, stage, op, plane_set, start_hint, deadline=ob.deadline_us, ob=ob):
+                op.meta["phase_key_used"]="(obligation)"
+                return op
 
         # 1) phase-conditional (optional; can be disabled via CFG)
         stage = "phase_conditional"
@@ -1990,35 +2017,17 @@ class PolicyEngine:
                     self._reject(now_us, hook, stage, "plan_none", base, alias_used, fanout, None, earliest_start, None, "no_targets")
                 else:
                     targets, plane_set, scope=plan
-                    cfg_op=self.cfg["op_specs"][pick]; op=build_operation(alias_used, kind, cfg_op, targets)
+                    cfg_op=self.cfg["op_specs"][pick]
+                    op=build_operation(alias_used, kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=alias_used
-                    # record phase key used for aggregation at propose-time
                     try:
                         op.meta["phase_key_used"] = str(used_key if used_key else used_label)
                         op.meta["state_key_at_schedule"] = str(st_key) if st_key else None
                     except Exception:
                         op.meta["phase_key_used"] = str(used_label)
-                    # earliest_start re-calc at candidate time for scope
                     start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
-                    # Step 1 reaffirm admission with exact start_hint
-                    adm_ok=self._admission_ok(now_us, hook.label, base, start_hint)
-                    adm_delta=get_admission_delta(self.cfg, hook.label, base)
-                    if not adm_ok:
-                        self._reject(now_us, hook, stage, "admission", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "near_future_gate")
-                    # Step 6: multi-plane screening with priority and ordered checks
-                    elif not self.latch.allowed(op, start_hint):
-                        self._reject(now_us, hook, stage, "latch", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "read->dout plane latched")
-                    elif (
-                        # scope-aware exclusion check using compiled rules against exact start/end
-                        self._excl_blocks_candidate(die, plane_set, start_hint, quantize(start_hint + get_op_duration(op)), base, self._alias_label_for(base, len(plane_set)))
-                    ):
-                        self._reject(now_us, hook, stage, "excl", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "exclusion_window")
-                    elif not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
-                        self._reject(now_us, hook, stage, "bus", base, alias_used, len(plane_set), plane_set, start_hint, adm_delta, "bus_conflict")
-                    else:
-                        # ACCEPT
-                        self.rejlog.log_accept(stage)
-                        op.meta["source"]="policy.phase_conditional"; op.meta["phase_key_used"]=used_key
+                    if self._validate_candidate(now_us, hook, stage, op, plane_set, start_hint):
+                        op.meta["source"]="policy.phase_conditional"
                         return op
 
         # backoff 단계 제거됨 (충돌 정합성 해소 계획에 따라 비활성화)
@@ -2182,6 +2191,7 @@ class Scheduler:
         self.cfg=cfg; self.addr=addr; self.SPE=spe; self.obl=obl; self.excl=excl
         self.now=0.0; self.ev=[]; self._seq=0
         self.stat_propose_calls=0; self.stat_scheduled=0
+        self._propose_time_total=0.0
         self.logger = logger or TimelineLogger()
         self.latch = latch or LatchManager()
         # state timeline
@@ -2233,20 +2243,24 @@ class Scheduler:
         # -----------------------------------------------
 
         # reserve plane scope + bus + register exclusions + future update
-        self.addr.reserve_planescope(op, start, end)
-        self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
-        self.excl.register(op, start)
-        self.addr.register_future(op, start, end)
+        ignore = set(self.cfg.get("op_specs", {}).get(op.name, {}).get("ignore", []))
+        if "reserve_planscope" not in ignore:
+            self.addr.reserve_planescope(op, start, end)
+        if "bus_reserve" not in ignore:
+            self.addr.bus_reserve(start, self.addr.bus_segments_for_op(op))
+        if "register_exclusion" not in ignore:
+            self.excl.register(op, start)
+        if "register_future" not in ignore:
+            self.addr.register_future(op, start, end)
         # state timeline register per target
         affects = self.cfg.get("state_timeline", {}).get("affects", {})
-        affect_op = bool(affects.get(op.base.name, True))
+        affect_op = bool(affects.get(op.base.name, True)) and ("state_timeline" not in ignore)
         if affect_op:
-            # build states as (name, dur) list
             st_list = [(s.name, float(s.dur_us)) for s in op.states]
             for t in op.targets:
                 self.state_timeline.reserve_op(t.die, t.plane, op.name, op.base.name, st_list, start, True)
         # latch: if READ, plan lock from READ.end_us until DOUT ends
-        if op.base == OpKind.READ:
+        if op.base == OpKind.READ and "latch_plan_lock" not in ignore:
             self.latch.plan_lock_after_read(op.targets, end)
 
         # assign deterministic op uid (per scheduled op)
@@ -2364,7 +2378,9 @@ class Scheduler:
                     if self._bootstrap_started and self._bootstrap_end_time is None:
                         self._bootstrap_end_time=self.now
                 self.stat_propose_calls+=1
+                _ts = time.perf_counter()
                 op=self.SPE.propose(self.now, hook, g, l, earliest_start)
+                self._propose_time_total += time.perf_counter() - _ts
                 if op: self._schedule_operation(op)
 
             elif typ=="OP_START":
@@ -2390,6 +2406,9 @@ class Scheduler:
         print(f"scheduled ops : {self.stat_scheduled}")
         if self.stat_propose_calls:
             print(f"accept ratio  : {100.0*self.stat_scheduled/self.stat_propose_calls:.1f}%")
+            print(f"reject ratio  : {100.0*(self.stat_propose_calls - self.stat_scheduled)/self.stat_propose_calls:.1f}%")
+            avg = (self._propose_time_total/self.stat_propose_calls)*1000.0
+            print(f"avg propose ms: {avg:.3f}")
         s=self.obl.stats
         rate=(100.0*s["fulfilled_in_time"]/s["created"]) if s["created"] else 0.0
         print(f"obligations   : created={s['created']} assigned={s['assigned']} fulfilled={s['fulfilled']} in_time={s['fulfilled_in_time']} expired={s['expired']} success={rate:.1f}%")
