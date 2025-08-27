@@ -348,14 +348,7 @@ CFG["pattern_export"] = {
     "file_prefix": "pattern",
     "columns": ["seq","time","op_id","op_name","payload"],
     "time": {"from": "start_us", "scale": 1.0, "round_decimals": 0, "out_col": "time"},
-    "opcode_map": {
-        "NOP": 0,
-        "SIN_ERASE": 1, "MUL_ERASE": 2,
-        "SIN_PROGRAM": 3, "MUL_PROGRAM": 4,
-        "SIN_READ": 5, "MUL_READ": 6,
-        "SR": 7,
-        "DOUT": 8
-    },
+    "opcode_map": {},
     "aliasing": {"apply_to": ["READ","PROGRAM","ERASE"], "mul_threshold": 2},
     "nop": {
         "enable": True,
@@ -406,12 +399,45 @@ for op_name, spec in CFG.get("op_specs", {}).items():
 
 # --------------------------------------------------------------------------
 # Models
-class OpKind(Enum):
-    READ=auto();
-    PROGRAM=auto();
-    ERASE=auto();
-    DOUT=auto();
-    SR=auto();
+# Build OpKind dynamically from CFG.op_specs[*].base
+def _build_opkind_from_cfg(cfg: Dict[str, Any]) -> Enum:
+    bases: List[str] = []
+    for op_name, spec in cfg.get("op_specs", {}).items():
+        base = str(spec.get("base", op_name))
+        if base not in bases:
+            bases.append(base)
+    # deterministic ordering
+    bases = sorted(bases)
+    return Enum("OpKind", bases)  # values = 1..N, names = base strings
+
+OpKind = _build_opkind_from_cfg(CFG)
+
+# Build opcode_map dynamically using OpKind and aliasing rules
+def _build_opcode_map_from_opkind(cfg: Dict[str, Any], opkind: Enum) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    next_code = 0
+    # NOP first
+    nop_name = str(cfg.get("pattern_export", {}).get("nop", {}).get("op_name",
+                    cfg.get("export", {}).get("nop_symbol", "NOP")))
+    mapping[nop_name] = next_code; next_code += 1
+    # aliasing targets
+    alias_apply = set(cfg.get("pattern_export", {}).get("aliasing", {}).get("apply_to", []))
+    # deterministic order by base name
+    base_names = sorted([name for name in opkind.__members__.keys()])
+    for base in base_names:
+        if base in alias_apply:
+            for prefix in ("SIN_", "MUL_"):
+                key = f"{prefix}{base}"
+                if key not in mapping:
+                    mapping[key] = next_code; next_code += 1
+        else:
+            key = base
+            if key not in mapping:
+                mapping[key] = next_code; next_code += 1
+    return mapping
+
+# apply dynamic opcode map
+CFG["pattern_export"]["opcode_map"] = _build_opcode_map_from_opkind(CFG, OpKind)
 
 class Scope(Enum):
     NONE=0; PLANE_SET=1; DIE_WIDE=2
