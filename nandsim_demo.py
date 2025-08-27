@@ -97,7 +97,7 @@ def _validate_phase_conditional_cfg(cfg):
 CFG = {
     "rng_seed": 12345,
     "policy": {
-        "queue_refill_period_us": 5.0,
+        "queue_refill_period_us": 50.0,
         "run_until_us": 2000.0,
         "planner_max_tries": 8,
         "hookscreen": {"startplane_scan": 2, "horizon_us": 0.30, "global_obl_iters": 1},
@@ -240,7 +240,7 @@ CFG = {
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed",  "value": 0.2}},
             ],
-            "ignore": ["admission", "reserve_planscope"],
+            "ignore": ["admission", "reserve_planscope", "precheck"],
         },
     },
 
@@ -813,17 +813,22 @@ class AddressManager:
 
     # ---- bus segments & gating ----
     def bus_segments_for_op(self, op: Operation)->List[Tuple[float,float]]:
+        if op.name == "SR" and op.states[0].name == "ISSUE":
+            print(f"op: {op.name} state: {op.states[0].name} bus: {op.states[0].bus} dur_us: {op.states[0].dur_us}")
         segs=[]; t=0.0
         for s in op.states:
             if s.bus: segs.append((t, t+s.dur_us))
             t+=s.dur_us
         return segs
 
-    def bus_precheck(self, start_hint: float, segs: List[Tuple[float,float]])->bool:
+    def bus_precheck(self, op: Operation, start_hint: float, segs: List[Tuple[float,float]])->bool:
         for (off0,off1) in segs:
             a0, a1 = quantize(start_hint+off0), quantize(start_hint+off1)
             for (s,e) in self.bus_resv:
-                if not (a1<=s or e<=a0): return False
+                if not (a1<=s or e<=a0):
+                    if op.name == "SR" and op.states[0].name == "ISSUE":
+                        print(f"bus_precheck: op: {op.name} state: {op.states[0].name} bus: {op.states[0].bus} dur_us: {op.states[0].dur_us} start_hint: {start_hint} off0: {off0} off1: {off1} segs: {segs} a0: {a0} a1: {a1} s: {s} e: {e}")
+                    return False
         return True
 
     def bus_reserve(self, start_time: float, segs: List[Tuple[float,float]]):
@@ -1882,7 +1887,7 @@ class PolicyEngine:
                     self.obl.requeue(ob)
                 return False
         if "bus_precheck" not in ignore:
-            if not self.addr.bus_precheck(start_hint, self.addr.bus_segments_for_op(op)):
+            if not self.addr.bus_precheck(op, start_hint, self.addr.bus_segments_for_op(op)):
                 self._reject(now_us, hook, stage, "bus", attempted, alias_used,
                              len(plane_set), plane_set, start_hint, adm_delta, "bus_conflict")
                 if ob:
@@ -1926,11 +1931,15 @@ class PolicyEngine:
                 op.meta["skip_dout_creation"] = True
             plane_set=op.meta["plane_list"]
             scope=Scope[op.meta["scope"]]
-            start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+            affects = self.cfg.get("state_timeline", {}).get("affects", {})
+            if op.base.name in affects:
+                start_hint=quantize(earliest_start)
+            else:
+                start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
             self.current_obligation = ob
             if self._validate_candidate(now_us, hook, stage, op, plane_set, start_hint, deadline=ob.deadline_us, ob=ob):
                 op.meta["phase_key_used"]="(obligation)"
-                return op
+                return op, start_hint
 
         # 1) phase-conditional (optional; can be disabled via CFG)
         stage = "phase_conditional"
@@ -1938,11 +1947,11 @@ class PolicyEngine:
         # disable knob
         if not self.cfg.get("policy", {}).get("enable_phase_conditional", True):
             self._reject(now_us, hook, stage, "disabled", None, None, None, None, earliest_start, None, "disabled_by_cfg")
-            return None
+            return None, None
         # guard: while bootstrap obligations exist anywhere, skip policy proposals
         if self.obl.has_pending(source="bootstrap"):
             self._reject(now_us, hook, stage, "guard_bootstrap_pending", None, None, None, None, earliest_start, None, "bootstrap_pending_skip")
-            return None
+            return None, None
 
         # # Step 1: admission screen (target-level) - available_at <= now + default_delta
         # adm_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
@@ -1964,7 +1973,7 @@ class PolicyEngine:
             cand = {op_name: w for op_name, w in dist.items() if op_name in allow and float(w) > 0.0}
             if not cand:
                 self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "all_zero_weight")
-                return None
+                return None, None
             # DIE_WIDE op screen with state_timeline (operation screen)
             filtered = {}
             for op_name, w in cand.items():
@@ -1990,7 +1999,7 @@ class PolicyEngine:
                 filtered[op_name] = w
             if not filtered:
                 self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "allow_filtered_empty")
-                return None
+                return None, None
             pick=roulette_pick(filtered, set(filtered.keys()))
             if not pick:
                 self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "roulette_zero_weight")
@@ -2025,13 +2034,17 @@ class PolicyEngine:
                         op.meta["state_key_at_schedule"] = str(st_key) if st_key else None
                     except Exception:
                         op.meta["phase_key_used"] = str(used_label)
-                    start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+                    affects = self.cfg.get("state_timeline", {}).get("affects", {})
+                    if op.base.name in affects:
+                        start_hint=quantize(earliest_start)
+                    else:
+                        start_hint=self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
                     if self._validate_candidate(now_us, hook, stage, op, plane_set, start_hint):
                         op.meta["source"]="policy.phase_conditional"
-                        return op
+                        return op, start_hint
 
         # backoff 단계 제거됨 (충돌 정합성 해소 계획에 따라 비활성화)
-        return None
+        return None, None
 
 # --------------------------------------------------------------------------
 # Selection overrides
@@ -2226,12 +2239,13 @@ class Scheduler:
             return "MUL_ERASE" if arity>1 else "SIN_ERASE"
         return op.base.name
 
-    def _schedule_operation(self, op: Operation):
-        start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
+    def _schedule_operation(self, op: Operation, start_hint: float):
+        # start=self._start_time_for_op(op); dur=get_op_duration(op); end=quantize(start+dur)
+        start=quantize(start_hint); dur=get_op_duration(op); end=quantize(start+dur)
 
         # ---- fail-safe: schedule 직전 마지막 충돌 점검 ----
         segs = self.addr.bus_segments_for_op(op)
-        if not self.addr.bus_precheck(start, segs):
+        if not self.addr.bus_precheck(op, start, segs):
             print(f"[WARN] BUS conflict at schedule-time: {op.base.name} start={start:.2f} end={end:.2f}")
             return
         if not self.latch.allowed(op, start):
@@ -2336,9 +2350,10 @@ class Scheduler:
                     cur=start
                     for s in op.states:
                         if s.name !="ISSUE":
-                            eps = random.random()*s.dur_us*0.2
-                            self._push(cur + s.dur_us - eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.name}.{s.name}.MID",   t.die, t.plane))
-                            self._push(cur + s.dur_us + eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.name}.{s.name}.END",   t.die, t.plane))
+                            eps_s = random.random()*s.dur_us*0.2
+                            eps_e = random.random()*s.dur_us*0.2
+                            self._push(cur + s.dur_us - eps_s,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.name}.{s.name}.MID",   t.die, t.plane))
+                            self._push(cur + s.dur_us + eps_e,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.name}.{s.name}.END",   t.die, t.plane))
                         cur += s.dur_us
 
         first=op.targets[0]
@@ -2367,7 +2382,8 @@ class Scheduler:
             elif typ=="PHASE_HOOK":
                 hook: PhaseHook = payload
                 # 의무 선택의 타당성 판단을 위해 now를 고려
-                earliest_start = max(self.now, self.addr.available_at(hook.die, hook.plane))
+                # earliest_start = max(self.now, self.addr.available_at(hook.die, hook.plane))
+                earliest_start = self.now
                 g,l=self.addr.observe_states(hook.die, hook.plane, self.now)
                 # bootstrap watchdog: first time pending detected / drain completion
                 if self.obl.has_pending("bootstrap"):
@@ -2379,9 +2395,9 @@ class Scheduler:
                         self._bootstrap_end_time=self.now
                 self.stat_propose_calls+=1
                 _ts = time.perf_counter()
-                op=self.SPE.propose(self.now, hook, g, l, earliest_start)
+                op, start_hint=self.SPE.propose(self.now, hook, g, l, earliest_start)
                 self._propose_time_total += time.perf_counter() - _ts
-                if op: self._schedule_operation(op)
+                if op: self._schedule_operation(op, start_hint)
 
             elif typ=="OP_START":
                 op: Operation=payload; first=op.targets[0]
