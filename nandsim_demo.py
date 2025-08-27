@@ -1351,7 +1351,7 @@ class StateTimeline:
         """
         Materialize state timeline to a pandas DataFrame for visualization/export.
         - Includes END segments if they have a finite end (infinite tail segments are skipped)
-        - Columns: start_us, end_us, die, plane, op_name(OP.STATE), lane("die/plane"), op, state, dur_us
+        - Columns: start_us, end_us, die, plane, op_state(OP.STATE), lane("die/plane"), op_name(OP), state, dur_us
         """
         rows = []
         for (die, plane), lst in self.by_plane.items():
@@ -1370,9 +1370,9 @@ class StateTimeline:
                     "end_us": float(seg.end_us),
                     "die": int(die),
                     "plane": int(plane),
-                    "op_name": f"{seg.op_base}.{seg.state}",
+                    "op_state": f"{seg.op_base}.{seg.state}",
                     "lane": f"{die}/{plane}",
-                    "op": seg.op_base,
+                    "op_name": seg.op_name,
                     "state": seg.state,
                 })
         try:
