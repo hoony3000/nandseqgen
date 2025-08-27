@@ -123,6 +123,7 @@ CFG = {
     "admission": {
         "default_delta_us": 0.30,
         "op_overrides": {
+            # op_base
             "SR": 0.30
         },
         "obligation_bypass": True  # obligations ignore admission delta by default
@@ -130,6 +131,7 @@ CFG = {
 
     # Phase-conditional proposal (alias keys allowed)
     "state_timeline": {
+        # affects: op_base
         "affects": {"READ": True, "PROGRAM": True, "ERASE": True, "DOUT": True, "SR": False}
     },
     "phase_conditional": {
@@ -160,7 +162,7 @@ CFG = {
     "op_specs": {
         "SIN_READ": {
             "base": "READ",
-            "fanout": 1,
+            "fanout": ("eq",1),
             "scope": "PLANE_SET",
             "page_equal_required": True,
             "states": [
@@ -171,8 +173,9 @@ CFG = {
         },
         "MUL_READ": {
             "base": "READ",
-            "fanout": 1,
+            "fanout": ("ge",2),
             "scope": "PLANE_SET",
+            # require same page across planes
             "page_equal_required": True,
             "states": [
                 {"name": "ISSUE",     "bus": True,  "dist": {"kind": "fixed", "value": 0.4}},
@@ -182,7 +185,7 @@ CFG = {
         },
         "SIN_PROGRAM": {
             "base": "PROGRAM",
-            "fanout": 2,
+            "fanout": ("eq",1),
             "scope": "DIE_WIDE",
             "page_equal_required": True,
             "states": [
@@ -192,7 +195,7 @@ CFG = {
         },
         "MUL_PROGRAM": {
             "base": "PROGRAM",
-            "fanout": 2,
+            "fanout": ("ge",2),
             "scope": "DIE_WIDE",
             "page_equal_required": True,
             "states": [
@@ -202,7 +205,7 @@ CFG = {
         },
         "SIN_ERASE": {
             "base": "ERASE",
-            "fanout": 2,
+            "fanout": ("eq",1),
             "scope": "DIE_WIDE",
             "page_equal_required": False,
             "states": [
@@ -212,7 +215,7 @@ CFG = {
         },
         "MUL_ERASE": {
             "base": "ERASE",
-            "fanout": 2,
+            "fanout": ("ge",2),
             "scope": "DIE_WIDE",
             "page_equal_required": False,
             "states": [
@@ -222,7 +225,7 @@ CFG = {
         },
         "DOUT": {
             "base": "DOUT",
-            "fanout": 1,
+            "fanout": ("eq",1),
             "scope": "NONE",
             "page_equal_required": False,
             "states": [
@@ -231,7 +234,7 @@ CFG = {
         },
         "SR": {
             "base": "SR",
-            "fanout": 1,
+            "fanout": ("eq",1),
             "scope": "NONE",
             "page_equal_required": False,
             "states": [
@@ -244,6 +247,7 @@ CFG = {
     "constraints": {
         "exclusions": [
             # PROGRAM/ERASE: during CORE_BUSY block READ/PROGRAM/ERASE on the die; allow SR
+            # op: op_base
             {"when": {"op": "PROGRAM", "states": ["CORE_BUSY"]}, "scope": "DIE",
              "blocks": ["BASE:READ", "BASE:PROGRAM", "BASE:ERASE"]},
             {"when": {"op": "ERASE",   "states": ["CORE_BUSY"]}, "scope": "DIE",
@@ -267,19 +271,24 @@ CFG = {
     # Obligation: READ → DOUT
     "obligations": [
         {
-            "issuer": "SIN_READ",
+            # issuer: op_base / require: op_name
+            "issuer": "READ",
             "require": "DOUT",
-            # "window_us": {"kind": "normal", "mean": 6.0, "std": 1.5, "min": 3.0},
             "window_us": {"kind": "fixed", "value": 20.0},
             "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True, "plane_stagger_us": 0.2},
         },
         {
-            "issuer": "MUL_READ",
-            "require": "DOUT",
-            # "window_us": {"kind": "normal", "mean": 6.0, "std": 1.5, "min": 3.0},
-            "window_us": {"kind": "fixed", "value": 20.0},
+            "issuer": "PROGRAM",
+            "require": "SR",
+            "window_us": {"kind": "fixed", "value": 2.0},
             "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True, "plane_stagger_us": 0.2},
-        }
+        },
+        {
+            "issuer": "ERASE",
+            "require": "SR",
+            "window_us": {"kind": "fixed", "value": 2.0},
+            "priority_boost": {"start_us_before_deadline": 2.5, "boost_factor": 2.0, "hard_slot": True, "plane_stagger_us": 0.2},
+        },
     ],
 
     # Topology (redefined): plane = block % planes
@@ -381,17 +390,9 @@ CFG["pattern_export"] = {
 
 # --------------------------------------------------------------------------
 # Alias mapping for policy/external naming
-OP_ALIAS = {
-    "SIN_READ":    {"base": "READ",    "fanout": ("eq", 1)},
-    "MUL_READ":    {"base": "READ",    "fanout": ("ge", 2)},
-    "SIN_PROGRAM": {"base": "PROGRAM", "fanout": ("eq", 1)},
-    "MUL_PROGRAM": {"base": "PROGRAM", "fanout": ("ge", 2)},
-    "SIN_ERASE":   {"base": "ERASE",   "fanout": ("eq", 1)},
-    "MUL_ERASE":   {"base": "ERASE",   "fanout": ("ge", 2)},
-}
-# OP_ALIAS = {}
-# for op, spec in CFG.get("op_specs", {}).items():
-#     OP_ALIAS[op] = {"base": spec.get("base", op), "fanout": spec.get("fanout", 1)}
+OP_ALIAS = {}
+for op, spec in CFG.get("op_specs", {}).items():
+    OP_ALIAS[op] = {"base": spec.get("base", op), "fanout": spec.get("fanout", ("eq",1))}
 
 MAPPING_OP_BASE = {}
 CANDIDATES_OP_BASE = {}
@@ -649,18 +650,10 @@ def get_phase_dist(cfg: Dict[str,Any], hook_label: str):
     base, state, _ = parse_hook_key(hook_label)
     pc = cfg.get("phase_conditional", {})
     keys=[]
-    print(f"base: {base}, state: {state}, hook_label: {hook_label}")
     # POS granularity removed by plan; only OP.STATE and DEFAULT are considered
     # Expand keys to try alias/base variants to support configs written with ALIAS or BASE.
     if base and state:
-        # 1) as-is
         keys.append(f"{base}.{state}")
-        # 2) alias candidates from base (e.g., READ -> SIN_READ/MUL_READ)
-        # for _ali in MAPPING_OP_BASE.get(base, []):
-        #     k=f"{_ali}.{state}"
-        #     if k not in keys:
-        #         keys.append(k)
-    print(f"keys: {keys}")
     keys.append("DEFAULT")
     for key in keys:
         dist = pc.get(key)
@@ -683,10 +676,10 @@ def _op_alias_candidates(kind: str) -> List[str]:
 def _op_base_from_alias(op: str) -> Optional[str]:
     return MAPPING_OP_BASE.get(op, None)
 
-def get_admission_delta(cfg: Dict[str,Any], hook_label: str, op_kind_name: str) -> float:
+def get_admission_delta(cfg: Dict[str,Any], hook_label: str, op_base: str) -> float:
     adm = cfg.get("admission", {})
-    if op_kind_name in adm.get("op_overrides", {}):
-        return float(adm["op_overrides"][op_kind_name])
+    if op_base in adm.get("op_overrides", {}):
+        return float(adm["op_overrides"][op_base])
     return float(adm.get("default_delta_us", 0.3))
 
 # --------------------------------------------------------------------------
@@ -700,7 +693,7 @@ def build_operation(name:str, kind: OpKind, cfg_op: Dict[str, Any], targets: Lis
 def get_op_duration(op: Operation) -> float:
     return sum(seg.dur_us for seg in op.states)
 
-def get_kind_nominal_duration(cfg: Dict[str,Any], op_name: str) -> float:
+def get_nominal_duration(cfg: Dict[str,Any], op_name: str) -> float:
     """Sum of nominal state durations for an op kind from cfg.op_specs (assumes fixed)."""
     spec = cfg.get("op_specs", {}).get(op_name, {})
     total = 0.0
@@ -876,7 +869,7 @@ class AddressManager:
                 if key not in out: out.append(key)
         return [list(ps) for ps in dict.fromkeys(out)]
 
-    def plan_multipane(self, kind: OpKind, die:int, start_plane:int, desired_fanout:int, interleave:bool)\
+    def plan_multiplane(self, kind: OpKind, die:int, start_plane:int, desired_fanout:int, interleave:bool)\
             -> Optional[Tuple[List[Address], List[int], Scope]]:
         if desired_fanout<1: desired_fanout=1
         tries=self.cfg["policy"]["planner_max_tries"]
@@ -1162,6 +1155,7 @@ class ExclusionManager:
         rules = self.cfg.get("constraints",{}).get("exclusions",[])
         die = op.targets[0].die
         for r in rules:
+            # if_op: op_base
             when=r["when"]; if_op=when.get("op")
             if if_op != op.base.name:
                 if not (op.base==OpKind.READ and if_op=="READ"):
@@ -1236,7 +1230,8 @@ class LatchManager:
 class StateInterval:
     die: int
     plane: int
-    op: str
+    op_name: str
+    op_base: str
     state: str
     start_us: float
     end_us: float
@@ -1289,7 +1284,7 @@ class StateTimeline:
         lst.insert(i, seg)
         starts.insert(i, seg.start_us)
 
-    def reserve_op(self, die: int, plane: int, op_name: str, states: List[Tuple[str, float]], start_us: float, affect: bool):
+    def reserve_op(self, die: int, plane: int, op_name: str, op_base: str, states: List[Tuple[str, float]], start_us: float, affect: bool):
         if not affect:
             return
         import math as _math
@@ -1302,13 +1297,13 @@ class StateTimeline:
         # insert concrete states
         t = start_us
         for st_name, dur in states:
-            seg = StateInterval(die, plane, op_name, st_name, t, t + float(dur))
+            seg = StateInterval(die, plane, op_name, op_base, st_name, t, t + float(dur))
             self._insert_plane(key, seg)
             self._insert_die(die, seg)
             self._insert_global(seg)
             t += float(dur)
         # insert new END
-        end_seg = StateInterval(die, plane, op_name, "END", t, _math.inf)
+        end_seg = StateInterval(die, plane, op_name, op_base, "END", t, _math.inf)
         self._insert_plane(key, end_seg)
         self.last_end_idx[key] = lst.index(end_seg)
 
@@ -1326,7 +1321,7 @@ class StateTimeline:
         if 0 <= i < len(lst):
             s = lst[i]
             if s.start_us <= t < s.end_us:
-                return f"{s.op}.{s.state}"
+                return f"{s.op_base}.{s.state}"
         return None
 
     def overlaps(self, die: int, plane: int, start: float, end: float, pred=None) -> bool:
@@ -1374,9 +1369,9 @@ class StateTimeline:
                     "end_us": float(seg.end_us),
                     "die": int(die),
                     "plane": int(plane),
-                    "op_name": f"{seg.op}.{seg.state}",
+                    "op_name": f"{seg.op_base}.{seg.state}",
                     "lane": f"{die}/{plane}",
-                    "op": seg.op,
+                    "op": seg.op_base,
                     "state": seg.state,
                 })
         try:
@@ -1560,7 +1555,7 @@ class ObligationManager:
     def on_commit(self, op: Operation, now_us: float):
         # READ completion -> create DOUT obligation(s)
         for spec in self.specs:
-            if spec["issuer"] == op.name:
+            if spec["issuer"] == op.base.name:
                 # Bootstrap 체인으로 미리 생성된 DOUT과 중복 생성 방지 가드
                 if op.meta.get("source") == "bootstrap" or op.meta.get("skip_dout_creation"):
                     continue
@@ -1572,7 +1567,7 @@ class ObligationManager:
                 # optional: amplify stagger by DOUT duration multiplier N
                 n_mult = float(spec.get("priority_boost", {}).get("plane_stagger_by_dout_n", 0.0))
                 if n_mult and n_mult > 0.0:
-                    dout_dur = get_kind_nominal_duration(self.cfg_root, "DOUT") if hasattr(self, "cfg_root") else 0.0
+                    dout_dur = get_nominal_duration(self.cfg_root, "DOUT") if hasattr(self, "cfg_root") else 0.0
                     plane_stagger = max(plane_stagger, n_mult * dout_dur)
 
                 # 멀티플레인 READ의 경우 plane 순서대로 DOUT을 분산 생성
@@ -1716,8 +1711,8 @@ class PolicyEngine:
         # compile exclusion rules for data-driven predicates
         self._excl_rules = self._compile_exclusion_rules()
 
-    def _fanout_from_alias(self, base_name: str, alias_constraint: Optional[Tuple[str,int]], hook_label: str)->Tuple[int,bool]:
-        fanout, interleave = get_phase_selection_override(self.cfg, hook_label, base_name)
+    def _fanout_from_alias(self, op_base: str, alias_constraint: Optional[Tuple[str,int]], hook_label: str)->Tuple[int,bool]:
+        fanout, interleave = get_phase_selection_override(self.cfg, hook_label, op_base)
         if alias_constraint:
             mode,val=alias_constraint
             if mode=="eq": fanout=val
@@ -1729,9 +1724,9 @@ class PolicyEngine:
         end = quantize(start_hint + dur)
         return self.excl.allowed(op, start_hint, end)
 
-    def _admission_ok(self, now_us: float, hook_label: str, kind_name: str, start_hint: float, deadline: Optional[float]=None) -> bool:
+    def _admission_ok(self, now_us: float, hook_label: str, op_base: str, start_hint: float, deadline: Optional[float]=None) -> bool:
         adm = self.cfg.get("admission", {})
-        delta = get_admission_delta(self.cfg, hook_label, kind_name)
+        delta = get_admission_delta(self.cfg, hook_label, op_base)
         if deadline is not None:  # for obligations if bypass disabled
             delta = min(delta, max(0.0, deadline - now_us))
         return start_hint <= now_us + delta
@@ -1787,7 +1782,7 @@ class PolicyEngine:
         base_name = op.base.name
         alias_label = self._alias_label_for(base_name, int(op.meta.get("arity", 1)) if hasattr(op, "meta") else 1)
         for wop, states, tokens, _scope in self._excl_rules:
-            if wop and str(seg.op).upper() != wop:
+            if wop and str(seg.op_base).upper() != wop:
                 continue
             if ("*" not in states) and (str(seg.state) not in states):
                 continue
@@ -1802,7 +1797,7 @@ class PolicyEngine:
         if getattr(seg, "state", None) == "END":
             return False
         try:
-            spec = self.cfg.get("op_specs", {}).get(str(seg.op), {})
+            spec = self.cfg.get("op_specs", {}).get(str(seg.op_base), {})
             for st in spec.get("states", []):
                 if str(st.get("name")) == str(seg.state):
                     return bool(st.get("bus", False))
@@ -1832,7 +1827,7 @@ class PolicyEngine:
                     return True
             return False
 
-    def _excl_blocks_candidate(self, die: int, plane_set: List[int], t0: float, t1: float, base_name: str, alias_label: Optional[str]) -> bool:
+    def _excl_blocks_candidate(self, die: int, plane_set: List[int], t0: float, t1: float, base_name: str, op_name: Optional[str]) -> bool:
         # iterate compiled rules and test overlaps in their scopes
         if not self._excl_rules:
             return False
@@ -1841,13 +1836,13 @@ class PolicyEngine:
             def _pred(seg: "StateInterval"):
                 if getattr(seg, "state", None) == "END":
                     return False
-                if wop and str(seg.op).upper() != wop:
+                if wop and str(seg.op_base).upper() != wop:
                     return False
                 if ("*" not in states) and (str(seg.state) not in states):
                     return False
                 # check if rule tokens would block the candidate
                 for tok in tokens:
-                    if self._token_blocks_labels(tok, base_name, alias_label):
+                    if self._token_blocks_labels(tok, base_name, op_name):
                         return True
                 return False
             if self._overlaps_scope(die, plane_set, t0, t1, pred=_pred, scope=scope):
@@ -1913,11 +1908,6 @@ class PolicyEngine:
         # 1) phase-conditional (optional; can be disabled via CFG)
         stage = "phase_conditional"
         self.rejlog.log_attempt(stage)
-        # Step 1: admission screen (target-level) - available_at <= now + default_delta
-        default_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
-        if self.addr.available_at(die, hook_plane) > now_us + default_delta:
-            self._reject(now_us, hook, stage, "admission_target", None, None, None, None, earliest_start, default_delta, "target_busy")
-            return None
         # disable knob
         if not self.cfg.get("policy", {}).get("enable_phase_conditional", True):
             self._reject(now_us, hook, stage, "disabled", None, None, None, None, earliest_start, None, "disabled_by_cfg")
@@ -1926,6 +1916,12 @@ class PolicyEngine:
         if self.obl.has_pending(source="bootstrap"):
             self._reject(now_us, hook, stage, "guard_bootstrap_pending", None, None, None, None, earliest_start, None, "bootstrap_pending_skip")
             return None
+
+        # # Step 1: admission screen (target-level) - available_at <= now + default_delta
+        # adm_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
+        # if self.addr.available_at(die, hook_plane) > now_us + adm_delta:
+        #     self._reject(now_us, hook, stage, "admission_target", None, None, None, None, earliest_start, adm_delta, "target_busy")
+        #     return None
         allow=set(list(OP_ALIAS.keys()))
         # derive state key from state_timeline at reference time (earliest_start)
         st_key = None
@@ -1933,7 +1929,6 @@ class PolicyEngine:
             st_key = self.state_timeline.state_at(hook.die, hook.plane, earliest_start)  # e.g., "READ.CORE_BUSY" or "READ.END"
         used_label = st_key if st_key else hook.label
         dist, used_key = get_phase_dist(self.cfg, used_label)
-        print(f"used_label: {used_label}, st_key: {st_key}")
         if not dist:
             self._reject(now_us, hook, stage, "none_available", None, None, None, None, earliest_start, None, "no_dist_for_hook")
         else:
@@ -1949,13 +1944,12 @@ class PolicyEngine:
                 base, _cons = self._resolve_op_name(op_name)
                 # exclude/bus op-level quick screen on hook plane interval
                 try:
-                    dur_nom = get_kind_nominal_duration(self.cfg, op_name)
+                    dur_nom = get_nominal_duration(self.cfg, op_name)
                 except Exception:
                     dur_nom = 0.0
                 t0 = earliest_start; t1 = quantize(earliest_start + dur_nom)
                 # exclusion op-level filter (scope-aware)
-                alias_label = self._alias_label_for(base, 1)
-                if self._excl_blocks_candidate(die, [hook_plane], t0, t1, base, alias_label):
+                if self._excl_blocks_candidate(die, [hook_plane], t0, t1, base, op_name):
                     continue
                 # bus op-level prescreen on hook plane
                 if self.state_timeline is not None and dur_nom > 0.0:
@@ -1976,28 +1970,20 @@ class PolicyEngine:
             else:
                 base, alias_const = self._resolve_op_name(pick)
                 kind=OpKind[base]
-                if kind==OpKind.SR:
-                    plan=self.addr.plan_multipane(kind, die, hook_plane, 1, True)
-                    fanout=1; alias_used="SR"
-                else:
-                    fanout, interleave=self._fanout_from_alias(base, alias_const, hook.label)
-                    plan=self.addr.plan_multipane(kind, die, hook_plane, fanout, interleave)
-                    alias_used=pick
-                    if not plan and fanout>1:
-                        self.stats["alias_degrade"]+=1
-                        plan=self.addr.plan_multipane(kind, die, hook_plane, 1, interleave)
-                        if plan: fanout=1
+                fanout, interleave=self._fanout_from_alias(base, alias_const, hook.label)
+                plan=self.addr.plan_multiplane(kind, die, hook_plane, fanout, interleave)
+                alias_used=pick
+                if not plan and fanout>1:
+                    self.stats["alias_degrade"]+=1
+                    plan=self.addr.plan_multiplane(kind, die, hook_plane, 1, interleave)
+                    if plan: fanout=1
                 # start_plane round-robin scan when easing enabled and no plan
                 if not plan:
                     scan = max(1, int(hookscreen_cfg.get("startplane_scan", 1)))
                     tried = 0
                     p = (hook_plane + 1) % self.addr.planes
                     while tried < self.addr.planes and tried < scan and not plan:
-                        if kind==OpKind.SR:
-                            plan=self.addr.plan_multipane(kind, die, p, 1, True)
-                            fanout=1
-                        else:
-                            plan=self.addr.plan_multipane(kind, die, p, fanout, interleave)
+                        plan=self.addr.plan_multiplane(kind, die, p, fanout, interleave)
                         tried += 1
                         p = (p + 1) % self.addr.planes
                 if not plan:
@@ -2084,10 +2070,10 @@ def populate_bootstrap_obligations(cfg: Dict[str,Any], addr: AddressManager, obl
     stagger = float(bs.get("stagger_us", 0.5))
     hard_slot = bool(bs.get("hard_slot", True))
     # nominal durations for dependency-aware deadlines
-    erase_nom = get_kind_nominal_duration(cfg, "MUL_ERASE")
-    prog_nom  = get_kind_nominal_duration(cfg, "MUL_PROGRAM")
-    read_nom  = get_kind_nominal_duration(cfg, "MUL_READ")
-    dout_nom  = get_kind_nominal_duration(cfg, "DOUT")
+    erase_nom = get_nominal_duration(cfg, "MUL_ERASE")
+    prog_nom  = get_nominal_duration(cfg, "MUL_PROGRAM")
+    read_nom  = get_nominal_duration(cfg, "MUL_READ")
+    dout_nom  = get_nominal_duration(cfg, "DOUT")
     dout_mult = float(bs.get("dout_stagger_n", 0.0))
     stagger_dout = max(stagger, dout_nom * dout_mult) if dout_mult > 0.0 else stagger
 
@@ -2199,7 +2185,7 @@ class Scheduler:
         self.logger = logger or TimelineLogger()
         self.latch = latch or LatchManager()
         # state timeline
-        self.state_timeline = StateTimeline()
+        self.state_timeline = state_timeline
         self._push(1, "QUEUE_REFILL", None)
         for plane in range(self.addr.planes):
             self._push(2, "PHASE_HOOK", PhaseHook(2, "BOOT.START", 0, plane))
@@ -2258,7 +2244,7 @@ class Scheduler:
             # build states as (name, dur) list
             st_list = [(s.name, float(s.dur_us)) for s in op.states]
             for t in op.targets:
-                self.state_timeline.reserve_op(t.die, t.plane, op.base.name, st_list, start, True)
+                self.state_timeline.reserve_op(t.die, t.plane, op.name, op.base.name, st_list, start, True)
         # latch: if READ, plan lock from READ.end_us until DOUT ends
         if op.base == OpKind.READ:
             self.latch.plan_lock_after_read(op.targets, end)
@@ -2293,7 +2279,7 @@ class Scheduler:
                             "block":    int(t.block),
                             "page":     int(page),
                             "op_name":     label,
-                            "op_kind": op.base.name,
+                            "op_base": op.base.name,
                             "source":   op.meta.get("source"),
                             "op_uid":   int(op.meta.get("uid", -1)),
                             "arity":    int(op.meta.get("arity", 1)),
@@ -2331,14 +2317,14 @@ class Scheduler:
             for t in op.targets:
                 if reduce_hooks:
                     # op 종료 시각 + margin 기준 한 번만 훅 발생
-                    self._push(end + hook_margin, "PHASE_HOOK", PhaseHook(end + hook_margin, f"{op.base.name}.END", t.die, t.plane))
+                    self._push(end + hook_margin, "PHASE_HOOK", PhaseHook(end + hook_margin, f"{op.name}.END", t.die, t.plane))
                 else:
                     cur=start
                     for s in op.states:
                         if s.name !="ISSUE":
                             eps = random.random()*s.dur_us*0.2
-                            self._push(cur + s.dur_us - eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.base.name}.{s.name}.MID",   t.die, t.plane))
-                            self._push(cur + s.dur_us + eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.base.name}.{s.name}.END",   t.die, t.plane))
+                            self._push(cur + s.dur_us - eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.name}.{s.name}.MID",   t.die, t.plane))
+                            self._push(cur + s.dur_us + eps,    "PHASE_HOOK", PhaseHook(cur + s.dur_us,    f"{op.name}.{s.name}.END",   t.die, t.plane))
                         cur += s.dur_us
 
         first=op.targets[0]
@@ -2470,6 +2456,7 @@ def main():
 
     # 2) 실행: bootstrap 전용 여유와 총 러닝타임 분리 계산
     CFG["policy"]["run_until_us"] = 50000.0
+
     run_until_base = CFG["policy"]["run_until_us"]
     run_until_boot = 0.0
     try:
@@ -2553,7 +2540,7 @@ def main():
 
     # 4.5) Rejection log
     try:
-        # rejlog.to_csv("reject_log.csv")
+        rejlog.to_csv("reject_log.csv")
         rejlog.to_obligation_skips_csv("obligation_skips.csv")
         print("\n=== Rejection Summary (by stage/reason) ===")
         for stage, d in rejlog.stats.items():

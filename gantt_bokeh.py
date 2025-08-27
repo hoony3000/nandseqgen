@@ -390,7 +390,7 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
     # ---------------- Schedule-time State vs Operation (second tab) ----------------
     sched_layout = column(Div(text="nand_state_timeline.csv & nand_timeline.csv 둘 다 필요합니다."))
     try:
-        need_ops = {"die","plane","start_us","op_kind"}.issubset(df_ops.columns) if (df_ops is not None and not df_ops.empty) else False
+        need_ops = {"die","plane","start_us","op_base"}.issubset(df_ops.columns) if (df_ops is not None and not df_ops.empty) else False
         # base_df는 normalize 후 컬럼명이 start/end 이므로 그 존재만 확인
         need_st   = {"die","plane","start","end","state"}.issubset(base_df.columns)
         if need_ops and need_st:
@@ -413,7 +413,7 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
                 pass
             st = st.sort_values([c for c in ("die","plane","start_us") if c in st.columns]).reset_index(drop=True)
             # ops: include op_uid if present, for dedup per (uid,die,plane)
-            ops_cols = ["die","plane","start_us","op_kind"]
+            ops_cols = ["die","plane","start_us","op_base"]
             if "op_uid" in df_ops.columns:
                 ops_cols.append("op_uid")
             ops = df_ops[ops_cols].sort_values(["die","plane","start_us"]).reset_index(drop=True)
@@ -484,11 +484,11 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
                     if "op_uid" in mm.columns and mm["op_uid"].notna().any():
                         mm = mm.drop_duplicates(subset=["op_uid","die","plane"], keep="first")
                     mm["state_at"] = mm["phase_key_used"].astype(str)
-                    agg = mm.groupby(["state_at","op_kind"]).size().reset_index(name="value")
+                    agg = mm.groupby(["state_at","op_base"]).size().reset_index(name="value")
                 else:
                     # build state_at as op.state using previous segment
                     m["state_at"] = (m["op_prev"].astype(str) + "." + m["state"].astype(str))
-                    agg = m.groupby(["state_at","op_kind"]).size().reset_index(name="value")
+                    agg = m.groupby(["state_at","op_base"]).size().reset_index(name="value")
                 sched_src = ColumnDataSource(dict(x=[], value=[]))
                 p3 = figure(title="Schedule-time: State vs Operation", x_axis_label="(state, op)", y_axis_label="count", height=420, tools="xpan,xwheel_zoom,reset,save,tap", active_scroll="xwheel_zoom", output_backend="canvas", x_range=FactorRange())
                 p3.width = int(width_slider.value)
@@ -500,7 +500,7 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
                         sched_src.data = dict(x=[], value=[])
                         p3.x_range = FactorRange()
                         return
-                    factors = list(agg.apply(lambda r: (str(r["state_at"]), str(r["op_kind"])) , axis=1))
+                    factors = list(agg.apply(lambda r: (str(r["state_at"]), str(r["op_base"])) , axis=1))
                     values = agg["value"].astype(float).tolist()
                     p3.x_range = FactorRange(*factors)
                     p3.xaxis.major_label_orientation = 1.0
@@ -534,11 +534,11 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
                             else:
                                 st_key, okind = s, "?"
                         if (df_ops is not None) and ("phase_key_used" in df_ops.columns):
-                            mm = df_ops[(df_ops["phase_key_used"].astype(str) == str(st_key)) & (df_ops["op_kind"].astype(str) == str(okind))].copy()
+                            mm = df_ops[(df_ops["phase_key_used"].astype(str) == str(st_key)) & (df_ops["op_base"].astype(str) == str(okind))].copy()
                         else:
-                            mm = m[(m["state_at"].astype(str) == str(st_key)) & (m["op_kind"].astype(str) == str(okind))].copy()
+                            mm = m[(m["state_at"].astype(str) == str(st_key)) & (m["op_base"].astype(str) == str(okind))].copy()
                         # show top 20 rows from df_ops-like columns
-                        cols = [c for c in ("die","plane","start_us","op_uid","op_kind","query_us","op_prev","state","phase_key_used","state_key_at_schedule") if c in mm.columns]
+                        cols = [c for c in ("die","plane","start_us","op_uid","op_base","query_us","op_prev","state","phase_key_used","state_key_at_schedule") if c in mm.columns]
                         show = mm[cols].head(20)
                         html = show.to_html(index=False)
                         details.text = f"<b>Selected:</b> {st_key} × {okind} (rows={len(mm)})" + html
