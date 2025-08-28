@@ -2477,6 +2477,8 @@ def main():
     CFG["topology"]["blocks"] = 8
     CFG["topology"]["pages_per_block"] = 100
     print(f"topology: {CFG['topology']}")
+    # 시각화 on/off 토글
+    enable_visualization = True
     try:
         exp = CFG.get("export", {})
         if bool(exp.get("log_to_file", False)):
@@ -2624,38 +2626,41 @@ def main():
     # 4.7) 성능 프로파일 저장 제거됨
 
     # 5) 시각화
-    if split_logging and (df_boot is not None or df_pol is not None):
-        if df_boot is not None and not df_boot.empty:
-            plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
-            plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
+    if enable_visualization:
+        if split_logging and (df_boot is not None or df_pol is not None):
+            if df_boot is not None and not df_boot.empty:
+                plot_gantt_by_die(df_boot, title="Bootstrap Timeline")
+                plot_block_page_sequence_3d_by_die(df_boot, kinds=("ERASE","PROGRAM","READ"),
+                                                   z_mode="global_die", draw_lines=True)
+                # heatmap (bootstrap)
+                try:
+                    plot_target_heatmap(df_boot, kinds=("PROGRAM","READ"),
+                                        title="Target heatmap (bootstrap)",
+                                        save_path="figs/heatmap_bootstrap.png")
+                except Exception as e:
+                    print(f"[HEATMAP] bootstrap skipped: {e}")
+            if df_pol is not None and not df_pol.empty:
+                plot_gantt_by_die(df_pol, title="Policy Timeline")
+                plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
+                                                   z_mode="global_die", draw_lines=True)
+                try:
+                    plot_target_heatmap(df_pol, kinds=("PROGRAM","READ"),
+                                        title="Target heatmap (policy)",
+                                        save_path="figs/heatmap_policy.png")
+                except Exception as e:
+                    print(f"[HEATMAP] policy skipped: {e}")
+        else:
+            plot_gantt_by_die(df)  # 모든 die별로 개별 그림
+            plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
                                                z_mode="global_die", draw_lines=True)
-            # heatmap (bootstrap)
             try:
-                plot_target_heatmap(df_boot, kinds=("PROGRAM","READ"),
-                                    title="Target heatmap (bootstrap)",
-                                    save_path="figs/heatmap_bootstrap.png")
+                plot_target_heatmap(df, kinds=("PROGRAM","READ"),
+                                    title="Target heatmap (all)",
+                                    save_path="figs/heatmap_all.png")
             except Exception as e:
-                print(f"[HEATMAP] bootstrap skipped: {e}")
-        if df_pol is not None and not df_pol.empty:
-            plot_gantt_by_die(df_pol, title="Policy Timeline")
-            plot_block_page_sequence_3d_by_die(df_pol, kinds=("ERASE","PROGRAM","READ"),
-                                               z_mode="global_die", draw_lines=True)
-            try:
-                plot_target_heatmap(df_pol, kinds=("PROGRAM","READ"),
-                                    title="Target heatmap (policy)",
-                                    save_path="figs/heatmap_policy.png")
-            except Exception as e:
-                print(f"[HEATMAP] policy skipped: {e}")
+                print(f"[HEATMAP] all skipped: {e}")
     else:
-        plot_gantt_by_die(df)  # 모든 die별로 개별 그림
-        plot_block_page_sequence_3d_by_die(df, kinds=("ERASE","PROGRAM","READ"),
-                                           z_mode="global_die", draw_lines=True)
-        try:
-            plot_target_heatmap(df, kinds=("PROGRAM","READ"),
-                                title="Target heatmap (all)",
-                                save_path="figs/heatmap_all.png")
-        except Exception as e:
-            print(f"[HEATMAP] all skipped: {e}")
+        print("[VIZ] disabled")
 
     # (선택) 미리보기
     # df_preview = pattern_preview_dataframe(df, CFG)
