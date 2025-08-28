@@ -385,6 +385,8 @@ CFG["planning"] = {
         "shift_on_delay_us": 0.2,
         # while planned items are pending on a die/plane, guard against policy proposals
         "guard_policy": True,
+        # debug logging
+        "debug": False,
     }
 }
 
@@ -553,6 +555,8 @@ class PlannedOpManager:
 
     def _push(self, pop: PlannedOp):
         self._deps[pop.id] = list(pop.deps) if pop.deps else []
+        if bool(self.cfg.get("planning",{}).get("single_path",{}).get("debug", False)):
+            print(f"[PLAN] push id={pop.id} die={pop.die} planes={pop.plane_set} name={pop.name} start={pop.start_us_reserved:.2f} end={pop.end_us_reserved:.2f}")
         heapq.heappush(self.heap, (pop.prio, pop.start_us_reserved, pop.id, pop))
 
     def _deps_satisfied(self, op_id: int) -> bool:
@@ -593,6 +597,9 @@ class PlannedOpManager:
             chosen = pop
         for it in kept:
             heapq.heappush(self.heap, it)
+        if chosen is None and bool(self.cfg.get("planning",{}).get("single_path",{}).get("debug", False)):
+            die_items = [(pr, st, pid, p) for (pr, st, pid, p) in self.heap if p.die==die]
+            print(f"[PLAN] pop_ready none die={die} plane={plane} now={now_us:.2f} die_items={[(pid,p.name,st) for (_,st,pid,p) in die_items]}")
         return chosen
 
     def _reserve_all_for_op(self, pop: PlannedOp) -> bool:
