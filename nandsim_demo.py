@@ -2478,7 +2478,7 @@ def main():
     CFG["topology"]["pages_per_block"] = 100
     print(f"topology: {CFG['topology']}")
     # 시각화 on/off 토글
-    enable_visualization = True
+    enable_visualization = False
     try:
         exp = CFG.get("export", {})
         if bool(exp.get("log_to_file", False)):
