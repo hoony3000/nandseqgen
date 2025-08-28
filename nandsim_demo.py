@@ -2656,6 +2656,41 @@ def main():
     CFG["topology"]["blocks"] = 8
     CFG["topology"]["pages_per_block"] = 100
     print(f"topology: {CFG['topology']}")
+
+    # 1.x) Optional overrides via environment (for testing)
+    try:
+        env = os.environ
+        v = env.get("BOOTSTRAP_ENABLED")
+        if v is not None:
+            CFG["bootstrap"]["enabled"] = str(v).lower() in ("1","true","yes","on")
+        v = env.get("RUN_UNTIL_US")
+        if v is not None:
+            CFG["policy"]["run_until_us"] = float(v)
+        # Sequence feature toggles
+        v = env.get("SEQUENCE_ENABLE")
+        if v is not None:
+            CFG.setdefault("sequence", {})
+            CFG["sequence"]["enable"] = str(v).lower() in ("1","true","yes","on")
+        v = env.get("SEQUENCE_PCREATE")
+        if v is not None:
+            CFG.setdefault("sequence", {})
+            CFG["sequence"]["p_create"] = float(v)
+        # Optional read_linear params
+        seq_read = {}
+        v = env.get("SEQUENCE_LEN")
+        if v is not None:
+            seq_read["length"] = int(v)
+        v = env.get("SEQUENCE_WIN_US")
+        if v is not None:
+            seq_read["window_us"] = float(v)
+        v = env.get("SEQUENCE_GAP_US")
+        if v is not None:
+            seq_read["step_gap_us"] = float(v)
+        if seq_read:
+            CFG.setdefault("sequence", {})
+            CFG["sequence"]["read_linear"] = {**CFG.get("sequence", {}).get("read_linear", {}), **seq_read}
+    except Exception as e:
+        print(f"[ENV] overrides skipped: {e}")
     # 시각화 on/off 토글
     enable_visualization = False
     try:
@@ -2702,6 +2737,13 @@ def main():
 
     # 2) 실행: bootstrap 전용 여유와 총 러닝타임 분리 계산
     CFG["policy"]["run_until_us"] = 50000.0
+    # allow env override of runtime even after default is set
+    try:
+        v = os.environ.get("RUN_UNTIL_US")
+        if v is not None:
+            CFG["policy"]["run_until_us"] = float(v)
+    except Exception:
+        pass
 
     run_until_base = CFG["policy"]["run_until_us"]
     run_until_boot = 0.0
