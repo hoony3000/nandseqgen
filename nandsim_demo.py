@@ -461,7 +461,7 @@ class StateSeg:
 @dataclass
 class Operation:
     name: str
-    base: OpKind
+    base: Enum
     targets: List[Address]
     states: List[StateSeg]
     movable: bool = True
@@ -711,7 +711,7 @@ def get_admission_delta(cfg: Dict[str,Any], hook_label: str, op_base: str) -> fl
 
 # --------------------------------------------------------------------------
 # Builders
-def build_operation(name:str, kind: OpKind, cfg_op: Dict[str, Any], targets: List[Address]) -> Operation:
+def build_operation(name:str, kind: Enum, cfg_op: Dict[str, Any], targets: List[Address]) -> Operation:
     states=[]
     for s in cfg_op["states"]:
         states.append(StateSeg(name=s["name"], dur_us=sample_dist(s["dist"]), bus=bool(s.get("bus", False))))
@@ -901,7 +901,7 @@ class AddressManager:
                 if key not in out: out.append(key)
         return [list(ps) for ps in dict.fromkeys(out)]
 
-    def plan_multiplane(self, kind: OpKind, die:int, start_plane:int, desired_fanout:int, interleave:bool)\
+    def plan_multiplane(self, kind: Enum, die:int, start_plane:int, desired_fanout:int, interleave:bool)\
             -> Optional[Tuple[List[Address], List[int], Scope]]:
         if desired_fanout<1: desired_fanout=1
         tries=self.cfg["policy"]["planner_max_tries"]
@@ -994,7 +994,7 @@ class AddressManager:
         return None
 
     # ---- precheck/reserve/future/commit ----
-    def precheck_planescope(self, kind: OpKind, targets: List[Address], start_hint: float, scope: Scope)->bool:
+    def precheck_planescope(self, kind: Enum, targets: List[Address], start_hint: float, scope: Scope)->bool:
         start_hint=quantize(start_hint); end_hint=start_hint
         die=targets[0].die
         # time overlap check
