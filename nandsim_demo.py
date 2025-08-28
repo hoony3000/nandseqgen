@@ -3092,9 +3092,12 @@ def main():
     spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch, state_timeline=state_timeline, planned=planned, plan_resv=plan_resv)
     sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger, latch=latch, state_timeline=state_timeline)
 
-    # 1.3) Bootstrap obligations (optional)
+    # 1.3) Bootstrap obligations (optional) — disabled under single-path planning
     try:
-        populate_bootstrap_obligations(CFG, addr, obl)
+        if not bool(CFG.get("planning", {}).get("single_path", {}).get("enable", False)):
+            populate_bootstrap_obligations(CFG, addr, obl)
+        else:
+            print("[BOOTSTRAP] planning.single_path enabled: skip runtime bootstrap obligations")
     except Exception as e:
         print(f"[BOOTSTRAP] skipped: {e}")
 
