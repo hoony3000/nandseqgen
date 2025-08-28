@@ -57,7 +57,7 @@ class TimelineLogger:
             label = label_for_read  # READ:MUL_/SIN_, PROGRAM/ERASE도 MUL_/SIN_ 반영
         for t in op.targets:
             page = t.page if (t.page is not None) else 0  # ERASE/SR도 page=0로 강제
-            self.rows.append({
+            row = {
                 "start_us": float(start_us),
                 "end_us":   float(end_us),
                 "die":      int(t.die),
@@ -71,7 +71,12 @@ class TimelineLogger:
                 "arity":    int(op.meta.get("arity", 1)),
                 "phase_key_used": op.meta.get("phase_key_used"),
                 "state_key_at_schedule": op.meta.get("state_key_at_schedule"),
-            })
+            }
+            # optional sequence fields
+            for k in ("seq_id","seq_idx","seq_len","seq_name"):
+                if k in op.meta and op.meta.get(k) is not None:
+                    row[k] = op.meta.get(k)
+            self.rows.append(row)
 
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.rows)

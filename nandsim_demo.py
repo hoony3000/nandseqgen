@@ -1135,6 +1135,31 @@ class AddressManager:
                 except Exception:
                     pass
 
+    # --- helpers for sequence READ target building with fixed plane_set/page ---
+    def build_read_targets_for_plane_set_and_page(self, die: int, plane_set: List[int], page: int) -> Optional[List[Address]]:
+        try:
+            targets: List[Address] = []
+            committed = self.programmed_committed.get((die,), set())
+            future    = self.programmed_future.get((die,), set())
+            for pl in list(plane_set):
+                # prefer committed blocks first
+                cand_b = None
+                for (b, p) in committed:
+                    if p == page and (b % self.planes) == pl:
+                        cand_b = b
+                        break
+                if cand_b is None:
+                    for (b, p) in future:
+                        if p == page and (b % self.planes) == pl:
+                            cand_b = b
+                            break
+                if cand_b is None:
+                    return None
+                targets.append(Address(die, pl, int(cand_b), int(page)))
+            return targets
+        except Exception:
+            return None
+
 # --------------------------------------------------------------------------
 # Exclusion Manager (runtime blocking windows)
 @dataclass
@@ -1492,6 +1517,15 @@ class Obligation:
     # bootstrap/flags
     source: Optional[str] = None
     skip_dout_creation: bool = False
+    # sequence (head-only) metadata
+    seq_id: Optional[int] = None
+    seq_idx: Optional[int] = None
+    seq_len: Optional[int] = None
+    seq_name: Optional[str] = None
+    seq_plane_set: Optional[List[int]] = None
+    seq_die: Optional[int] = None
+    seq_page_base: Optional[int] = None
+    seq_step_gap_us: Optional[float] = None
 
 class ObligationManager:
     def __init__(self, cfg_list: List[Dict[str,Any]], cfg_root: Optional[Dict[str,Any]] = None):
@@ -1521,6 +1555,13 @@ class ObligationManager:
         }
         self.debug = False
         self._last_audit_lost = 0
+        # dependencies
+        self.addr: Optional[AddressManager] = None
+        # sequence id counter
+        self._seq_id_counter = 0
+
+    def attach_addr(self, addr: "AddressManager"):
+        self.addr = addr
 
     def _page_index_of_ob(self, ob: Obligation) -> int:
         try:
@@ -1539,7 +1580,7 @@ class ObligationManager:
         groups: Dict[Tuple[str,int,Optional[str]], List[Tuple[int,int,float]]] = {}
         for it in self.heap:
             o = it.ob
-            key = (o.require.name, o.targets[0].die, getattr(o, "source", None))
+            key = (str(o.require), o.targets[0].die, getattr(o, "source", None))
             groups.setdefault(key, []).append((o.id, self._page_index_of_ob(o), o.deadline_us))
         any_inv = False
         for (req_name, die, src), items in groups.items():
@@ -1685,6 +1726,55 @@ class ObligationManager:
             print(f"not_fulfilled: {ob.require} by {now:7.2f} us, deadline={ob.deadline_us:7.2f} us, target(d{ob.targets[0].die},p{ob.targets[0].plane})")
         if self.debug:
             print(f"[OBLIGDBG] mark_fulfilled: id={ob.id} at={now:.2f} heap_size={len(self.heap)} assigned={len(self.assigned)}")
+        # sequence progression (head-only): create next step obligation if any
+        try:
+            if getattr(ob, "seq_id", None) is not None and getattr(ob, "seq_idx", None) is not None:
+                if self.addr is None:
+                    return
+                seq_idx = int(ob.seq_idx)
+                seq_len = int(ob.seq_len or 0)
+                if seq_idx + 1 >= seq_len:
+                    return  # sequence finished
+                die = int(ob.seq_die if ob.seq_die is not None else ob.targets[0].die)
+                plane_set = list(ob.seq_plane_set or [t.plane for t in ob.targets])
+                base_page = int(ob.seq_page_base or (ob.targets[0].page or 0))
+                next_page = base_page + seq_idx + 1
+                targets = self.addr.build_read_targets_for_plane_set_and_page(die, plane_set, next_page)
+                if not targets:
+                    return  # cannot progress sequence safely
+                arity = len(plane_set)
+                alias = "MUL_READ" if arity > 1 else "SIN_READ"
+                # deadline: step gap from now; hard_slot to bypass horizon
+                gap = float(ob.seq_step_gap_us or 2.0)
+                next_deadline = quantize(now + max(0.0, gap))
+                self._seq += 1
+                nxt = Obligation(
+                    id=self._seq,
+                    require=alias,
+                    targets=targets,
+                    deadline_us=next_deadline,
+                    hard_slot=True,
+                    source=str(ob.source or "sequence.read_linear"),
+                    skip_dout_creation=False,
+                    seq_id=int(ob.seq_id),
+                    seq_idx=seq_idx + 1,
+                    seq_len=seq_len,
+                    seq_name=str(ob.seq_name or "SEQ_READ_LINEAR"),
+                    seq_plane_set=list(plane_set),
+                    seq_die=die,
+                    seq_page_base=base_page,
+                    seq_step_gap_us=float(ob.seq_step_gap_us or 2.0),
+                )
+                heapq.heappush(self.heap, _ObHeapItem(deadline_us=nxt.deadline_us, seq=nxt.id, ob=nxt))
+                self.stats["created"] += 1
+                try:
+                    if not hasattr(self, "creation_logger"):
+                        self.creation_logger = CreationLogger()
+                    self.creation_logger.log(nxt, context="sequence.next", page_index=next_page, created_at_us=now)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def expire_due(self, now: float):
         if not self.heap:
@@ -1702,6 +1792,66 @@ class ObligationManager:
                 print(f"[OBLIGDBG] extend_all: delta={delta:.2f} heap_size={len(self.heap)} new_earliest={self.heap[0].deadline_us:.2f}")
                 # choose one representative ob to check ordering per kind
                 rep = self.heap[0].ob
+
+    # --- sequence creation (head-only) ---
+    def create_sequence_read_linear(self, addr: "AddressManager", die: int, start_plane: int, now_us: float,
+                                    length: Optional[int] = None,
+                                    window_us: Optional[float] = None,
+                                    step_gap_us: Optional[float] = None) -> bool:
+        try:
+            # defaults from CFG if available
+            seq_cfg = (self.cfg_root or {}).get("sequence", {}) if isinstance(self.cfg_root, dict) else {}
+            read_cfg = seq_cfg.get("read_linear", {}) if isinstance(seq_cfg, dict) else {}
+            L = int(length if length is not None else int(read_cfg.get("length", 4)))
+            win = float(window_us if window_us is not None else float(read_cfg.get("window_us", 6.0)))
+            gap = float(step_gap_us if step_gap_us is not None else float(read_cfg.get("step_gap_us", 2.0)))
+            # choose plane_set and common page using planner
+            sel = (self.cfg_root or {}).get("selection", {}) if isinstance(self.cfg_root, dict) else {}
+            dfl = sel.get("defaults", {}).get("READ", {}) if isinstance(sel, dict) else {}
+            fanout = int(dfl.get("fanout", 1))
+            interleave = bool(dfl.get("interleave", True))
+            plan = addr.plan_multiplane(OpKind.READ, die, start_plane, fanout, interleave)
+            if not plan:
+                return False
+            targets, plane_set, _scope = plan
+            if not targets:
+                return False
+            page0 = int(targets[0].page or 0)
+            # allocate sequence id
+            self._seq_id_counter += 1
+            seq_id = self._seq_id_counter
+            arity = len(plane_set)
+            alias = "MUL_READ" if arity > 1 else "SIN_READ"
+            first_deadline = quantize(now_us + max(0.0, win))
+            self._seq += 1
+            ob = Obligation(
+                id=self._seq,
+                require=alias,
+                targets=targets,
+                deadline_us=first_deadline,
+                hard_slot=True,
+                source="sequence.read_linear",
+                skip_dout_creation=False,
+                seq_id=seq_id,
+                seq_idx=0,
+                seq_len=L,
+                seq_name="SEQ_READ_LINEAR",
+                seq_plane_set=list(plane_set),
+                seq_die=die,
+                seq_page_base=page0,
+                seq_step_gap_us=gap,
+            )
+            heapq.heappush(self.heap, _ObHeapItem(deadline_us=ob.deadline_us, seq=ob.id, ob=ob))
+            self.stats["created"] += 1
+            try:
+                if not hasattr(self, "creation_logger"):
+                    self.creation_logger = CreationLogger()
+                self.creation_logger.log(ob, context="sequence.head", page_index=page0, created_at_us=now_us)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
 # --------------------------------------------------------------------------
 # Policy Engine (phase-conditional + admission gating + backoff + latch check)
@@ -1955,6 +2105,14 @@ class PolicyEngine:
                 op.meta["source"] = ob.source
             if getattr(ob, "skip_dout_creation", False):
                 op.meta["skip_dout_creation"] = True
+            # propagate sequence metadata for logging if present on obligation
+            for _k in ("seq_id","seq_idx","seq_len","seq_name","seq_plane_set","seq_die","seq_page_base","seq_step_gap_us"):
+                try:
+                    v = getattr(ob, _k, None)
+                except Exception:
+                    v = None
+                if v is not None:
+                    op.meta[_k] = v
             plane_set=op.meta["plane_list"]
             scope=Scope[op.meta["scope"]]
             affects = self.cfg.get("state_timeline", {}).get("affects", {})
@@ -1978,6 +2136,23 @@ class PolicyEngine:
         if self.obl.has_pending(source="bootstrap"):
             self._reject(now_us, hook, stage, "guard_bootstrap_pending", None, None, None, None, earliest_start, None, "bootstrap_pending_skip")
             return None, None
+
+        # sequence trigger (head-only): probabilistically create a read-linear sequence head
+        try:
+            seq_cfg = self.cfg.get("sequence", {})
+            if bool(seq_cfg.get("enable", False)):
+                p_create = float(seq_cfg.get("p_create", 0.0))
+                if random.random() < p_create:
+                    created = False
+                    try:
+                        created = self.obl.create_sequence_read_linear(self.addr, die, hook_plane, now_us)
+                    except Exception:
+                        created = False
+                    if created:
+                        # head obligation will be consumed in the next hook
+                        return None, None
+        except Exception:
+            pass
 
         # # Step 1: admission screen (target-level) - available_at <= now + default_delta
         # adm_delta = float(self.cfg.get("admission", {}).get("default_delta_us", 0.0))
@@ -2325,7 +2500,7 @@ class Scheduler:
                     rows = []
                     for t in op.targets:
                         page = t.page if (t.page is not None) else 0
-                        rows.append({
+                        r = {
                             "start_us": float(start),
                             "end_us":   float(end),
                             "die":      int(t.die),
@@ -2337,7 +2512,11 @@ class Scheduler:
                             "source":   op.meta.get("source"),
                             "op_uid":   int(op.meta.get("uid", -1)),
                             "arity":    int(op.meta.get("arity", 1)),
-                        })
+                        }
+                        for k in ("seq_id","seq_idx","seq_len","seq_name"):
+                            if k in op.meta and op.meta.get(k) is not None:
+                                r[k] = op.meta.get(k)
+                        rows.append(r)
                     return rows
                 if in_bootstrap or is_bootstrap_op:
                     self._timeline_rows_bootstrap.extend(_row_dict())
@@ -2505,6 +2684,10 @@ def main():
     rejlog = RejectionLogger()
     addr = AddressManager(CFG); excl = ExclusionManager(CFG)
     obl  = ObligationManager(CFG["obligations"], cfg_root=CFG)
+    try:
+        obl.attach_addr(addr)
+    except Exception:
+        pass
     latch = LatchManager()
     # shared state timeline
     state_timeline = StateTimeline()

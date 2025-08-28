@@ -199,6 +199,9 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
     for c in ("die", "block", "plane", "page"):
         if c in base_df.columns:
             tips.append((c, f"@{c}"))
+    for c in ("seq_id", "seq_idx", "seq_len", "seq_name"):
+        if c in base_df.columns:
+            tips.append((c, f"@{c}"))
     fig.add_tools(HoverTool(tooltips=tips))
 
     info = Div(text="", sizing_mode="stretch_width")
@@ -350,6 +353,9 @@ def _make_doc_layout(df_in: pd.DataFrame, df_ops: Optional[pd.DataFrame] = None)
                 tips_ops.append(("plane","@plane"))
             if "page" in dfo.columns:
                 tips_ops.append(("page","@page"))
+            for c in ("seq_id", "seq_idx", "seq_len", "seq_name"):
+                if c in dfo.columns:
+                    tips_ops.append((c, f"@{c}"))
             if "op_uid" in dfo.columns:
                 tips_ops.append(("op_uid","@op_uid"))
             fig_op.add_tools(HoverTool(tooltips=tips_ops))
