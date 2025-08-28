@@ -735,6 +735,51 @@ class PlannedOpManager:
             now_us = quantize(pop_r.end_us_reserved + base_gap_us)
         return True
 
+    def plan_policy_op(self, op_name: str, kind: Enum, die:int, plane_set: List[int], targets: List[Address], start_reserved: float, meta: Optional[Dict[str,Any]] = None, also_chain: bool = True) -> bool:
+        meta = dict(meta or {})
+        # base states
+        cfg_op = self.addr.cfg["op_specs"][op_name]
+        states = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_op["states"]]
+        dur = self._duration_of_states(states)
+        pop_id = self._next_id()
+        pop = PlannedOp(id=pop_id, name=op_name, base=kind, targets=targets, states=states,
+                        start_us_reserved=start_reserved, end_us_reserved=quantize(start_reserved+dur),
+                        die=die, plane_set=list(plane_set), prio=1, meta={**meta, "source":"plan.policy"})
+        if not self._reserve_all_for_op(pop):
+            return False
+        self._push(pop)
+
+        if not also_chain:
+            return True
+
+        # chain: READ -> DOUT, PROGRAM/ERASE -> SR
+        if kind == OpKind.READ:
+            cfg_d = self.addr.cfg["op_specs"]["DOUT"]
+            states_d = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_d["states"]]
+            dur_d = self._duration_of_states(states_d)
+            for a in targets:
+                did = self._next_id()
+                pop_d = PlannedOp(id=did, name="DOUT", base=OpKind.DOUT, targets=[a], states=states_d,
+                                  start_us_reserved=pop.end_us_reserved, end_us_reserved=quantize(pop.end_us_reserved+dur_d),
+                                  die=die, plane_set=[a.plane], prio=0, deps=[pop_id], meta={"source":"plan.policy"})
+                if not self.resv.reserve_latch(a.die, a.plane, pop.end_us_reserved, pop_d.end_us_reserved):
+                    return False
+                if not self._reserve_all_for_op(pop_d):
+                    return False
+                self._push(pop_d)
+        elif kind in (OpKind.PROGRAM, OpKind.ERASE):
+            cfg_s = self.addr.cfg["op_specs"]["SR"]
+            states_s = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_s["states"]]
+            dur_s = self._duration_of_states(states_s)
+            sid = self._next_id()
+            pop_s = PlannedOp(id=sid, name="SR", base=OpKind.SR, targets=[targets[0]], states=states_s,
+                              start_us_reserved=pop.end_us_reserved, end_us_reserved=quantize(pop.end_us_reserved+dur_s),
+                              die=die, plane_set=[targets[0].plane], prio=0, deps=[pop_id], meta={"source":"plan.policy"})
+            if not self._reserve_all_for_op(pop_s):
+                return False
+            self._push(pop_s)
+        return True
+
 # --------------------------------------------------------------------------
 # Rejection logging (per-attempt structured log + aggregated stats)
 @dataclass
@@ -2395,34 +2440,33 @@ class PolicyEngine:
                 pass
 
             pop = self.planned.pop_ready(now_us, die, hook_plane)
-            if not pop:
-                return None, None
-            # build operation from planned
-            op = Operation(name=pop.name, base=pop.base, targets=pop.targets, states=pop.states, meta={**pop.meta})
-            op.meta.setdefault("scope", self.addr.cfg.get("op_specs", {}).get(pop.name, {}).get("scope", "PLANE_SET"))
-            op.meta["plane_list"] = pop.plane_set
-            op.meta["arity"] = len(pop.plane_set)
-            start_hint = quantize(max(earliest_start, pop.start_us_reserved))
-            # validation stays the same
-            stage = "planned"
-            self.rejlog.log_attempt(stage)
-            if not self.addr.bus_precheck(op, start_hint, self.addr.bus_segments_for_op(op)):
-                self._reject(now_us, hook, stage, "bus", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "bus_conflict")
-                # shift chain forward
-                self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
-                return None, None
-            if not self.latch.allowed(op, start_hint):
-                self._reject(now_us, hook, stage, "latch", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "planned_latch_conflict")
-                self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
-                return None, None
-            if not self._exclusion_ok(op, start_hint):
-                self._reject(now_us, hook, stage, "excl", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "excl_conflict")
-                self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
-                return None, None
-            self.rejlog.log_accept(stage)
-            # mark complete so deps unblock
-            self.planned.mark_completed(pop)
-            return op, start_hint
+            if pop:
+                # build operation from planned
+                op = Operation(name=pop.name, base=pop.base, targets=pop.targets, states=pop.states, meta={**pop.meta})
+                op.meta.setdefault("scope", self.addr.cfg.get("op_specs", {}).get(pop.name, {}).get("scope", "PLANE_SET"))
+                op.meta["plane_list"] = pop.plane_set
+                op.meta["arity"] = len(pop.plane_set)
+                start_hint = quantize(max(earliest_start, pop.start_us_reserved))
+                # validation stays the same
+                stage = "planned"
+                self.rejlog.log_attempt(stage)
+                if not self.addr.bus_precheck(op, start_hint, self.addr.bus_segments_for_op(op)):
+                    self._reject(now_us, hook, stage, "bus", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "bus_conflict")
+                    # shift chain forward
+                    self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
+                    return None, None
+                if not self.latch.allowed(op, start_hint):
+                    self._reject(now_us, hook, stage, "latch", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "planned_latch_conflict")
+                    self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
+                    return None, None
+                if not self._exclusion_ok(op, start_hint):
+                    self._reject(now_us, hook, stage, "excl", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "excl_conflict")
+                    self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
+                    return None, None
+                self.rejlog.log_accept(stage)
+                # mark complete so deps unblock
+                self.planned.mark_completed(pop)
+                return op, start_hint
 
         # 0) obligations first
         stage = "obligation"
@@ -2569,7 +2613,7 @@ class PolicyEngine:
                     if plan: fanout=1
                 # start_plane round-robin scan when easing enabled and no plan
                 if not plan:
-                    scan = max(1, int(hookscreen_cfg.get("startplane_scan", 1)))
+                    scan = max(1, int(self.cfg.get("policy", {}).get("hookscreen", {}).get("startplane_scan", 1)))
                     tried = 0
                     p = (hook_plane + 1) % self.addr.planes
                     while tried < self.addr.planes and tried < scan and not plan:
@@ -2581,6 +2625,22 @@ class PolicyEngine:
                 else:
                     targets, plane_set, scope=plan
                     cfg_op=self.cfg["op_specs"][pick]
+                    # If planning is enabled, turn this into a planned op chain and return None (to be consumed later)
+                    plan_cfg = self.cfg.get("planning", {}).get("single_path", {})
+                    if bool(plan_cfg.get("enable", False)) and self.planned is not None:
+                        start_reserved = self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+                        planned_ok = self.planned.plan_policy_op(pick, kind, die, plane_set, targets, start_reserved,
+                                                                 meta={"phase_key_used": str(used_key if used_key else used_label),
+                                                                       "state_key_at_schedule": str(st_key) if st_key else None,
+                                                                       "alias_used": alias_used},
+                                                                 also_chain=True)
+                        if planned_ok:
+                            self.rejlog.log_accept(stage)
+                            return None, None
+                        else:
+                            self._reject(now_us, hook, stage, "planned_conflict", base, alias_used, fanout, plane_set, start_reserved, None, "reservation_conflict")
+                            return None, None
+                    # legacy: immediate op path
                     op=build_operation(alias_used, kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=alias_used
                     try:
