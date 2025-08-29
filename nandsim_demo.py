@@ -340,6 +340,19 @@ CFG = {
             "on_erase": "round_robin_next"
         }
     },
+    # Sequence (testing convenience defaults)
+    # - enable: master toggle for sequence features
+    # - p_create: probability to create head-only sequence obligations in legacy (non-planned) mode
+    # - read_linear: parameters for linear READ sequences
+    "sequence": {
+        "enable": False,
+        "p_create": 0.0,
+        "read_linear": {
+            "length": 4,
+            "window_us": 6.0,
+            "step_gap_us": 2.0
+        }
+    },
 }
 
 # --- Pattern export (ATE CSV) defaults ---
@@ -374,6 +387,21 @@ CFG["pattern_export"] = {
         "page_equal_required_from_op_specs": True,
         "time_monotonic": True
     }
+}
+
+# --------------------------------------------------------------------------
+# Planning (single-path) defaults (disabled by default)
+CFG["planning"] = {
+    "single_path": {
+        "enable": True,
+        # when a planned op cannot be scheduled at reserved time, shift chain by delta
+        "shift_on_delay_us": 0.2,
+        # while planned items are pending on a die/plane, guard against policy proposals
+        "guard_policy": True,
+        # debug logging
+        "debug": False,
+    }
+    
 }
 
 # 예시
@@ -466,6 +494,312 @@ class Operation:
     states: List[StateSeg]
     movable: bool = True
     meta: Dict[str,Any] = field(default_factory=dict)
+
+# --------------------------------------------------------------------------
+# Planned operations (single-path)
+@dataclass
+class PlannedOp:
+    id: int
+    name: str
+    base: Enum
+    targets: List[Address]
+    states: List[StateSeg]
+    start_us_reserved: float
+    end_us_reserved: float
+    die: int
+    plane_set: List[int]
+    prio: int
+    deps: List[int] = field(default_factory=list)
+    meta: Dict[str,Any] = field(default_factory=dict)
+
+class PlanningReservation:
+    def __init__(self):
+        self.by_plane: Dict[Tuple[int,int], List[Tuple[float,float]]] = {}
+        self.bus: List[Tuple[float,float]] = []
+        self.latch: Dict[Tuple[int,int], List[Tuple[float,float]]] = {}
+
+    def _overlap(self, a0: float, a1: float, b0: float, b1: float) -> bool:
+        return not (a1 <= b0 or b1 <= a0)
+
+    def reserve_plane_segments(self, die:int, plane:int, segs: List[Tuple[float,float]]) -> bool:
+        rows = self.by_plane.setdefault((die,plane), [])
+        for (s0,s1) in segs:
+            for (t0,t1) in rows:
+                if self._overlap(s0,s1,t0,t1):
+                    return False
+        rows.extend(segs)
+        return True
+
+    def reserve_bus(self, segs: List[Tuple[float,float]]) -> bool:
+        for (s0,s1) in segs:
+            for (t0,t1) in self.bus:
+                if self._overlap(s0,s1,t0,t1):
+                    return False
+        self.bus.extend(segs)
+        return True
+
+    def reserve_latch(self, die:int, plane:int, start_us: float, end_us: float) -> bool:
+        arr = self.latch.setdefault((die,plane), [])
+        for (t0,t1) in arr:
+            if self._overlap(start_us,end_us,t0,t1):
+                return False
+        arr.append((start_us,end_us))
+        return True
+
+    def conflicts_with_latch(self, die:int, plane:int, t: float) -> bool:
+        arr = self.latch.get((die,plane), [])
+        for (t0,t1) in arr:
+            if t0 <= t < t1:
+                return True
+        return False
+
+class PlannedOpManager:
+    def __init__(self, cfg, addr: "AddressManager", reservation: PlanningReservation):
+        self.cfg = cfg
+        self.addr = addr
+        self.resv = reservation
+        self._seq = 0
+        self.heap: List[Tuple[int,float,int,PlannedOp]] = []  # (prio, start_reserved, id, op)
+        self._deps: Dict[int, List[int]] = {}
+        self._completed: Set[int] = set()
+
+    def _next_id(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _push(self, pop: PlannedOp):
+        self._deps[pop.id] = list(pop.deps) if pop.deps else []
+        if bool(self.cfg.get("planning",{}).get("single_path",{}).get("debug", False)):
+            print(f"[PLAN] push id={pop.id} die={pop.die} planes={pop.plane_set} name={pop.name} start={pop.start_us_reserved:.2f} end={pop.end_us_reserved:.2f}")
+        heapq.heappush(self.heap, (pop.prio, pop.start_us_reserved, pop.id, pop))
+
+    def _deps_satisfied(self, op_id: int) -> bool:
+        reqs = self._deps.get(op_id, [])
+        return all(d in self._completed for d in reqs)
+
+    def mark_completed(self, pop: PlannedOp):
+        self._completed.add(pop.id)
+
+    def shift_due_to_delay(self, die:int, delta: float):
+        if delta <= 0: return
+        items = []
+        while self.heap:
+            items.append(heapq.heappop(self.heap))
+        new_items = []
+        for pr, start_r, _id, pop in items:
+            if pop.die == die:
+                pop.start_us_reserved = quantize(pop.start_us_reserved + delta)
+                pop.end_us_reserved = quantize(pop.end_us_reserved + delta)
+            new_items.append((pr, pop.start_us_reserved, _id, pop))
+        for it in new_items:
+            heapq.heappush(self.heap, it)
+
+    def pop_ready(self, now_us: float, die:int, plane:int) -> Optional[PlannedOp]:
+        # pick first whose deps satisfied and start_reserved <= now
+        kept = []
+        chosen = None
+        while self.heap and chosen is None:
+            pr, start_r, _id, pop = heapq.heappop(self.heap)
+            if pop.die != die:
+                kept.append((pr, start_r, _id, pop)); continue
+            if not self._deps_satisfied(pop.id):
+                kept.append((pr, start_r, _id, pop)); continue
+            if start_r > now_us:
+                kept.append((pr, start_r, _id, pop)); continue
+            if plane not in pop.plane_set:
+                kept.append((pr, start_r, _id, pop)); continue
+            chosen = pop
+        for it in kept:
+            heapq.heappush(self.heap, it)
+        if chosen is None and bool(self.cfg.get("planning",{}).get("single_path",{}).get("debug", False)):
+            die_items = [(pr, st, pid, p) for (pr, st, pid, p) in self.heap if p.die==die]
+            print(f"[PLAN] pop_ready none die={die} plane={plane} now={now_us:.2f} die_items={[(pid,p.name,st) for (_,st,pid,p) in die_items]}")
+        return chosen
+
+    def _reserve_all_for_op(self, pop: PlannedOp) -> bool:
+        # plane reservations
+        per_plane_segs = {}
+        t = pop.start_us_reserved
+        segs_bus = []
+        for s in pop.states:
+            if s.bus:
+                segs_bus.append((t, t+s.dur_us))
+            for a in pop.targets:
+                per_plane_segs.setdefault((a.die,a.plane), []).append((t, t+s.dur_us))
+            t += s.dur_us
+        # check and reserve planes
+        for (d,p), segs in per_plane_segs.items():
+            if not self.resv.reserve_plane_segments(d, p, segs):
+                return False
+        # bus
+        if not self.resv.reserve_bus(segs_bus):
+            return False
+        return True
+
+    def _duration_of_states(self, states: List[StateSeg]) -> float:
+        return sum(s.dur_us for s in states)
+
+    def plan_sequence_read_linear(self, die:int, plane_set: List[int], page0:int, L:int, base_gap_us: float, now_us: float) -> bool:
+        # op specs
+        alias = "MUL_READ" if len(plane_set) > 1 else "SIN_READ"
+        cfg_read = self.addr.cfg["op_specs"][alias]
+        states_read = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_read["states"]]
+        cfg_dout = self.addr.cfg["op_specs"]["DOUT"]
+        states_dout = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_dout["states"]]
+
+        # start base from now or earliest availability
+        # compute candidate start considering now
+        cur = self.addr.candidate_start_for_scope(now_us, die, Scope.PLANE_SET, plane_set)
+        seq_id = 0
+        deps_prev_read = None
+        for i in range(L):
+            page = page0 + i
+            targets = self.addr.build_read_targets_for_plane_set_and_page(die, plane_set, page)
+            if not targets:
+                return False
+            # READ_i
+            read_id = self._next_id()
+            dur_r = self._duration_of_states(states_read)
+            pop_r = PlannedOp(id=read_id, name=alias, base=OpKind.READ, targets=targets,
+                              states=states_read, start_us_reserved=cur, end_us_reserved=quantize(cur+dur_r),
+                              die=die, plane_set=list(plane_set), prio=1,
+                              meta={"source":"plan.sequence","seq_id":1,"seq_idx":i,"seq_len":L})
+            ok = self._reserve_all_for_op(pop_r)
+            if not ok:
+                return False
+            self._push(pop_r)
+
+            # DOUT_i (per-plane)
+            dout_start = pop_r.end_us_reserved
+            for a in targets:
+                dout_id = self._next_id()
+                dur_d = self._duration_of_states(states_dout)
+                pop_d = PlannedOp(id=dout_id, name="DOUT", base=OpKind.DOUT, targets=[a],
+                                  states=states_dout, start_us_reserved=dout_start, end_us_reserved=quantize(dout_start+dur_d),
+                                  die=die, plane_set=[a.plane], prio=0,
+                                  deps=[read_id], meta={"source":"plan.sequence","seq_id":1,"seq_idx":i,"seq_len":L})
+                # planned latch: READ.end -> DOUT.end
+                if not self.resv.reserve_latch(a.die, a.plane, pop_r.end_us_reserved, pop_d.end_us_reserved):
+                    return False
+                if not self._reserve_all_for_op(pop_d):
+                    return False
+                self._push(pop_d)
+
+            # next READ start: last DOUT end + gap
+            cur = quantize(pop_r.end_us_reserved + base_gap_us)
+            deps_prev_read = read_id
+        return True
+
+    def plan_program_then_read_linear(self, die:int, start_plane:int, desired_fanout:int, interleave: bool, L:int, base_gap_us: float, now_us: float) -> bool:
+        # specs
+        # choose plane_set and targets for PROGRAM using existing planner each step
+        for i in range(L):
+            plan = self.addr.plan_multiplane(OpKind.PROGRAM, die, start_plane, desired_fanout, interleave)
+            if not plan:
+                return False
+            targets_pgm, plane_set, _scope = plan
+            alias_pgm = "MUL_PROGRAM" if len(plane_set) > 1 else "SIN_PROGRAM"
+            cfg_pgm = self.addr.cfg["op_specs"][alias_pgm]
+            states_pgm = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_pgm["states"]]
+            dur_pgm = self._duration_of_states(states_pgm)
+            # schedule time
+            cur = self.addr.candidate_start_for_scope(now_us, die, Scope.DIE_WIDE, plane_set)
+            # PROGRAM
+            pgm_id = self._next_id()
+            pop_p = PlannedOp(id=pgm_id, name=alias_pgm, base=OpKind.PROGRAM, targets=targets_pgm,
+                              states=states_pgm, start_us_reserved=cur, end_us_reserved=quantize(cur+dur_pgm),
+                              die=die, plane_set=list(plane_set), prio=0, meta={"source":"plan.sequence","seq_idx":i,"seq_len":L})
+            if not self._reserve_all_for_op(pop_p):
+                return False
+            self._push(pop_p)
+            # SR after PROGRAM
+            cfg_sr = self.addr.cfg["op_specs"]["SR"]
+            states_sr = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_sr["states"]]
+            dur_sr = self._duration_of_states(states_sr)
+            sr_id = self._next_id()
+            pop_sr = PlannedOp(id=sr_id, name="SR", base=OpKind.SR, targets=[targets_pgm[0]],
+                               states=states_sr, start_us_reserved=pop_p.end_us_reserved, end_us_reserved=quantize(pop_p.end_us_reserved+dur_sr),
+                               die=die, plane_set=[targets_pgm[0].plane], prio=0, deps=[pgm_id], meta={"source":"plan.sequence","seq_idx":i,"seq_len":L})
+            if not self._reserve_all_for_op(pop_sr):
+                return False
+            self._push(pop_sr)
+            # READ same page after SR
+            # determine page from targets_pgm (all same page)
+            page = targets_pgm[0].page
+            alias_read = "MUL_READ" if len(plane_set) > 1 else "SIN_READ"
+            cfg_read = self.addr.cfg["op_specs"][alias_read]
+            states_read = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_read["states"]]
+            dur_read = self._duration_of_states(states_read)
+            read_id = self._next_id()
+            pop_r = PlannedOp(id=read_id, name=alias_read, base=OpKind.READ, targets=[Address(t.die, t.plane, t.block, page) for t in targets_pgm],
+                              states=states_read, start_us_reserved=quantize(pop_sr.end_us_reserved + base_gap_us), end_us_reserved=quantize(pop_sr.end_us_reserved+base_gap_us+dur_read),
+                              die=die, plane_set=list(plane_set), prio=1, deps=[sr_id], meta={"source":"plan.sequence","seq_idx":i,"seq_len":L})
+            if not self._reserve_all_for_op(pop_r):
+                return False
+            self._push(pop_r)
+            # DOUT per plane
+            cfg_dout = self.addr.cfg["op_specs"]["DOUT"]
+            states_dout = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_dout["states"]]
+            dur_dout = self._duration_of_states(states_dout)
+            for a in pop_r.targets:
+                did = self._next_id()
+                pop_d = PlannedOp(id=did, name="DOUT", base=OpKind.DOUT, targets=[a],
+                                  states=states_dout, start_us_reserved=pop_r.end_us_reserved, end_us_reserved=quantize(pop_r.end_us_reserved+dur_dout),
+                                  die=die, plane_set=[a.plane], prio=0, deps=[read_id], meta={"source":"plan.sequence","seq_idx":i,"seq_len":L})
+                # planned latch
+                if not self.resv.reserve_latch(a.die, a.plane, pop_r.end_us_reserved, pop_r.end_us_reserved+dur_dout):
+                    return False
+                if not self._reserve_all_for_op(pop_d):
+                    return False
+                self._push(pop_d)
+            # advance now for next step
+            now_us = quantize(pop_r.end_us_reserved + base_gap_us)
+        return True
+
+    def plan_policy_op(self, op_name: str, kind: Enum, die:int, plane_set: List[int], targets: List[Address], start_reserved: float, meta: Optional[Dict[str,Any]] = None, also_chain: bool = True) -> bool:
+        meta = dict(meta or {})
+        # base states
+        cfg_op = self.addr.cfg["op_specs"][op_name]
+        states = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_op["states"]]
+        dur = self._duration_of_states(states)
+        pop_id = self._next_id()
+        pop = PlannedOp(id=pop_id, name=op_name, base=kind, targets=targets, states=states,
+                        start_us_reserved=start_reserved, end_us_reserved=quantize(start_reserved+dur),
+                        die=die, plane_set=list(plane_set), prio=1, meta={**meta, "source":"plan.policy"})
+        if not self._reserve_all_for_op(pop):
+            return False
+        self._push(pop)
+
+        if not also_chain:
+            return True
+
+        # chain: READ -> DOUT, PROGRAM/ERASE -> SR
+        if kind == OpKind.READ:
+            cfg_d = self.addr.cfg["op_specs"]["DOUT"]
+            states_d = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_d["states"]]
+            dur_d = self._duration_of_states(states_d)
+            for a in targets:
+                did = self._next_id()
+                pop_d = PlannedOp(id=did, name="DOUT", base=OpKind.DOUT, targets=[a], states=states_d,
+                                  start_us_reserved=pop.end_us_reserved, end_us_reserved=quantize(pop.end_us_reserved+dur_d),
+                                  die=die, plane_set=[a.plane], prio=0, deps=[pop_id], meta={"source":"plan.policy"})
+                if not self.resv.reserve_latch(a.die, a.plane, pop.end_us_reserved, pop_d.end_us_reserved):
+                    return False
+                if not self._reserve_all_for_op(pop_d):
+                    return False
+                self._push(pop_d)
+        elif kind in (OpKind.PROGRAM, OpKind.ERASE):
+            cfg_s = self.addr.cfg["op_specs"]["SR"]
+            states_s = [StateSeg(name=s["name"], dur_us=float(s["dist"]["value"]), bus=bool(s.get("bus", False))) for s in cfg_s["states"]]
+            dur_s = self._duration_of_states(states_s)
+            sid = self._next_id()
+            pop_s = PlannedOp(id=sid, name="SR", base=OpKind.SR, targets=[targets[0]], states=states_s,
+                              start_us_reserved=pop.end_us_reserved, end_us_reserved=quantize(pop.end_us_reserved+dur_s),
+                              die=die, plane_set=[targets[0].plane], prio=0, deps=[pop_id], meta={"source":"plan.policy"})
+            if not self._reserve_all_for_op(pop_s):
+                return False
+            self._push(pop_s)
+        return True
 
 # --------------------------------------------------------------------------
 # Rejection logging (per-attempt structured log + aggregated stats)
@@ -1242,6 +1576,8 @@ class LatchManager:
     def __init__(self):
         # (die, plane) -> _Latch
         self._locks: Dict[Tuple[int,int], _Latch] = {}
+        # planned latch windows (optional)
+        self._planned: Dict[Tuple[int,int], List[Tuple[float,float]]] = {}
 
     def plan_lock_after_read(self, targets: List[Address], read_end_us: float):
         for t in targets:
@@ -1279,6 +1615,10 @@ class LatchManager:
             for t in op.targets:
                 if self._is_locked_at(t.die, t.plane, start_hint):
                     return False
+                # planned latch guard
+                for (t0,t1) in self._planned.get((t.die,t.plane), []):
+                    if t0 <= start_hint < t1:
+                        return False
             return True
 
 # --------------------------------------------------------------------------
@@ -1626,6 +1966,12 @@ class ObligationManager:
         return False
 
     def on_commit(self, op: Operation, now_us: float):
+        # Planning single-path: runtime obligation creation disabled
+        try:
+            if bool(self.cfg_root.get("planning", {}).get("single_path", {}).get("enable", False)):
+                return
+        except Exception:
+            pass
         # READ completion -> create DOUT obligation(s)
         for spec in self.specs:
             if spec["issuer"] == op.base.name:
@@ -1884,12 +2230,16 @@ class PolicyEngine:
     def __init__(self, cfg, addr: AddressManager, obl: ObligationManager, excl: ExclusionManager,
                  rejlog: Optional[RejectionLogger] = None,
                  latch: Optional[LatchManager] = None,
-                 state_timeline: Optional["StateTimeline"] = None):
+                 state_timeline: Optional["StateTimeline"] = None,
+                 planned: Optional["PlannedOpManager"] = None,
+                 plan_resv: Optional["PlanningReservation"] = None):
         self.cfg=cfg; self.addr=addr; self.obl=obl; self.excl=excl
         self.stats={"alias_degrade":0}
         self.rejlog = rejlog or RejectionLogger()
         self.latch = latch or LatchManager()
         self.state_timeline = state_timeline
+        self.planned = planned
+        self.plan_resv = plan_resv
         # compile exclusion rules for data-driven predicates
         self._excl_rules = self._compile_exclusion_rules()
 
@@ -2089,6 +2439,56 @@ class PolicyEngine:
     def propose(self, now_us: float, hook: PhaseHook, g: Dict[str,str], l: Dict[str,str], earliest_start: float) -> Optional[Operation]:
         die, hook_plane = hook.die, hook.plane
 
+        # Single-path planning: only consume planned ops
+        plan_cfg = self.cfg.get("planning", {}).get("single_path", {})
+        if bool(plan_cfg.get("enable", False)) and self.planned is not None:
+            # lazy-seed a sequence plan if sequence enabled and nothing is planned for this die yet
+            try:
+                seq_cfg = self.cfg.get("sequence", {})
+                if bool(seq_cfg.get("enable", False)):
+                    # if no pending planned ops for this die, attempt to plan one sequence
+                    if not any((item[3].die==die) for item in self.planned.heap):
+                        sel = (self.cfg or {}).get("selection", {})
+                        dfl = sel.get("defaults", {}).get("PROGRAM", {})
+                        fanout = int(dfl.get("fanout", 1))
+                        interleave = bool(dfl.get("interleave", False))
+                        read_cfg = seq_cfg.get("read_linear", {})
+                        L = int(read_cfg.get("length", 4))
+                        gap = float(read_cfg.get("step_gap_us", 2.0))
+                        # plan PROGRAM->SR->READ->DOUT steps to ensure content exists then read it
+                        self.planned.plan_program_then_read_linear(die, hook_plane, fanout, interleave, L, gap, now_us)
+            except Exception:
+                pass
+
+            pop = self.planned.pop_ready(now_us, die, hook_plane)
+            if pop:
+                # build operation from planned
+                op = Operation(name=pop.name, base=pop.base, targets=pop.targets, states=pop.states, meta={**pop.meta})
+                op.meta.setdefault("scope", self.addr.cfg.get("op_specs", {}).get(pop.name, {}).get("scope", "PLANE_SET"))
+                op.meta["plane_list"] = pop.plane_set
+                op.meta["arity"] = len(pop.plane_set)
+                start_hint = quantize(max(earliest_start, pop.start_us_reserved))
+                # validation stays the same
+                stage = "planned"
+                self.rejlog.log_attempt(stage)
+                if not self.addr.bus_precheck(op, start_hint, self.addr.bus_segments_for_op(op)):
+                    self._reject(now_us, hook, stage, "bus", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "bus_conflict")
+                    # shift chain forward
+                    self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
+                    return None, None
+                if not self.latch.allowed(op, start_hint):
+                    self._reject(now_us, hook, stage, "latch", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "planned_latch_conflict")
+                    self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
+                    return None, None
+                if not self._exclusion_ok(op, start_hint):
+                    self._reject(now_us, hook, stage, "excl", op.base.name, op.name, len(pop.plane_set), pop.plane_set, start_hint, None, "excl_conflict")
+                    self.planned.shift_due_to_delay(die, float(plan_cfg.get("shift_on_delay_us", 0.2)))
+                    return None, None
+                self.rejlog.log_accept(stage)
+                # mark complete so deps unblock
+                self.planned.mark_completed(pop)
+                return op, start_hint
+
         # 0) obligations first
         stage = "obligation"
         self.rejlog.log_attempt(stage)
@@ -2141,16 +2541,34 @@ class PolicyEngine:
         try:
             seq_cfg = self.cfg.get("sequence", {})
             if bool(seq_cfg.get("enable", False)):
-                p_create = float(seq_cfg.get("p_create", 0.0))
-                if random.random() < p_create:
-                    created = False
-                    try:
-                        created = self.obl.create_sequence_read_linear(self.addr, die, hook_plane, now_us)
-                    except Exception:
+                # In single-path mode, preplan instead of creating runtime obligations
+                plan_cfg = self.cfg.get("planning", {}).get("single_path", {})
+                if bool(plan_cfg.get("enable", False)) and self.planned is not None:
+                    # determine plane_set & page0 by planner, then preplan
+                    sel = (self.cfg or {}).get("selection", {})
+                    dfl = sel.get("defaults", {}).get("READ", {})
+                    fanout = int(dfl.get("fanout", 1))
+                    interleave = bool(dfl.get("interleave", True))
+                    plan = self.addr.plan_multiplane(OpKind.READ, die, hook_plane, fanout, interleave)
+                    if plan:
+                        targets, plane_set, _scope = plan
+                        page0 = int(targets[0].page or 0)
+                        read_cfg = seq_cfg.get("read_linear", {})
+                        L = int(read_cfg.get("length", 4))
+                        gap = float(read_cfg.get("step_gap_us", 2.0))
+                        if self.planned.plan_sequence_read_linear(die, plane_set, page0, L, gap, now_us):
+                            return None, None
+                else:
+                    # legacy: head-only obligation
+                    p_create = float(seq_cfg.get("p_create", 0.0))
+                    if random.random() < p_create:
                         created = False
-                    if created:
-                        # head obligation will be consumed in the next hook
-                        return None, None
+                        try:
+                            created = self.obl.create_sequence_read_linear(self.addr, die, hook_plane, now_us)
+                        except Exception:
+                            created = False
+                        if created:
+                            return None, None
         except Exception:
             pass
 
@@ -2216,7 +2634,7 @@ class PolicyEngine:
                     if plan: fanout=1
                 # start_plane round-robin scan when easing enabled and no plan
                 if not plan:
-                    scan = max(1, int(hookscreen_cfg.get("startplane_scan", 1)))
+                    scan = max(1, int(self.cfg.get("policy", {}).get("hookscreen", {}).get("startplane_scan", 1)))
                     tried = 0
                     p = (hook_plane + 1) % self.addr.planes
                     while tried < self.addr.planes and tried < scan and not plan:
@@ -2228,6 +2646,22 @@ class PolicyEngine:
                 else:
                     targets, plane_set, scope=plan
                     cfg_op=self.cfg["op_specs"][pick]
+                    # If planning is enabled, turn this into a planned op chain and return None (to be consumed later)
+                    plan_cfg = self.cfg.get("planning", {}).get("single_path", {})
+                    if bool(plan_cfg.get("enable", False)) and self.planned is not None:
+                        start_reserved = self.addr.candidate_start_for_scope(now_us, die, scope, plane_set)
+                        planned_ok = self.planned.plan_policy_op(pick, kind, die, plane_set, targets, start_reserved,
+                                                                 meta={"phase_key_used": str(used_key if used_key else used_label),
+                                                                       "state_key_at_schedule": str(st_key) if st_key else None,
+                                                                       "alias_used": alias_used},
+                                                                 also_chain=True)
+                        if planned_ok:
+                            self.rejlog.log_accept(stage)
+                            return None, None
+                        else:
+                            self._reject(now_us, hook, stage, "planned_conflict", base, alias_used, fanout, plane_set, start_reserved, None, "reservation_conflict")
+                            return None, None
+                    # legacy: immediate op path
                     op=build_operation(alias_used, kind, cfg_op, targets)
                     op.meta["scope"]=cfg_op["scope"]; op.meta["plane_list"]=plane_set; op.meta["arity"]=len(plane_set); op.meta["alias_used"]=alias_used
                     try:
@@ -2656,6 +3090,46 @@ def main():
     CFG["topology"]["blocks"] = 8
     CFG["topology"]["pages_per_block"] = 100
     print(f"topology: {CFG['topology']}")
+
+    # 1.x) Optional overrides via environment (for testing)
+    try:
+        env = os.environ
+        v = env.get("BOOTSTRAP_ENABLED")
+        if v is not None:
+            CFG["bootstrap"]["enabled"] = str(v).lower() in ("1","true","yes","on")
+        v = env.get("RUN_UNTIL_US")
+        if v is not None:
+            CFG["policy"]["run_until_us"] = float(v)
+        # Sequence feature toggles
+        v = env.get("SEQUENCE_ENABLE")
+        if v is not None:
+            CFG.setdefault("sequence", {})
+            CFG["sequence"]["enable"] = str(v).lower() in ("1","true","yes","on")
+        v = env.get("SEQUENCE_PCREATE")
+        if v is not None:
+            CFG.setdefault("sequence", {})
+            CFG["sequence"]["p_create"] = float(v)
+        # Optional read_linear params
+        seq_read = {}
+        v = env.get("SEQUENCE_LEN")
+        if v is not None:
+            seq_read["length"] = int(v)
+        v = env.get("SEQUENCE_WIN_US")
+        if v is not None:
+            seq_read["window_us"] = float(v)
+        v = env.get("SEQUENCE_GAP_US")
+        if v is not None:
+            seq_read["step_gap_us"] = float(v)
+        if seq_read:
+            CFG.setdefault("sequence", {})
+            CFG["sequence"]["read_linear"] = {**CFG.get("sequence", {}).get("read_linear", {}), **seq_read}
+        # planning single-path toggle
+        v = env.get("PLANNING_SINGLE_PATH")
+        if v is not None:
+            CFG.setdefault("planning", {}).setdefault("single_path", {})
+            CFG["planning"]["single_path"]["enable"] = str(v).lower() in ("1","true","yes","on")
+    except Exception as e:
+        print(f"[ENV] overrides skipped: {e}")
     # 시각화 on/off 토글
     enable_visualization = False
     try:
@@ -2691,17 +3165,32 @@ def main():
     latch = LatchManager()
     # shared state timeline
     state_timeline = StateTimeline()
-    spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch, state_timeline=state_timeline)
+    # planning (single-path) plumbing
+    plan_cfg = CFG.get("planning", {}).get("single_path", {})
+    plan_resv = PlanningReservation() if bool(plan_cfg.get("enable", False)) else None
+    planned = PlannedOpManager(CFG, addr, plan_resv) if plan_resv is not None else None
+
+    spe  = PolicyEngine(CFG, addr, obl, excl, rejlog=rejlog, latch=latch, state_timeline=state_timeline, planned=planned, plan_resv=plan_resv)
     sch  = Scheduler(CFG, addr, spe, obl, excl, logger=logger, latch=latch, state_timeline=state_timeline)
 
-    # 1.3) Bootstrap obligations (optional)
+    # 1.3) Bootstrap obligations (optional) — disabled under single-path planning
     try:
-        populate_bootstrap_obligations(CFG, addr, obl)
+        if not bool(CFG.get("planning", {}).get("single_path", {}).get("enable", False)):
+            populate_bootstrap_obligations(CFG, addr, obl)
+        else:
+            print("[BOOTSTRAP] planning.single_path enabled: skip runtime bootstrap obligations")
     except Exception as e:
         print(f"[BOOTSTRAP] skipped: {e}")
 
     # 2) 실행: bootstrap 전용 여유와 총 러닝타임 분리 계산
     CFG["policy"]["run_until_us"] = 50000.0
+    # allow env override of runtime even after default is set
+    try:
+        v = os.environ.get("RUN_UNTIL_US")
+        if v is not None:
+            CFG["policy"]["run_until_us"] = float(v)
+    except Exception:
+        pass
 
     run_until_base = CFG["policy"]["run_until_us"]
     run_until_boot = 0.0
