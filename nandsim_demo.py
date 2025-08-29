@@ -340,6 +340,19 @@ CFG = {
             "on_erase": "round_robin_next"
         }
     },
+    # Sequence (testing convenience defaults)
+    # - enable: master toggle for sequence features
+    # - p_create: probability to create head-only sequence obligations in legacy (non-planned) mode
+    # - read_linear: parameters for linear READ sequences
+    "sequence": {
+        "enable": False,
+        "p_create": 0.0,
+        "read_linear": {
+            "length": 4,
+            "window_us": 6.0,
+            "step_gap_us": 2.0
+        }
+    },
 }
 
 # --- Pattern export (ATE CSV) defaults ---
@@ -380,7 +393,7 @@ CFG["pattern_export"] = {
 # Planning (single-path) defaults (disabled by default)
 CFG["planning"] = {
     "single_path": {
-        "enable": False,
+        "enable": True,
         # when a planned op cannot be scheduled at reserved time, shift chain by delta
         "shift_on_delay_us": 0.2,
         # while planned items are pending on a die/plane, guard against policy proposals
@@ -388,6 +401,7 @@ CFG["planning"] = {
         # debug logging
         "debug": False,
     }
+    
 }
 
 # 예시
